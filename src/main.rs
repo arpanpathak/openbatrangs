@@ -3,6 +3,7 @@ mod banner;
 mod models;
 mod ollama;
 mod tools;
+mod tui;
 
 use agent::AgentConfig;
 use anyhow::{anyhow, bail, Context, Result};
@@ -78,10 +79,10 @@ enum Commands {
 }
 
 #[derive(Clone)]
-struct ModelPrefs {
-    model: Option<String>,
-    no_auto_pull: bool,
-    min_context: u64,
+pub(crate) struct ModelPrefs {
+    pub(crate) model: Option<String>,
+    pub(crate) no_auto_pull: bool,
+    pub(crate) min_context: u64,
 }
 
 struct ReplState {
@@ -116,7 +117,7 @@ async fn main() -> Result<()> {
         Some(Commands::Setup) => unreachable!("setup is handled before ensure_ollama"),
         Some(Commands::Agent { task }) => {
             if task.is_empty() {
-                run_repl(&cli, &client).await?;
+                tui::run(&cli, &client).await?;
             } else {
                 let prefs = ModelPrefs {
                     model: cli.model.clone(),
@@ -138,7 +139,7 @@ async fn main() -> Result<()> {
         }
         None => {
             if cli.task.is_empty() {
-                run_repl(&cli, &client).await?;
+                tui::run(&cli, &client).await?;
             } else {
                 let prefs = ModelPrefs {
                     model: cli.model.clone(),
@@ -263,7 +264,8 @@ async fn setup(client: &OllamaClient) -> Result<()> {
     Ok(())
 }
 
-/// Interactive DeepCode-style REPL.
+/// Interactive DeepCode-style REPL (legacy, replaced by ratatui TUI).
+#[allow(dead_code)]
 async fn run_repl(cli: &Cli, client: &OllamaClient) -> Result<()> {
     use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
@@ -449,10 +451,19 @@ async fn run_agent_task(
         confirm,
     };
 
-    agent::run_agent(&config, client, &selected.name, model_context, task).await
+    let mut reporter = agent::StdoutReporter;
+    agent::run_agent(
+        &config,
+        client,
+        &selected.name,
+        model_context,
+        task,
+        &mut reporter,
+    )
+    .await
 }
 
-async fn select_model(
+pub(crate) async fn select_model(
     client: &OllamaClient,
     prefs: &ModelPrefs,
     mem_budget: u64,
@@ -522,7 +533,7 @@ async fn select_model(
     }
 }
 
-async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
+pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
     let show = client.show(model).await?;
     let context = show
         .get("model_info")

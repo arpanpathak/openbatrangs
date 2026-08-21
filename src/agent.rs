@@ -13,6 +13,31 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
+/// Receives agent output. `line` is a complete line; `chunk` is streaming text
+/// that should be appended to the current live line.
+pub trait Reporter: Send {
+    fn line(&mut self, msg: String);
+    fn chunk(&mut self, msg: String);
+}
+
+/// Prints agent output directly to stdout (used by one-shot mode).
+pub struct StdoutReporter;
+
+impl Reporter for StdoutReporter {
+    fn line(&mut self, msg: String) {
+        if msg.is_empty() {
+            println!();
+        } else {
+            println!("{msg}");
+        }
+    }
+
+    fn chunk(&mut self, msg: String) {
+        print!("{msg}");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub cwd: PathBuf,
@@ -66,12 +91,13 @@ Rules:
 - When the task is complete, provide a concise answer with what changed and any commands the user should run.
 - Keep tool outputs in mind, but do not repeat them verbatim in the final answer."#;
 
-pub async fn run_agent(
+pub async fn run_agent<R: Reporter>(
     config: &AgentConfig,
     client: &OllamaClient,
     model: &str,
     model_context: u64,
     task: &str,
+    reporter: &mut R,
 ) -> Result<()> {
     let cwd = config.cwd.clone();
     if !cwd.is_dir() {
@@ -103,7 +129,7 @@ pub async fn run_agent(
     let mut changed_files: Vec<String> = Vec::new();
 
     for step in 1..=config.max_steps {
-        println!(
+        reporter.line(format!(
             "\n{BOLD}{CYAN}🦇 Step {step}/{max}{RESET} — model: {BOLD}{model}{RESET}",
             BOLD = BOLD,
             CYAN = CYAN,
@@ -111,7 +137,7 @@ pub async fn run_agent(
             step = step,
             max = config.max_steps,
             model = model
-        );
+        ));
 
         let req = ChatRequest {
             model: model.to_string(),
@@ -160,17 +186,16 @@ pub async fn run_agent(
             if !thought_complete {
                 if let Some((text, complete)) = extract_json_string(&buffer, "thought") {
                     if !thought_prefix_printed && !text.is_empty() {
-                        print!("{}🧠 {}", CYAN, RESET);
+                        reporter.chunk(format!("{}🧠 {}", CYAN, RESET));
                         thought_prefix_printed = true;
                     }
                     if text.len() > thought_printed_len {
-                        print!("{}", &text[thought_printed_len..]);
-                        let _ = std::io::stdout().flush();
+                        reporter.chunk(text[thought_printed_len..].to_string());
                         thought_printed_len = text.len();
                     }
                     if complete {
                         thought_complete = true;
-                        println!();
+                        reporter.line(String::new());
                     }
                 }
             }
@@ -178,17 +203,16 @@ pub async fn run_agent(
             if !answer_skipped && !answer_complete {
                 if let Some((text, complete)) = extract_json_string(&buffer, "answer") {
                     if !answer_prefix_printed && !text.is_empty() {
-                        print!("\n{GREEN}✅ {RESET}", GREEN = "\x1b[32m");
+                        reporter.chunk(format!("\n\x1b[32m✅\x1b[0m "));
                         answer_prefix_printed = true;
                     }
                     if text.len() > answer_printed_len {
-                        print!("{}", &text[answer_printed_len..]);
-                        let _ = std::io::stdout().flush();
+                        reporter.chunk(text[answer_printed_len..].to_string());
                         answer_printed_len = text.len();
                     }
                     if complete {
                         answer_complete = true;
-                        println!();
+                        reporter.line(String::new());
                     }
                 }
             }
@@ -198,18 +222,18 @@ pub async fn run_agent(
         let parsed = match parse_agent_response(&content) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("\n⚠️  Could not parse model JSON: {e}");
-                eprintln!("Showing raw model output as the final response.");
-                println!("\n{content}");
+                reporter.line(format!("\n⚠️  Could not parse model JSON: {e}"));
+                reporter.line("Showing raw model output as the final response.".to_string());
+                reporter.line(format!("\n{content}"));
                 return Ok(());
             }
         };
 
         if let Some(answer) = parsed.answer {
             if !answer_prefix_printed {
-                println!("\n\x1b[32m✅\x1b[0m {answer}");
+                reporter.line(format!("\n\x1b[32m✅\x1b[0m {answer}"));
             }
-            print_changed_files(&cwd, &changed_files);
+            print_changed_files(&cwd, &changed_files, reporter);
             return Ok(());
         }
 
@@ -217,8 +241,8 @@ pub async fn run_agent(
             // finish is a direct final response.
             if tool_call.name == "finish" {
                 let summary = get_str(&tool_call.arguments, "summary")?.unwrap_or("done");
-                println!("\n\x1b[32m✅\x1b[0m {summary}");
-                print_changed_files(&cwd, &changed_files);
+                reporter.line(format!("\n\x1b[32m✅\x1b[0m {summary}"));
+                print_changed_files(&cwd, &changed_files, reporter);
                 return Ok(());
             }
 
@@ -228,13 +252,18 @@ pub async fn run_agent(
                 content: content.clone(),
             });
 
-            println!("\n{}🔧 {}{}", MAGENTA, describe_tool(&tool_call), RESET);
+            reporter.line(format!(
+                "\n{}🔧 {}{}",
+                MAGENTA,
+                describe_tool(&tool_call),
+                RESET
+            ));
             let result = execute_tool(config, &cwd, &tool_call, &mut changed_files).await;
             let result_text = match result {
                 Ok(text) => text,
                 Err(e) => format!("Tool error: {e:#}"),
             };
-            println!("{}{}{}", DIM, result_text, RESET);
+            reporter.line(format!("{}{}{}", DIM, result_text, RESET));
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -246,14 +275,14 @@ pub async fn run_agent(
             continue;
         }
 
-        eprintln!("\n⚠️  Model returned neither an answer nor a tool call.");
+        reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
         return Ok(());
     }
 
-    eprintln!(
+    reporter.line(format!(
         "\n⚠️  Reached max steps ({}) without a final answer.",
         config.max_steps
-    );
+    ));
     Ok(())
 }
 
@@ -457,12 +486,12 @@ fn clickable_path(cwd: &Path, path: &str) -> String {
     format!("\x1b]8;;file://{encoded}\x1b\\{display}\x1b]8;;\x1b\\")
 }
 
-fn print_changed_files(cwd: &Path, files: &[String]) {
+fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
     if files.is_empty() {
         return;
     }
-    println!("\n\x1b[1;33m📁 Files changed:\x1b[0m");
+    reporter.line("\n\x1b[1;33m📁 Files changed:\x1b[0m".to_string());
     for f in files {
-        println!("   {}", clickable_path(cwd, f));
+        reporter.line(format!("   {}", clickable_path(cwd, f)));
     }
 }
