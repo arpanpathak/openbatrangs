@@ -224,14 +224,13 @@ fn render_cursor(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(prefix) = app.input.get(..app.cursor) else {
         return;
     };
-    let line_idx = prefix.matches('\n').count();
-    let column = prefix
-        .rsplit('\n')
-        .next()
-        .map(|line| line.chars().count())
-        .unwrap_or(0);
-    let x = area.x + 1 + column as u16;
-    let y = area.y + 1 + line_idx as u16;
+    let max_text_width = (area.width as usize).saturating_sub(2).max(1);
+    let line_start = prefix.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let current_line = &prefix[line_start..];
+    let column = current_line.chars().count();
+    let newline_count = prefix.matches('\n').count();
+    let x = area.x + 1 + (column % max_text_width) as u16;
+    let y = area.y + 1 + (newline_count + column / max_text_width) as u16;
     f.set_cursor_position((x, y.min(area.y + area.height.saturating_sub(1))));
 }
 

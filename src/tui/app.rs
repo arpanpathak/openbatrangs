@@ -209,8 +209,6 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        self.log.push("─".repeat(60));
-        self.log.push(format!("You: {task}"));
         self.is_running = true;
         self.status = "running".to_string();
         self.last_action.clear();
@@ -524,6 +522,10 @@ impl App {
         }
         self.history.push(task.clone());
         self.auto_scroll = true;
+        if !task.starts_with('/') {
+            self.log.push("─".repeat(60));
+            self.log.push(format!("You: {task}"));
+        }
         if task.starts_with('/') {
             self.run_slash_command(client, &task).await?;
         } else if self.is_running {

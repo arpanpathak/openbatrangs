@@ -56,7 +56,7 @@ const COMMANDS: &[&str] = &[
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Maximum visible lines in the multi-line input box.
-const MAX_INPUT_LINES: usize = 12;
+const MAX_INPUT_LINES: usize = 20;
 /// Extra lines for the input box border.
 const INPUT_BOX_PADDING: usize = 2;
 /// Minimum input box height (border + one line).
