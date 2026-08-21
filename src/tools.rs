@@ -114,7 +114,11 @@ pub fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     }
     std::fs::write(&file, content)
         .with_context(|| format!("failed to write {}", file.display()))?;
-    Ok(format!("✅ wrote {} ({} bytes)", file.display(), content.len()))
+    Ok(format!(
+        "✅ wrote {} ({} bytes)",
+        file.display(),
+        content.len()
+    ))
 }
 
 pub fn grep_files(root: &Path, pattern: &str, path: &str, max_results: usize) -> Result<String> {
@@ -164,11 +168,7 @@ pub fn grep_files(root: &Path, pattern: &str, path: &str, max_results: usize) ->
     Ok(truncate(out))
 }
 
-pub async fn run_command(
-    root: &Path,
-    command: &str,
-    timeout_secs: u64,
-) -> Result<String> {
+pub async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
     let output = tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
         tokio::process::Command::new("bash")
@@ -188,7 +188,10 @@ pub async fn run_command(
     }
 
     let status = output.status;
-    let exit = status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+    let exit = status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into());
     if !status.success() {
         text.push_str(&format!("\n[exit code {exit}]\n"));
     } else {
@@ -206,6 +209,9 @@ fn truncate_to(s: String, max: usize) -> String {
         return s;
     }
     let mut result = s.chars().take(max).collect::<String>();
-    result.push_str(&format!("\n... (truncated, {} chars omitted)", s.chars().count().saturating_sub(max)));
+    result.push_str(&format!(
+        "\n... (truncated, {} chars omitted)",
+        s.chars().count().saturating_sub(max)
+    ));
     result
 }

@@ -138,7 +138,8 @@ pub fn score_model(model: &OllamaModel, mem_budget: u64, min_context: u64) -> Op
     let quant_label = quant.clone();
     let quant = quant_bonus(&quant_label);
 
-    let score = mem_factor * 0.45 + size_factor * 0.2 + coding * 0.2 + ctx_factor * 0.1 + quant * 0.05;
+    let score =
+        mem_factor * 0.45 + size_factor * 0.2 + coding * 0.2 + ctx_factor * 0.1 + quant * 0.05;
 
     Some(ModelScore {
         name: model.name.clone(),
@@ -151,16 +152,16 @@ pub fn score_model(model: &OllamaModel, mem_budget: u64, min_context: u64) -> Op
     })
 }
 
-pub fn score_models(
-    models: &[OllamaModel],
-    mem_budget: u64,
-    min_context: u64,
-) -> Vec<ModelScore> {
+pub fn score_models(models: &[OllamaModel], mem_budget: u64, min_context: u64) -> Vec<ModelScore> {
     let mut scored: Vec<ModelScore> = models
         .iter()
         .filter_map(|m| score_model(m, mem_budget, min_context))
         .collect();
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored
 }
 
@@ -175,10 +176,7 @@ pub fn recommended_fallback_model(mem_budget: u64) -> &'static str {
 
 /// True if a model name looks like a local file path rather than an Ollama tag.
 pub fn looks_like_path(name: &str) -> bool {
-    name.ends_with(".gguf")
-        || name.contains('/')
-        || name.contains('\\')
-        || Path::new(name).exists()
+    name.ends_with(".gguf") || name.contains('/') || name.contains('\\') || Path::new(name).exists()
 }
 
 #[cfg(test)]

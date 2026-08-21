@@ -33,15 +33,29 @@ It is designed to run well on Jetson-class edge devices (Orin Nano/NX Super,
 - No heavy Rust/CUDA compile per machine.
 - Best performance-per-watt-per-dollar for local agentic coding on edge devices.
 
+## Performance per watt per dollar
+
+openBatarangs is built around the local-first economics of edge AI:
+
+- **No cloud API fees.** Every prompt stays on-device; the only cost is electricity.
+- **Unified memory wins on Jetson.** The Orin 16 GB's GPU/CPU share memory, so a
+  4-7 GB Q4_K_M coding model fits without duplicating weights across VRAM and RAM.
+- **Small quantized models beat big cloud round-trips for agentic loops.**
+  A 3B-8B Q4 coding model is fast enough to iterate (read → edit → build → fix)
+  while leaving headroom for a 32K+ context window.
+- **The auto-picker optimizes for watts, not just raw tokens/sec:** it refuses
+  models that don't fit comfortably, avoiding swap thrash and thermal throttling.
+- **Same binary runs on Jetson, laptops, and desktops** — you only pay for the
+  hardware you already own.
+
+Exact tok/s depends on clocks, thermals, and model size; run `openbatrangs doctor`
+to see which model your hardware scores best for this workload.
+
 ## Requirements
 
-- [Ollama](https://ollama.com) installed and running (`ollama serve`).
-- At least one model installed, e.g.:
-  ```sh
-  ollama pull qwen2.5-coder:7b
-  ```
-  If no suitable model is installed, openBatarangs can auto-pull a recommended
-  coding model unless you pass `--no-auto-pull`.
+- [Ollama](https://ollama.com) installed (the CLI auto-starts `ollama serve` if it is installed but not running).
+- If Ollama is not installed at all, run `openbatrangs setup` once — it installs Ollama and pulls a coding model for you.
+- If no suitable model is installed, openBatarangs auto-pulls a recommended coding model unless you pass `--no-auto-pull`.
 
 ## Install / Build
 
@@ -61,27 +75,52 @@ The binary is at `target/release/openbatrangs` (or `~/.cargo/bin/openbatrangs`).
 ## Quick start
 
 ```sh
-# Agent mode with a task (auto-discovers the best model)
-./target/release/openbatrangs "fix the Rust build errors"
+# One-time auto setup: install/start Ollama + pull a coding model
+openbatrangs setup
 
-# Agent mode in a specific directory
-./target/release/openbatrangs --cwd /path/to/project "add a --dry-run flag"
+# Interactive DeepCode-style agent (type tasks, keep chatting)
+openbatrangs
+
+# One-shot agent mode with a task
+openbatrangs "fix the Rust build errors"
+
+# One-shot agent in a specific directory
+openbatrangs --cwd /path/to/project "add a --dry-run flag"
 
 # See what models are installed and which is best
-./target/release/openbatrangs list-models
+openbatrangs list-models
 
 # Check Ollama and get a recommendation
-./target/release/openbatrangs doctor
+openbatrangs doctor
 
 # Force a specific model
-./target/release/openbatrangs --model qwen2.5-coder:7b "explain this repo"
+openbatrangs --model qwen2.5-coder:7b "explain this repo"
 
 # Read-only mode (no file writes or shell commands)
-./target/release/openbatrangs --read-only "suggest a refactor plan"
+openbatrangs --read-only "suggest a refactor plan"
 
 # Ask before every write/command
-./target/release/openbatrangs --confirm "update the CLI docs"
+openbatrangs --confirm "update the CLI docs"
 ```
+
+### Interactive REPL commands
+
+Inside the `openBatarangs>` prompt:
+
+```
+/help          show all commands
+/exit, /quit   leave the REPL
+/setup         install/start Ollama + pull a model
+/models        list installed models + scores
+/model <tag>   switch model (e.g. /model qwen2.5-coder:7b)
+/read-only     toggle read-only mode
+/confirm       toggle confirm-before-write/command
+/steps <n>     set max agent steps
+/cwd <path>    change workspace
+/doctor        check Ollama + best model
+```
+
+Anything else you type is sent to the coding agent as a task.
 
 ## Agent tools
 

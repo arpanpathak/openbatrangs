@@ -23,6 +23,8 @@ struct ToolCall {
 #[derive(Debug, Deserialize)]
 struct AgentResponse {
     #[serde(default)]
+    thought: Option<String>,
+    #[serde(default)]
     tool: Option<ToolCall>,
     #[serde(default)]
     answer: Option<String>,
@@ -69,7 +71,8 @@ pub async fn run_agent(
     }
 
     let num_ctx = model_context.min(32768).max(4096) as u64;
-    let initial_listing = tools::list_files(&cwd, ".", 5).unwrap_or_else(|e| format!("(could not list files: {e})"));
+    let initial_listing =
+        tools::list_files(&cwd, ".", 5).unwrap_or_else(|e| format!("(could not list files: {e})"));
 
     let user_content = format!(
         "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
@@ -109,8 +112,6 @@ pub async fn run_agent(
             .with_context(|| format!("model call failed at step {step}"))?;
         let content = resp.message.content.trim().to_string();
 
-        println!("🤖 {content}");
-
         let parsed = match parse_agent_response(&content) {
             Ok(p) => p,
             Err(e) => {
@@ -120,6 +121,10 @@ pub async fn run_agent(
                 return Ok(());
             }
         };
+
+        if let Some(thought) = parsed.thought.as_deref() {
+            println!("🧠 {thought}");
+        }
 
         if let Some(answer) = parsed.answer {
             println!("\n✅ {answer}");
@@ -151,10 +156,7 @@ pub async fn run_agent(
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: format!(
-                    "Tool '{}' result:\n{}",
-                    tool_call.name, result_text
-                ),
+                content: format!("Tool '{}' result:\n{}", tool_call.name, result_text),
             });
 
             // Keep context bounded: drop the oldest tool exchange if history grows too large.
@@ -166,11 +168,18 @@ pub async fn run_agent(
         return Ok(());
     }
 
-    eprintln!("\n⚠️  Reached max steps ({}) without a final answer.", config.max_steps);
+    eprintln!(
+        "\n⚠️  Reached max steps ({}) without a final answer.",
+        config.max_steps
+    );
     Ok(())
 }
 
-async fn execute_tool(config: &AgentConfig, cwd: &std::path::Path, tool: &ToolCall) -> Result<String> {
+async fn execute_tool(
+    config: &AgentConfig,
+    cwd: &std::path::Path,
+    tool: &ToolCall,
+) -> Result<String> {
     let name = tool.name.as_str();
     let args = &tool.arguments;
 
@@ -180,7 +189,8 @@ async fn execute_tool(config: &AgentConfig, cwd: &std::path::Path, tool: &ToolCa
             tools::list_files(cwd, path, 5)
         }
         "read_file" => {
-            let path = get_str(args, "path")?.ok_or_else(|| anyhow!("read_file requires 'path'"))?;
+            let path =
+                get_str(args, "path")?.ok_or_else(|| anyhow!("read_file requires 'path'"))?;
             let max_chars = get_u64(args, "max_chars")?.unwrap_or(8000) as usize;
             let max_chars = max_chars.min(tools::MAX_TOOL_OUTPUT);
             tools::read_file(cwd, path, max_chars)
@@ -193,8 +203,8 @@ async fn execute_tool(config: &AgentConfig, cwd: &std::path::Path, tool: &ToolCa
             tools::grep_files(cwd, pattern, path, max_results)
         }
         "write_file" => {
-            let path = get_str(args, "path")?
-                .ok_or_else(|| anyhow!("write_file requires 'path'"))?;
+            let path =
+                get_str(args, "path")?.ok_or_else(|| anyhow!("write_file requires 'path'"))?;
             let content = get_str(args, "content")?
                 .ok_or_else(|| anyhow!("write_file requires 'content'"))?;
             if config.read_only {
@@ -230,7 +240,10 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
 
 fn get_u64(args: &Value, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
-        Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer")),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer")),
         Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("argument '{key}' must be a number"),
     }

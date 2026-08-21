@@ -97,10 +97,7 @@ impl OllamaClient {
             .context("failed to reach Ollama server; is `ollama serve` running?")?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Ollama /api/tags returned HTTP {}",
-                resp.status()
-            ));
+            return Err(anyhow!("Ollama /api/tags returned HTTP {}", resp.status()));
         }
 
         let body: TagsResponse = resp
@@ -145,9 +142,7 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Ollama /api/chat returned HTTP {status}: {text}"
-            ));
+            return Err(anyhow!("Ollama /api/chat returned HTTP {status}: {text}"));
         }
 
         let body: ChatResponse = resp
@@ -173,9 +168,7 @@ impl OllamaClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Ollama /api/pull returned HTTP {status}: {text}"
-            ));
+            return Err(anyhow!("Ollama /api/pull returned HTTP {status}: {text}"));
         }
 
         let body: Value = resp
