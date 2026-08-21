@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # openBatarangs installer/updater
 #   Install:  curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
