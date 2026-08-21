@@ -72,6 +72,28 @@ cargo install --path .
 
 The binary is at `target/release/openbatrangs` (or `~/.cargo/bin/openbatrangs`).
 
+### Prebuilt binaries (easiest)
+
+Download from the latest GitHub release:
+
+```sh
+# Linux x86_64 (most desktops/laptops)
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-unknown-linux-gnu
+
+# Linux aarch64 (Jetson, Raspberry Pi 5, Apple silicon Linux)
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-unknown-linux-gnu
+
+chmod +x openbatrangs
+./openbatrangs setup
+./openbatrangs
+```
+
+Or use the installer:
+
+```sh
+curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
+```
+
 ## Quick start
 
 ```sh
