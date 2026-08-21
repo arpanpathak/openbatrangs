@@ -509,22 +509,37 @@ impl App {
         }
     }
 
+    /// Keep the byte cursor on a valid UTF-8 boundary and within bounds.
+    fn clamp_cursor_to_boundary(&mut self) {
+        self.cursor = self.cursor.min(self.input.len());
+        while self.cursor > 0 && !self.input.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+
     fn insert_char(&mut self, character: char) {
+        self.clamp_cursor_to_boundary();
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
     }
 
     pub(super) fn insert_text(&mut self, text: &str) {
-        self.input.insert_str(self.cursor, text);
+        self.clamp_cursor_to_boundary();
+        // Normalize CRLF/CR pastes to plain newlines so multiline paste behaves
+        // identically across terminals and never leaves stray control chars.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.cursor, &text);
         self.cursor += text.len();
     }
 
     fn insert_newline(&mut self) {
+        self.clamp_cursor_to_boundary();
         self.input.insert(self.cursor, '\n');
         self.cursor += 1;
     }
 
     fn backspace(&mut self) {
+        self.clamp_cursor_to_boundary();
         if self.cursor > 0 {
             let mut index = self.cursor;
             while index > 0 && !self.input.is_char_boundary(index - 1) {
@@ -536,12 +551,14 @@ impl App {
     }
 
     fn delete(&mut self) {
+        self.clamp_cursor_to_boundary();
         if self.cursor < self.input.len() {
             self.input.remove(self.cursor);
         }
     }
 
     fn move_left(&mut self) {
+        self.clamp_cursor_to_boundary();
         if self.cursor > 0 {
             let mut index = self.cursor;
             while index > 0 && !self.input.is_char_boundary(index - 1) {
@@ -552,6 +569,7 @@ impl App {
     }
 
     fn move_right(&mut self) {
+        self.clamp_cursor_to_boundary();
         if self.cursor < self.input.len() {
             let character = self.input[self.cursor..].chars().next().unwrap_or_default();
             self.cursor += character.len_utf8();
@@ -949,5 +967,25 @@ mod tests {
         app.move_right();
         app.backspace();
         app.delete();
+    }
+
+    #[test]
+    fn paste_multiline_crlf_unicode_keeps_cursor_valid() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        let text = "line1 😀\r\nline2 🦇\r\n```rust\r\nfn main() {}\r\n```";
+        app.insert_text(text);
+        assert!(app.input.is_char_boundary(app.cursor));
+        assert!(app.cursor <= app.input.len());
+        app.move_left();
+        app.move_right();
+        app.backspace();
+        app.delete();
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| super::super::ui::ui(frame, &mut app))
+            .expect("draw with pasted multiline input should not panic");
     }
 }
