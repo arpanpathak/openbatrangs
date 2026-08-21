@@ -78,16 +78,26 @@ fn confirm_or_abort(config: &AgentConfig, prompt: &str) -> Result<()> {
 }
 
 /// Terminal-clickable file path (OSC 8 hyperlink). Always emits an absolute path.
+///
+/// Control characters are stripped first so a malicious model cannot inject
+/// ANSI escape sequences into the terminal through a crafted file name.
 pub(super) fn clickable_path(cwd: &Path, path: &str) -> String {
     let joined = cwd.join(path);
     let full = std::path::absolute(&joined).unwrap_or(joined);
-    let display = full.to_string_lossy();
+    let display = sanitize_terminal_text(&full.to_string_lossy());
     let encoded = display
         .replace('%', "%25")
         .replace(' ', "%20")
         .replace('#', "%23")
         .replace('?', "%3F");
     format!("\x1b]8;;file://{encoded}\x1b\\{display}\x1b]8;;\x1b\\")
+}
+
+/// Remove control characters that could be interpreted as terminal escape codes.
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 pub(super) fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
@@ -114,6 +124,14 @@ mod tests {
         let link = clickable_path(path, "x");
         assert!(link.contains("a%20b%23c"));
         assert!(link.contains("/tmp/a b#c"));
+    }
+
+    #[test]
+    fn clickable_path_strips_terminal_escape_injection() {
+        let path = std::path::Path::new("/tmp");
+        let link = clickable_path(path, "evil\x1b]8;;http://evil\x1b\\file.txt");
+        assert!(!link.contains("\x1b]8;;http://evil"));
+        assert!(link.contains("file.txt"));
     }
 
     #[tokio::test]

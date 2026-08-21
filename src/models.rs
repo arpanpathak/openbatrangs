@@ -252,7 +252,12 @@ pub fn recommended_fallback_model(mem_budget: u64) -> &'static str {
 /// `true` if the name ends with `.gguf`, contains a path separator, or exists
 /// as a file on disk.
 pub fn looks_like_path(name: &str) -> bool {
-    name.ends_with(".gguf") || name.contains('/') || name.contains('\\') || Path::new(name).exists()
+    name.ends_with(".gguf")
+        || Path::new(name).is_absolute()
+        || name.starts_with('.')
+        || name.contains("..")
+        || name.contains('\\')
+        || Path::new(name).exists()
 }
 
 #[cfg(test)]
@@ -313,9 +318,17 @@ mod tests {
     #[test]
     fn looks_like_path_detects_paths() {
         assert!(looks_like_path("./model.gguf"));
-        assert!(looks_like_path("models/foo"));
+        assert!(looks_like_path("/tmp/foo"));
         assert!(looks_like_path("C:\\models\\foo"));
+        assert!(looks_like_path("../secret"));
         assert!(!looks_like_path("qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn namespaced_ollama_tags_are_not_paths() {
+        assert!(!looks_like_path("sebdg/emotional_llama:latest"));
+        assert!(!looks_like_path("ALIENTELLIGENCE/psychologist"));
+        assert!(!looks_like_path("models/foo"));
     }
 
     #[test]
