@@ -81,7 +81,7 @@ const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 const CHAT_SCROLL_STEP: usize = 5;
 /// Banner height: wordmark + Batman art + quote + model info + prompt.
-const COMPACT_BANNER_HEIGHT: u16 = 18;
+const COMPACT_BANNER_HEIGHT: u16 = 23;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 const CHAT_SYSTEM_PROMPT: &str =

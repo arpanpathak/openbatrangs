@@ -39,16 +39,21 @@ const BATMAN_QUOTES: &[&str] = &[
 /// # Returns
 /// Multi-line string containing the Batman logo and a random Batman quote.
 pub fn banner_text() -> String {
-    let batman = r#"          ______
-       _-'      '-_
-     -'            '-
-    /   |      |    \
-   |  __|  __  |__   |
-   | |  | |  | |  |  |
-   | |  | |  | |  |  |
-   | |__| |__| |__|  |
-    \                /
-     '-.__________.-'
+    let batman = r#"MMMMMMMMMMMMMMMMMMMMM.                             MMMMMMMMMMMMMMMMMMMMM
+ `MMMMMMMMMMMMMMMMMMMM           M\  /M           MMMMMMMMMMMMMMMMMMMM'
+   `MMMMMMMMMMMMMMMMMMM          MMMMMM          MMMMMMMMMMMMMMMMMMM'
+     MMMMMMMMMMMMMMMMMMM-_______MMMMMMMM_______-MMMMMMMMMMMMMMMMMMM
+      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+     .MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM.
+    MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+                   `MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM'
+                          `MMMMMMMMMMMMMMMMMM'
+                              `MMMMMMMMMM'
+                                 MMMMMM :F_P:
+                                  MMMM
+                                   MM
 "#;
 
     let quote_index = random_quote_index();
