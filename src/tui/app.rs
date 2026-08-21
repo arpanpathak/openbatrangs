@@ -367,7 +367,14 @@ impl App {
                     return self.submit_input(client, tx).await;
                 }
             }
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.input.is_empty() {
+                    self.should_quit = true;
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+            }
             _ => {}
         }
         Ok(self.should_quit)
@@ -466,6 +473,11 @@ impl App {
     fn insert_char(&mut self, character: char) {
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
+    }
+
+    pub(super) fn insert_text(&mut self, text: &str) {
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
     }
 
     fn insert_newline(&mut self) {

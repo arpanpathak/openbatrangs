@@ -19,8 +19,8 @@ use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -291,6 +291,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -308,6 +309,7 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -371,6 +373,7 @@ async fn run_loop(
                             break;
                         }
                     }
+                    Some(Ok(Event::Paste(text))) => app.insert_text(&text),
                     Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Ok(_)) => {}
