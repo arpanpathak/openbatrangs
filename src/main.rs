@@ -130,6 +130,15 @@ pub(crate) struct ModelPrefs {
     pub(crate) min_context: u64,
 }
 
+/// Agent execution mode selected in the TUI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentMode {
+    /// Full agentic loop with tools.
+    Agent,
+    /// Planning-only: read-only, no writes or shell commands.
+    Plan,
+}
+
 /// Runtime settings shared by the one-shot agent and the TUI worker.
 #[derive(Clone)]
 pub(crate) struct AgentRunConfig {
@@ -141,6 +150,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
     pub(crate) should_confirm: bool,
+    /// Agent vs planning mode.
+    pub(crate) mode: AgentMode,
 }
 
 #[tokio::main]
@@ -187,6 +198,7 @@ fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         max_steps: cli.max_steps,
         is_read_only: cli.is_read_only,
         should_confirm: cli.should_confirm,
+        mode: AgentMode::Agent,
     }
 }
 
@@ -349,7 +361,7 @@ async fn run_agent_task(
     let agent_config = AgentConfig {
         cwd: config.cwd.clone(),
         max_steps: config.max_steps,
-        is_read_only: config.is_read_only,
+        is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
     };
 

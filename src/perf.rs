@@ -33,10 +33,18 @@ pub struct SystemStats {
     pub cpu_util_percent: Option<f64>,
     /// Number of logical CPU cores.
     pub cpu_cores: usize,
-    /// Used system memory in MiB.
+    /// Green "used" system memory in MiB (matches jtop, excludes shared GPU).
     pub memory_used_mb: u64,
     /// Total system memory in MiB.
     pub memory_total_mb: u64,
+    /// GPU-shared memory in MiB (NvMapMemUsed on Jetson).
+    pub memory_shared_mb: u64,
+    /// Buffers in MiB.
+    pub memory_buffers_mb: u64,
+    /// Cached (+ SReclaimable) in MiB.
+    pub memory_cached_mb: u64,
+    /// Free memory in MiB.
+    pub memory_free_mb: u64,
 }
 
 /// GPU-only fields parsed from either `tegrastats` or `nvidia-smi`.
@@ -131,8 +139,8 @@ impl PerfMonitor {
             },
             None => parse_nvidia_smi().unwrap_or_default(),
         };
-        // Match jtop/free accounting: MemTotal - MemFree - Buffers - Cached.
-        let (memory_used_mb, memory_total_mb) = read_memory_mb();
+        // Match jtop: green used = (Total - Free - Buffers - Cached) - shared.
+        let memory = read_memory_mb();
 
         SystemStats {
             gpu_name: gpu.name,
@@ -145,8 +153,12 @@ impl PerfMonitor {
             cpu_cores: std::thread::available_parallelism()
                 .map(|count| count.get())
                 .unwrap_or(0),
-            memory_used_mb,
-            memory_total_mb,
+            memory_used_mb: memory.used_mb,
+            memory_total_mb: memory.total_mb,
+            memory_shared_mb: memory.shared_mb,
+            memory_buffers_mb: memory.buffers_mb,
+            memory_cached_mb: memory.cached_mb,
+            memory_free_mb: memory.free_mb,
         }
     }
 }
@@ -263,12 +275,24 @@ fn parse_float(field: &str) -> Option<f64> {
     field.parse().ok()
 }
 
-fn read_memory_mb() -> (u64, u64) {
+/// System memory breakdown matching jtop's RAM page.
+struct MemoryStats {
+    used_mb: u64,
+    total_mb: u64,
+    shared_mb: u64,
+    buffers_mb: u64,
+    cached_mb: u64,
+    free_mb: u64,
+}
+
+fn read_memory_mb() -> MemoryStats {
     let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mut total_kb = 0u64;
     let mut free_kb = 0u64;
     let mut buffers_kb = 0u64;
     let mut cached_kb = 0u64;
+    let mut reclaimable_kb = 0u64;
+    let mut shared_kb = 0u64;
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             total_kb = parse_kibibytes(rest);
@@ -278,12 +302,27 @@ fn read_memory_mb() -> (u64, u64) {
             buffers_kb = parse_kibibytes(rest);
         } else if let Some(rest) = line.strip_prefix("Cached:") {
             cached_kb = parse_kibibytes(rest);
+        } else if let Some(rest) = line.strip_prefix("SReclaimable:") {
+            reclaimable_kb = parse_kibibytes(rest);
+        } else if let Some(rest) = line.strip_prefix("NvMapMemUsed:") {
+            shared_kb = parse_kibibytes(rest);
         }
     }
     let total_mb = total_kb / 1024;
-    let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb);
-    let used_mb = used_kb / 1024;
-    (used_mb, total_mb)
+    let free_mb = free_kb / 1024;
+    let buffers_mb = buffers_kb / 1024;
+    let cached_mb = (cached_kb + reclaimable_kb) / 1024;
+    let shared_mb = shared_kb / 1024;
+    let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb + reclaimable_kb);
+    let used_mb = used_kb.saturating_sub(shared_kb) / 1024;
+    MemoryStats {
+        used_mb,
+        total_mb,
+        shared_mb,
+        buffers_mb,
+        cached_mb,
+        free_mb,
+    }
 }
 
 fn parse_kibibytes(rest: &str) -> u64 {

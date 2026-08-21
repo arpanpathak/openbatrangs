@@ -12,7 +12,7 @@
 use crate::agent::{AgentConfig, Reporter};
 use crate::ollama::OllamaClient;
 use crate::perf::{PerfMonitor, SystemStats, TegrastatsGuard};
-use crate::{resolve_model, resolve_model_context, AgentRunConfig, Cli, ModelPrefs};
+use crate::{resolve_model, resolve_model_context, AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Slash commands recognized by the TUI.
 const COMMANDS: &[&str] = &[
@@ -48,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "doctor",
     "clear",
     "perf",
+    "mode",
 ];
 
 /// Spinner frames shown while the agent is working.
@@ -69,12 +71,20 @@ const SUGGESTIONS_HEIGHT: u16 = 4;
 const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;
 /// Height of the model picker popup as a percentage of the screen.
 const MODEL_PICKER_HEIGHT_PERCENT: u16 = 40;
-/// Height of the live performance panel (border + two content lines).
-const PERF_PANEL_HEIGHT: u16 = 4;
+/// Height of the live performance panel (border + three content lines).
+const PERF_PANEL_HEIGHT: u16 = 5;
 /// Minimum elapsed time before the token-rate estimate refreshes.
 const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;
 /// Minimum terminal height for showing the performance panel automatically.
 const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
+/// Number of lines scrolled per PageUp/PageDown in the chat area.
+const CHAT_SCROLL_STEP: usize = 5;
+/// Compact banner height when the terminal is small (wordmark + quote).
+const COMPACT_BANNER_HEIGHT: u16 = 6;
+/// Full banner height when the terminal is tall enough.
+const FULL_BANNER_HEIGHT: u16 = 19;
+/// Terminal height threshold for showing the full banner.
+const FULL_BANNER_MIN_HEIGHT: u16 = 30;
 
 enum UiEvent {
     Log(String),
@@ -130,6 +140,7 @@ struct App {
     status: String,
     last_action: String,
     auto_scroll: bool,
+    chat_scroll_offset: usize,
     spinner_frame: u64,
     task_queue: VecDeque<String>,
     picker: Option<PickerState>,
@@ -144,17 +155,19 @@ struct App {
     stream_chars: u64,
     stream_started_at: Option<Instant>,
     tokens_per_sec: f64,
+    current_task: Option<JoinHandle<()>>,
+    banner_lines: Vec<String>,
 }
 
 impl App {
     fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
         let banner = strip_ansi(&crate::banner::banner_text());
-        let mut log = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
-        log.push(String::new());
-        log.push(
+        let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
+        let log = vec![
+            String::new(),
             "Type a task, or /help. Enter sends, Shift+Enter adds a new line. /models picks a model."
                 .to_string(),
-        );
+        ];
         Self {
             log,
             live: String::new(),
@@ -167,6 +180,7 @@ impl App {
             status: "ready".to_string(),
             last_action: String::new(),
             auto_scroll: false,
+            chat_scroll_offset: 0,
             spinner_frame: 0,
             task_queue: VecDeque::new(),
             picker: None,
@@ -177,6 +191,7 @@ impl App {
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
                 should_confirm: cli.should_confirm,
+                mode: AgentMode::Agent,
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
@@ -186,6 +201,8 @@ impl App {
             stream_chars: 0,
             stream_started_at: None,
             tokens_per_sec: 0.0,
+            current_task: None,
+            banner_lines,
         }
     }
 
@@ -238,11 +255,12 @@ impl App {
             is_auto_pull_disabled: self.is_auto_pull_disabled,
             min_context: self.min_context,
         };
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result =
                 run_agent_worker(client2, run_config, model, prefs, task, tx2.clone()).await;
             let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
         });
+        self.current_task = Some(handle);
     }
 
     fn handle_event(
@@ -281,6 +299,7 @@ impl App {
                 }
             }
             UiEvent::Done(result) => {
+                self.current_task = None;
                 self.flush_live();
                 match result {
                     Ok(()) => {
@@ -293,6 +312,7 @@ impl App {
                 }
                 self.is_running = false;
                 self.last_action.clear();
+                self.auto_scroll = true;
                 if let Some(next) = self.task_queue.pop_front() {
                     self.log.push("▶️  Starting next queued task.".to_string());
                     self.start_task(next, client, tx);
@@ -315,6 +335,11 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char(character)
+                if character == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.cancel_task();
+            }
             KeyCode::Char(character) if character != '\r' => self.insert_char(character),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
@@ -324,6 +349,8 @@ impl App {
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
+            KeyCode::PageUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
+            KeyCode::PageDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
             KeyCode::Tab => self.accept_suggestion(),
             KeyCode::Enter => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -336,6 +363,23 @@ impl App {
             _ => {}
         }
         Ok(self.should_quit)
+    }
+
+    fn cancel_task(&mut self) {
+        if let Some(handle) = self.current_task.take() {
+            handle.abort();
+        }
+        self.is_running = false;
+        self.status = "ready".to_string();
+        self.last_action.clear();
+        self.auto_scroll = true;
+        self.flush_live();
+        self.log.push("⛔ Cancelled.".to_string());
+    }
+
+    fn scroll_chat(&mut self, delta: i32) {
+        self.auto_scroll = false;
+        self.chat_scroll_offset = (self.chat_scroll_offset as i32 + delta).max(0) as usize;
     }
 
     fn handle_picker_key(&mut self, key: event::KeyEvent) {
@@ -475,6 +519,7 @@ impl App {
             "setup" => self.handle_setup_command(client).await?,
             "clear" => self.clear_chat(),
             "perf" => self.toggle_perf(),
+            "mode" => self.handle_mode_command(arg),
             _ => self.log_unknown_command(name),
         }
         Ok(())
@@ -487,7 +532,9 @@ impl App {
         self.log
             .push("  /model <tag>, /read-only, /confirm, /perf".to_string());
         self.log
-            .push("  /steps <n>, /cwd <path>, /doctor, /clear".to_string());
+            .push("  /mode agent|plan, /steps <n>, /cwd <path>".to_string());
+        self.log
+            .push("  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll".to_string());
         self.log
             .push("  Shift+Enter = new line · Enter = send".to_string());
     }
@@ -551,6 +598,22 @@ impl App {
                 "OFF"
             }
         ));
+    }
+
+    fn handle_mode_command(&mut self, arg: &str) {
+        match arg {
+            "agent" => {
+                self.run_config.mode = AgentMode::Agent;
+                self.log
+                    .push("Mode: agent (full tools enabled)".to_string());
+            }
+            "plan" => {
+                self.run_config.mode = AgentMode::Plan;
+                self.log
+                    .push("Mode: plan (read-only, no writes/commands)".to_string());
+            }
+            _ => self.log.push("Usage: /mode agent|plan".to_string()),
+        }
     }
 
     fn handle_steps_command(&mut self, arg: &str) {
@@ -633,11 +696,18 @@ impl App {
             .unwrap_or_else(|| "--".to_string());
         let memory_used_gb = stats.memory_used_mb as f64 / 1024.0;
         let memory_total_gb = stats.memory_total_mb as f64 / 1024.0;
+        let memory_shared_gb = stats.memory_shared_mb as f64 / 1024.0;
+        let memory_buffers_gb = stats.memory_buffers_mb as f64 / 1024.0;
+        let memory_cached_gb = stats.memory_cached_mb as f64 / 1024.0;
+        let memory_free_gb = stats.memory_free_mb as f64 / 1024.0;
         let system = format!(
-            "CPU {cpu} · RAM {memory_used_gb:.1}/{memory_total_gb:.1} GB · {} cores · ⚡ {:.1} tok/s",
+            "CPU {cpu} · {} cores · ⚡ {:.1} tok/s",
             stats.cpu_cores, self.tokens_per_sec
         );
-        vec![gpu, system]
+        let ram = format!(
+            "RAM {memory_used_gb:.1}/{memory_total_gb:.1} GB · sh {memory_shared_gb:.1} · buf {memory_buffers_gb:.1} · cache {memory_cached_gb:.1} · free {memory_free_gb:.1}"
+        );
+        vec![gpu, system, ram]
     }
 
     fn log_unknown_command(&mut self, name: &str) {
@@ -667,7 +737,7 @@ async fn run_agent_worker(
     let agent_config = AgentConfig {
         cwd: config.cwd,
         max_steps: config.max_steps,
-        is_read_only: config.is_read_only,
+        is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
     };
     let mut reporter = ChannelReporter { tx };
@@ -684,14 +754,15 @@ async fn run_agent_worker(
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
-    render_chat_area(f, app, chunks[0]);
-    render_status_line(f, app, chunks[1]);
+    render_banner(f, app, chunks[0]);
+    render_chat_area(f, app, chunks[1]);
+    render_status_line(f, app, chunks[2]);
     if perf_visible(app, f.area().height) {
-        render_perf_panel(f, app, chunks[2]);
+        render_perf_panel(f, app, chunks[3]);
     }
-    render_suggestions(f, app, chunks[3]);
-    render_input_box(f, app, chunks[4]);
-    render_cursor(f, app, chunks[4]);
+    render_suggestions(f, app, chunks[4]);
+    render_input_box(f, app, chunks[5]);
+    render_cursor(f, app, chunks[5]);
     render_model_picker(f, app);
 }
 
@@ -699,11 +770,20 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
+fn banner_height(area_height: u16) -> u16 {
+    if area_height >= FULL_BANNER_MIN_HEIGHT {
+        FULL_BANNER_HEIGHT
+    } else {
+        COMPACT_BANNER_HEIGHT
+    }
+}
+
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
+            Constraint::Length(banner_height(area.height)),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Length(if perf_visible(app, area.height) {
@@ -720,6 +800,39 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         ])
         .split(area)
         .to_vec()
+}
+
+fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let full = area.height >= FULL_BANNER_HEIGHT;
+    let lines: Vec<Line> = app
+        .banner_lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            if full {
+                true
+            } else {
+                // Compact: wordmark (first 5 lines) + the quote (last line).
+                *index < 5 || *index + 1 == app.banner_lines.len()
+            }
+        })
+        .map(|(index, text)| {
+            let style = if index < 5 {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if index + 1 == app.banner_lines.len() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Magenta)
+            };
+            Line::from(Span::styled(text.clone(), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_chat_area(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -744,28 +857,34 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &App, area: Rect) {
 
 /// Compute a safe vertical scroll offset that never overflows `u16`.
 fn chat_scroll(app: &App, chat_text: &str, area_height: u16) -> u16 {
-    if !app.auto_scroll {
-        return 0;
-    }
     let content_height = chat_text.lines().count().max(1) as u16;
     let visible_height = area_height.saturating_sub(2);
-    content_height.saturating_sub(visible_height)
+    if app.auto_scroll {
+        content_height.saturating_sub(visible_height)
+    } else {
+        app.chat_scroll_offset.min(content_height as usize) as u16
+    }
 }
 
 fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let mode_suffix = if app.run_config.mode == AgentMode::Plan {
+        " · plan"
+    } else {
+        ""
+    };
     let status_line = if app.is_running {
         let spin = app.spinner();
         if app.last_action.is_empty() {
-            format!("{spin} {} — thinking...", app.status)
+            format!("{spin} {}{} — thinking...", app.status, mode_suffix)
         } else {
-            format!("{spin} {} — {}", app.status, app.last_action)
+            format!("{spin} {}{} — {}", app.status, mode_suffix, app.last_action)
         }
     } else if app.picker.is_some() {
         "↑↓ select · Enter confirm · Esc cancel".to_string()
     } else if !app.task_queue.is_empty() {
         format!("ready — {} queued", app.task_queue.len())
     } else {
-        app.status.clone()
+        format!("{}{} · PgUp/PgDn scroll", app.status, mode_suffix)
     };
     let status_style = if app.is_running {
         Style::default().fg(Color::Yellow)
