@@ -201,4 +201,4 @@ This is the first working version. Future steps for standalone distribution:
 
 ## License
 
-[AGPL-3.0](LICENSE) — same license as the CivicSense project. Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+[AGPL-3.0](LICENSE). Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
