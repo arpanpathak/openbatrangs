@@ -14,7 +14,10 @@ use crate::ollama::OllamaClient;
 use crate::perf::{PerfMonitor, SystemStats, TegrastatsGuard};
 use crate::{resolve_model, resolve_model_context, AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,7 +31,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::collections::VecDeque;
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -157,6 +161,9 @@ struct App {
     tokens_per_sec: f64,
     current_task: Option<JoinHandle<()>>,
     banner_lines: Vec<String>,
+    last_chat_area: Option<Rect>,
+    rate_window_chars: u64,
+    rate_window_start: Option<Instant>,
 }
 
 impl App {
@@ -203,6 +210,9 @@ impl App {
             tokens_per_sec: 0.0,
             current_task: None,
             banner_lines,
+            last_chat_area: None,
+            rate_window_chars: 0,
+            rate_window_start: None,
         }
     }
 
@@ -246,6 +256,8 @@ impl App {
         self.stream_chars = 0;
         self.stream_started_at = None;
         self.tokens_per_sec = 0.0;
+        self.rate_window_chars = 0;
+        self.rate_window_start = None;
         let tx2 = tx.clone();
         let client2 = client.clone();
         let run_config = self.run_config.clone();
@@ -286,11 +298,17 @@ impl App {
                     self.stream_started_at = Some(now);
                 }
                 self.stream_chars += msg.chars().count() as u64;
-                if let Some(started_at) = self.stream_started_at {
-                    let elapsed = now.duration_since(started_at).as_secs_f64();
+                if self.rate_window_start.is_none() {
+                    self.rate_window_start = Some(now);
+                }
+                self.rate_window_chars += msg.chars().count() as u64;
+                if let Some(window_start) = self.rate_window_start {
+                    let elapsed = now.duration_since(window_start).as_secs_f64();
                     if elapsed >= TOKEN_RATE_MIN_ELAPSED {
                         // Rough estimate: ~4 characters per token for local models.
-                        self.tokens_per_sec = (self.stream_chars as f64 / 4.0) / elapsed;
+                        self.tokens_per_sec = (self.rate_window_chars as f64 / 4.0) / elapsed;
+                        self.rate_window_chars = 0;
+                        self.rate_window_start = Some(now);
                     }
                 }
                 self.live.push_str(&msg);
@@ -380,6 +398,57 @@ impl App {
     fn scroll_chat(&mut self, delta: i32) {
         self.auto_scroll = false;
         self.chat_scroll_offset = (self.chat_scroll_offset as i32 + delta).max(0) as usize;
+    }
+
+    fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        match event.kind {
+            MouseEventKind::ScrollUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
+            MouseEventKind::ScrollDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.open_clicked_file(event.column, event.row);
+            }
+            _ => {}
+        }
+    }
+
+    fn open_clicked_file(&mut self, column: u16, row: u16) {
+        let Some(area) = self.last_chat_area else {
+            return;
+        };
+        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
+            return;
+        }
+        let relative = (row - area.y - 1) as usize;
+        let chat_text = self.chat_text();
+        let lines: Vec<&str> = chat_text.lines().collect();
+        let content_height = lines.len().max(1);
+        let visible_height = area.height.saturating_sub(2) as usize;
+        let scroll = if self.auto_scroll {
+            content_height.saturating_sub(visible_height)
+        } else {
+            self.chat_scroll_offset.min(content_height)
+        };
+        let line_index = scroll + relative;
+        let Some(line) = lines.get(line_index) else {
+            return;
+        };
+        let _ = column;
+        if let Some(path) = extract_path_from_line(line, &self.run_config.cwd) {
+            self.log
+                .push(format!("📂 Opening {} in vim...", path.display()));
+            open_in_vim(&path);
+        }
+    }
+
+    fn chat_text(&self) -> String {
+        let mut chat_text = self.log.join("\n");
+        if !self.live.is_empty() {
+            if !chat_text.is_empty() {
+                chat_text.push('\n');
+            }
+            chat_text.push_str(&self.live);
+        }
+        chat_text
     }
 
     fn handle_picker_key(&mut self, key: event::KeyEvent) {
@@ -723,6 +792,48 @@ fn split_command(line: &str) -> (&str, &str) {
     (name, arg)
 }
 
+/// Find an existing file path inside a chat line, resolving relative to `cwd`.
+fn extract_path_from_line(line: &str, cwd: &Path) -> Option<PathBuf> {
+    line.split_whitespace().find_map(|token| {
+        let candidate = if token.starts_with('/') {
+            PathBuf::from(token)
+        } else {
+            cwd.join(token)
+        };
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// Open a file in `vim` inside a new terminal window.
+fn open_in_vim(path: &Path) {
+    let path_str = path.to_string_lossy().to_string();
+    let terminals = [
+        "x-terminal-emulator",
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "alacritty",
+        "kitty",
+    ];
+    for terminal in terminals {
+        let spawned = match terminal {
+            "gnome-terminal" => Command::new(terminal)
+                .arg("--")
+                .arg("vim")
+                .arg(&path_str)
+                .spawn(),
+            _ => Command::new(terminal)
+                .arg("-e")
+                .arg("vim")
+                .arg(&path_str)
+                .spawn(),
+        };
+        if spawned.is_ok() {
+            return;
+        }
+    }
+}
+
 async fn run_agent_worker(
     client: OllamaClient,
     config: AgentRunConfig,
@@ -835,14 +946,9 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_chat_area(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let mut chat_text = app.log.join("\n");
-    if !app.live.is_empty() {
-        if !chat_text.is_empty() {
-            chat_text.push('\n');
-        }
-        chat_text.push_str(&app.live);
-    }
+fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let chat_text = app.chat_text();
+    app.last_chat_area = Some(area);
     let scroll_y = chat_scroll(app, &chat_text, area.height);
     let chat = Paragraph::new(chat_text)
         .block(
@@ -1032,7 +1138,7 @@ pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
     terminal.hide_cursor()?;
@@ -1041,7 +1147,11 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
 
 fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     terminal.show_cursor()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     disable_raw_mode()?;
     println!("👋 Bye!");
     Ok(())
@@ -1078,6 +1188,7 @@ async fn run_loop(
                             break;
                         }
                     }
+                    Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),

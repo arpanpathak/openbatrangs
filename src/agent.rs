@@ -14,8 +14,8 @@ const COLOR_BOLD: &str = "\x1b[1m";
 const COLOR_DIM: &str = "\x1b[2m";
 const COLOR_RESET: &str = "\x1b[0m";
 
-/// Model context window caps.
-const MAX_CONTEXT_TOKENS: u64 = 32_768;
+/// Model context window caps. Lower max keeps attention faster on edge GPUs.
+const MAX_CONTEXT_TOKENS: u64 = 16_384;
 const MIN_CONTEXT_TOKENS: u64 = 4_096;
 
 /// Tool argument defaults.
