@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🦇 openBatarangs
+<img src="assets/logo.svg" alt="openBatarangs" width="220"/>
+
+# openBatarangs
 
 > *Agentic coding CLI for local models.*
 >
