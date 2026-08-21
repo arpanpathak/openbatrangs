@@ -54,6 +54,7 @@ const COMMANDS: &[&str] = &[
     "mode",
     "thinking",
     "mouse",
+    "yolo",
 ];
 
 /// Spinner frames shown while the agent is working.
@@ -112,17 +113,36 @@ fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for n in chars.by_ref() {
-                if n.is_ascii_alphabetic() || n == '\\' {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
+        match c {
+            '\x1b' => skip_escape_sequence(&mut chars),
+            _ => out.push(c),
         }
     }
     out
+}
+
+fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
+    match chars.clone().next() {
+        // OSC: ESC ] ... BEL / ST
+        Some(']') => {
+            chars.next();
+            for n in chars.by_ref() {
+                match n {
+                    '\x07' | '\x1b' => break,
+                    _ => {}
+                }
+            }
+        }
+        // CSI / other: ESC [ ... final byte
+        _ => {
+            for n in chars.by_ref() {
+                match n {
+                    value if value.is_ascii_alphabetic() || value == '\\' => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 fn split_command(line: &str) -> (&str, &str) {

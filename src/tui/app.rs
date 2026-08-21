@@ -93,7 +93,7 @@ impl App {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
-                should_confirm: cli.should_confirm,
+                should_confirm: true,
                 mode: AgentMode::Agent,
                 show_thinking: true,
             },
@@ -587,6 +587,7 @@ impl App {
             "mode" => self.handle_mode_command(arg),
             "thinking" => self.handle_thinking_command(arg),
             "mouse" => self.handle_mouse_command(arg),
+            "yolo" => self.handle_yolo_command(),
             _ => self.log_unknown_command(name),
         }
         Ok(())
@@ -605,6 +606,10 @@ impl App {
         );
         self.log.push(
             "  Mouse select/copy always on by default · /mouse on for wheel/click".to_string(),
+        );
+        self.log.push(
+            "  Confirmations ON by default · /yolo to skip them · /confirm to re-enable"
+                .to_string(),
         );
         self.log
             .push("  Shift+Enter / Ctrl+J = new line · Enter = send".to_string());
@@ -737,6 +742,14 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn handle_yolo_command(&mut self) {
+        self.run_config.should_confirm = false;
+        self.log.push(
+            "⚠️  YOLO mode ON — agent writes/commands run without confirmation. Be careful!"
+                .to_string(),
+        );
     }
 
     fn handle_steps_command(&mut self, arg: &str) {
