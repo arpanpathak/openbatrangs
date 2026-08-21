@@ -1,12 +1,14 @@
 //! Ratatui rendering for the TUI.
 
 use super::app::App;
-use super::{
-    text_wrapped_height, wrap_text_to_lines, COMPACT_BANNER_HEIGHT, INPUT_BOX_PADDING,
-    MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT, MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT,
-};
+use super::{text_wrapped_height, wrap_text_to_lines};
 use crate::cli::AgentMode;
+use crate::constants::tui::{
+    COMPACT_BANNER_HEIGHT, FULL_BANNER_MIN_TERMINAL_HEIGHT, FULL_BANNER_MIN_WIDTH,
+    INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
+    MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, SMALL_BANNER_HEIGHT,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -21,9 +23,6 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-/// Maximum height of the performance panel once wrapped lines are accounted for.
-const PERF_MAX_PANEL_HEIGHT: u16 = 8;
 
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
@@ -44,10 +43,10 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
 }
 
 fn banner_height(area_height: u16) -> u16 {
-    if area_height >= 30 {
+    if area_height >= FULL_BANNER_MIN_TERMINAL_HEIGHT {
         COMPACT_BANNER_HEIGHT
     } else {
-        7
+        SMALL_BANNER_HEIGHT
     }
 }
 
@@ -55,7 +54,7 @@ fn suggestions_height(app: &App) -> u16 {
     let count = app.suggestions().len();
     match count {
         0 => 0,
-        _ => count.min(6) as u16 + 2,
+        _ => count.min(MAX_SUGGESTION_ITEMS) as u16 + 2,
     }
 }
 
@@ -89,7 +88,7 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let full = area.height >= COMPACT_BANNER_HEIGHT && area.width >= 20;
+    let full = area.height >= COMPACT_BANNER_HEIGHT && area.width >= FULL_BANNER_MIN_WIDTH;
     let mut lines: Vec<Line> = app
         .banner_lines
         .iter()

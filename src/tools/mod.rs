@@ -15,5 +15,4 @@ mod path;
 mod text;
 
 pub(crate) use command::run_command;
-pub(crate) use files::{grep_files, list_files, read_file, write_file, DEFAULT_LIST_DEPTH};
-pub(crate) use text::MAX_TOOL_OUTPUT;
+pub(crate) use files::{grep_files, list_files, read_file, write_file};

@@ -2,40 +2,11 @@
 
 use super::path::resolve_in_root;
 use super::text::{truncate, truncate_to};
+use crate::constants::tools::{BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, HEAVY_DIRS, MAX_LISTED_FILES};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::path::Path;
 use walkdir::WalkDir;
-
-/// Directories skipped during recursive walks (build caches, VCS, dependencies).
-const HEAVY_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".cache",
-    ".next",
-    ".nuxt",
-    ".idea",
-    ".vscode",
-    ".agent",
-];
-
-/// Default depth for `list_files` in the agent's initial context.
-pub(crate) const DEFAULT_LIST_DEPTH: usize = 5;
-
-/// Depth used by `grep_files` when scanning the workspace.
-const GREP_MAX_DEPTH: usize = 12;
-
-/// Maximum number of files listed before truncating.
-const MAX_LISTED_FILES: usize = 5_000;
-
-/// Number of leading bytes inspected to detect binary files.
-const BINARY_SNIFF_BYTES: usize = 8_192;
 
 /// Returns true when a directory name should be skipped by recursive walks.
 fn is_heavy_dir(name: &str) -> bool {

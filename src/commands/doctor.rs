@@ -1,5 +1,6 @@
 //! Doctor/health-check command.
 
+use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::model_select::calculate_memory_budget;
 use crate::models;
 use crate::ollama::{OllamaClient, OllamaModel};
@@ -33,7 +34,7 @@ fn doctor_lines_from_tags(base_url: &str, tags: &[OllamaModel], min_context: u64
             ));
             lines.push(format!(
                 "   {:.1} GB, {} params, {} context, {}",
-                best.size_bytes as f64 / 1e9,
+                best.size_bytes as f64 / BYTES_PER_GIGABYTE,
                 best.parameter_size,
                 best.context_length,
                 best.quantization

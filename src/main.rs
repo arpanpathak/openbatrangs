@@ -7,6 +7,7 @@ mod agent;
 mod banner;
 mod cli;
 mod commands;
+mod constants;
 mod model_select;
 mod models;
 mod ollama;

@@ -1,16 +1,18 @@
 //! TUI application state and event handling.
 
-use super::{
-    chat_visual_line_indices, open_in_vim, run_agent_worker, split_command, strip_ansi, UiEvent,
-    CHAT_SCROLL_STEP, COMMANDS, MAX_CHAT_HISTORY_MESSAGES, MAX_LIVE_CHARS, TOKEN_RATE_MIN_ELAPSED,
-};
+use super::{chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, UiEvent};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
+use crate::constants::models::BYTES_PER_GIGABYTE;
+use crate::constants::perf::MIB_PER_GIB;
+use crate::constants::tui::{
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, COMMANDS, MAX_CHAT_HISTORY_MESSAGES,
+    MAX_LIVE_CHARS, PREFIXED_COMMANDS, SPINNER, TOKEN_RATE_MIN_ELAPSED,
+};
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
 use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -26,8 +28,8 @@ pub(super) struct App {
     pub(super) live: String,
     pub(super) input: String,
     pub(super) cursor: usize,
-    history: Vec<String>,
-    history_idx: Option<usize>,
+    pub(super) history: Vec<String>,
+    pub(super) history_idx: Option<usize>,
     pub(super) selected: usize,
     pub(super) is_running: bool,
     pub(super) status: String,
@@ -36,28 +38,28 @@ pub(super) struct App {
     pub(super) chat_scroll_offset: usize,
     pub(super) spinner_frame: u64,
     pub(super) task_queue: VecDeque<String>,
-    chat_history: Vec<ChatMessage>,
+    pub(super) chat_history: Vec<ChatMessage>,
     pub(super) picker: Option<PickerState>,
     pub(super) should_quit: bool,
-    model: Option<String>,
-    server_url: String,
-    model_info: Option<String>,
-    current_prompt: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) server_url: String,
+    pub(super) model_info: Option<String>,
+    pub(super) current_prompt: Option<String>,
     pub(super) run_config: AgentRunConfig,
-    min_context: u64,
-    is_auto_pull_disabled: bool,
+    pub(super) min_context: u64,
+    pub(super) is_auto_pull_disabled: bool,
     pub(super) show_perf: bool,
     pub(super) mouse_capture: bool,
     pub(super) perf: PerfMonitor,
     pub(super) system_stats: SystemStats,
-    stream_chars: u64,
-    stream_started_at: Option<Instant>,
+    pub(super) stream_chars: u64,
+    pub(super) stream_started_at: Option<Instant>,
     pub(super) tokens_per_sec: f64,
-    current_task: Option<JoinHandle<()>>,
+    pub(super) current_task: Option<JoinHandle<()>>,
     pub(super) banner_lines: Vec<String>,
     pub(super) last_chat_area: Option<Rect>,
-    rate_window_chars: u64,
-    rate_window_start: Option<Instant>,
+    pub(super) rate_window_chars: u64,
+    pub(super) rate_window_start: Option<Instant>,
 }
 
 impl App {
@@ -121,39 +123,20 @@ impl App {
             return vec![];
         }
         let query = &self.input[1..];
-        if let Some(arg) = query.strip_prefix("mode ") {
-            return ["agent", "plan", "chat"]
-                .iter()
-                .filter(|option| option.starts_with(arg))
-                .map(|option| format!("/mode {option}"))
-                .collect();
-        }
-        if query == "mode" {
-            return vec![
-                "/mode agent".to_string(),
-                "/mode plan".to_string(),
-                "/mode chat".to_string(),
-            ];
-        }
-        if let Some(arg) = query.strip_prefix("thinking ") {
-            return ["on", "off"]
-                .iter()
-                .filter(|option| option.starts_with(arg))
-                .map(|option| format!("/thinking {option}"))
-                .collect();
-        }
-        if query == "thinking" {
-            return vec!["/thinking on".to_string(), "/thinking off".to_string()];
-        }
-        if let Some(arg) = query.strip_prefix("mouse ") {
-            return ["on", "off"]
-                .iter()
-                .filter(|option| option.starts_with(arg))
-                .map(|option| format!("/mouse {option}"))
-                .collect();
-        }
-        if query == "mouse" {
-            return vec!["/mouse on".to_string(), "/mouse off".to_string()];
+        for (prefix, options) in PREFIXED_COMMANDS {
+            if query == prefix.trim_end() {
+                return options
+                    .iter()
+                    .map(|option| format!("/{prefix}{option}"))
+                    .collect();
+            }
+            if let Some(arg) = query.strip_prefix(prefix) {
+                return options
+                    .iter()
+                    .filter(|option| option.starts_with(arg))
+                    .map(|option| format!("/{prefix}{option}"))
+                    .collect();
+            }
         }
         COMMANDS
             .iter()
@@ -193,7 +176,7 @@ impl App {
         }) else {
             return;
         };
-        let size_gb = model.size as f64 / 1e9;
+        let size_gb = model.size as f64 / BYTES_PER_GIGABYTE;
         let params = model
             .details
             .as_ref()
@@ -222,8 +205,8 @@ impl App {
     }
 
     pub(super) fn spinner(&self) -> &'static str {
-        super::SPINNER
-            .get((self.spinner_frame as usize) % super::SPINNER.len())
+        SPINNER
+            .get((self.spinner_frame as usize) % SPINNER.len())
             .copied()
             .unwrap_or("")
     }
@@ -305,8 +288,8 @@ impl App {
                 if let Some(window_start) = self.rate_window_start {
                     let elapsed = now.duration_since(window_start).as_secs_f64();
                     if elapsed >= TOKEN_RATE_MIN_ELAPSED {
-                        // Rough estimate: ~4 characters per token for local models.
-                        self.tokens_per_sec = (self.rate_window_chars as f64 / 4.0) / elapsed;
+                        self.tokens_per_sec =
+                            (self.rate_window_chars as f64 / CHARS_PER_TOKEN) / elapsed;
                         self.rate_window_chars = 0;
                         self.rate_window_start = Some(now);
                     }
@@ -638,7 +621,7 @@ impl App {
         self.auto_scroll = true;
         if !task.starts_with('/') {
             self.current_prompt = Some(task.clone());
-            self.log.push("─".repeat(60));
+            self.log.push("─".repeat(CHAT_SEPARATOR_LENGTH));
             self.log.push(format!("You: {task}"));
         }
         if task.starts_with('/') {
@@ -651,251 +634,6 @@ impl App {
             self.start_task(task, client, tx);
         }
         Ok(self.should_quit)
-    }
-
-    async fn run_slash_command(&mut self, client: &OllamaClient, line: &str) -> anyhow::Result<()> {
-        let (name, arg) = split_command(line);
-        match name {
-            "help" | "h" => self.log_help(),
-            "exit" | "quit" => self.should_quit = true,
-            "models" => self.show_model_picker(client).await?,
-            "model" => self.handle_model_command(client, arg).await?,
-            "read-only" => self.toggle_read_only(),
-            "confirm" => self.toggle_confirm(),
-            "steps" => self.handle_steps_command(arg),
-            "cwd" => self.handle_cwd_command(arg),
-            "doctor" => self.handle_doctor_command(client).await?,
-            "setup" => self.handle_setup_command(client).await?,
-            "clear" => self.clear_chat(),
-            "perf" => self.toggle_perf(),
-            "mode" => self.handle_mode_command(arg),
-            "thinking" => self.handle_thinking_command(arg),
-            "mouse" => self.handle_mouse_command(arg),
-            "yolo" => self.handle_yolo_command(),
-            _ => self.log_unknown_command(name),
-        }
-        Ok(())
-    }
-
-    fn log_help(&mut self) {
-        self.log.push("Commands:".to_string());
-        self.log
-            .push("  /help, /exit, /quit, /setup, /models".to_string());
-        self.log
-            .push("  /model <tag>, /read-only, /confirm, /perf".to_string());
-        self.log
-            .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
-        self.log.push(
-            "  /doctor, /clear, /mouse on|off · Ctrl+C cancel · PgUp/PgDn scroll".to_string(),
-        );
-        self.log.push(
-            "  Mouse select/copy always on by default · /mouse on for wheel/click".to_string(),
-        );
-        self.log.push(
-            "  Confirmations ON by default · /yolo to skip them · /confirm to re-enable"
-                .to_string(),
-        );
-        self.log
-            .push("  Shift+Enter / Ctrl+J = new line · Enter = send".to_string());
-    }
-
-    async fn show_model_picker(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
-        let tags = client.tags().await?;
-        if tags.is_empty() {
-            self.log
-                .push("No models installed. Run /setup.".to_string());
-        } else {
-            self.picker = Some(PickerState {
-                models: tags.into_iter().map(|model| model.name).collect(),
-                selected: 0,
-            });
-            self.status = "select model".to_string();
-        }
-        Ok(())
-    }
-
-    async fn handle_model_command(
-        &mut self,
-        client: &OllamaClient,
-        arg: &str,
-    ) -> anyhow::Result<()> {
-        if arg.is_empty() {
-            match &self.model {
-                Some(model) => self.log.push(format!("Current model: {model}")),
-                None => self
-                    .log
-                    .push("Auto mode — best model will be selected on first task.".to_string()),
-            }
-        } else {
-            let tags = client.tags().await?;
-            if tags.iter().any(|model| model.name == arg) {
-                self.model = Some(arg.to_string());
-                self.log.push(format!("✅ Model set to {arg}"));
-                self.refresh_model_info(client).await;
-            } else {
-                self.log.push(format!(
-                    "❌ Model '{arg}' is not installed. Try /models or /setup."
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn toggle_read_only(&mut self) {
-        self.run_config.is_read_only = !self.run_config.is_read_only;
-        let state = match self.run_config.is_read_only {
-            true => "ON",
-            false => "OFF",
-        };
-        self.log.push(format!("Read-only mode: {state}"));
-    }
-
-    fn toggle_confirm(&mut self) {
-        self.run_config.should_confirm = !self.run_config.should_confirm;
-        let state = match self.run_config.should_confirm {
-            true => "ON",
-            false => "OFF",
-        };
-        self.log.push(format!("Confirm mode: {state}"));
-    }
-
-    fn handle_mode_command(&mut self, arg: &str) {
-        match arg {
-            "agent" => {
-                self.run_config.mode = AgentMode::Agent;
-                self.log
-                    .push("Mode: agent (full tools enabled)".to_string());
-            }
-            "plan" => {
-                self.run_config.mode = AgentMode::Plan;
-                self.log
-                    .push("Mode: plan (read-only, explores and plans)".to_string());
-            }
-            "chat" => {
-                self.run_config.mode = AgentMode::Chat;
-                self.log
-                    .push("Mode: chat (no tools, conversation + code)".to_string());
-            }
-            _ => self.log.push("Usage: /mode agent|plan|chat".to_string()),
-        }
-    }
-
-    fn handle_thinking_command(&mut self, arg: &str) {
-        match arg {
-            "on" => {
-                self.run_config.show_thinking = true;
-                self.log.push("Thinking display: ON".to_string());
-            }
-            "off" => {
-                self.run_config.show_thinking = false;
-                self.log.push("Thinking display: OFF".to_string());
-            }
-            _ => {
-                self.log.push(format!(
-                    "Thinking display: {} · Usage: /thinking on|off",
-                    if self.run_config.show_thinking {
-                        "ON"
-                    } else {
-                        "OFF"
-                    }
-                ));
-            }
-        }
-    }
-
-    fn handle_mouse_command(&mut self, arg: &str) {
-        match arg {
-            "on" => {
-                self.mouse_capture = true;
-                self.log.push(
-                    "Mouse mode: ON (wheel scroll + click-to-open, selection via Shift+drag)"
-                        .to_string(),
-                );
-            }
-            "off" => {
-                self.mouse_capture = false;
-                self.log.push(
-                    "Mouse mode: OFF (native select/copy always works, scroll with PgUp/PgDn)"
-                        .to_string(),
-                );
-            }
-            _ => {
-                self.log.push(format!(
-                    "Mouse mode: {} · Usage: /mouse on|off",
-                    if self.mouse_capture { "ON" } else { "OFF" }
-                ));
-            }
-        }
-    }
-
-    fn handle_yolo_command(&mut self) {
-        self.run_config.should_confirm = false;
-        self.log.push(
-            "⚠️  YOLO mode ON — agent writes/commands run without confirmation. Be careful!"
-                .to_string(),
-        );
-    }
-
-    fn handle_steps_command(&mut self, arg: &str) {
-        match arg.parse::<usize>() {
-            Ok(steps) if steps > 0 => {
-                self.run_config.max_steps = steps;
-                self.log.push(format!("Max steps set to {steps}"));
-            }
-            _ => self.log.push("Usage: /steps <positive number>".to_string()),
-        }
-    }
-
-    fn handle_cwd_command(&mut self, arg: &str) {
-        match arg.is_empty() {
-            true => self
-                .log
-                .push(format!("Workspace: {}", self.run_config.cwd.display())),
-            false => {
-                self.run_config.cwd = PathBuf::from(arg);
-                self.log.push(format!(
-                    "Workspace set to {}",
-                    self.run_config.cwd.display()
-                ));
-            }
-        }
-    }
-
-    async fn handle_doctor_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
-        for line in crate::commands::doctor_lines(client, self.min_context).await? {
-            self.log.push(line);
-        }
-        Ok(())
-    }
-
-    async fn handle_setup_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
-        self.log.push("Running setup...".to_string());
-        let messages = std::sync::Mutex::new(Vec::new());
-        crate::commands::setup_with_status(client, &|msg| {
-            if let Ok(mut messages) = messages.lock() {
-                messages.push(msg.to_string());
-            }
-        })
-        .await?;
-        let messages = messages.into_inner().unwrap_or_default();
-        self.log.extend(messages);
-        self.log.push("✅ Setup finished.".to_string());
-        Ok(())
-    }
-
-    fn clear_chat(&mut self) {
-        self.log.clear();
-        self.live.clear();
-        self.current_prompt = None;
-        self.chat_history.clear();
-    }
-
-    fn toggle_perf(&mut self) {
-        self.show_perf = !self.show_perf;
-        self.log.push(format!(
-            "Perf panel: {}",
-            if self.show_perf { "ON" } else { "OFF" }
-        ));
     }
 
     pub(super) fn perf_lines(&self) -> Vec<String> {
@@ -926,12 +664,12 @@ impl App {
             .cpu_util_percent
             .map(|util| format!("{util:.0}%"))
             .unwrap_or_else(|| "--".to_string());
-        let memory_used_gb = stats.memory_used_mb as f64 / 1024.0;
-        let memory_total_gb = stats.memory_total_mb as f64 / 1024.0;
-        let memory_shared_gb = stats.memory_shared_mb as f64 / 1024.0;
-        let memory_buffers_gb = stats.memory_buffers_mb as f64 / 1024.0;
-        let memory_cached_gb = stats.memory_cached_mb as f64 / 1024.0;
-        let memory_free_gb = stats.memory_free_mb as f64 / 1024.0;
+        let memory_used_gb = stats.memory_used_mb as f64 / MIB_PER_GIB;
+        let memory_total_gb = stats.memory_total_mb as f64 / MIB_PER_GIB;
+        let memory_shared_gb = stats.memory_shared_mb as f64 / MIB_PER_GIB;
+        let memory_buffers_gb = stats.memory_buffers_mb as f64 / MIB_PER_GIB;
+        let memory_cached_gb = stats.memory_cached_mb as f64 / MIB_PER_GIB;
+        let memory_free_gb = stats.memory_free_mb as f64 / MIB_PER_GIB;
         let system = format!(
             "CPU {cpu} · {} cores · ⚡ {:.1} tok/s",
             stats.cpu_cores, self.tokens_per_sec
@@ -940,11 +678,6 @@ impl App {
             "RAM {memory_used_gb:.1}/{memory_total_gb:.1} GB · sh {memory_shared_gb:.1} · buf {memory_buffers_gb:.1} · cache {memory_cached_gb:.1} · free {memory_free_gb:.1}"
         );
         vec![gpu, system, ram]
-    }
-
-    fn log_unknown_command(&mut self, name: &str) {
-        self.log
-            .push(format!("Unknown command: /{name}. Try /help"));
     }
 }
 

@@ -1,12 +1,12 @@
 //! Ollama onboarding: install/start Ollama and pull a recommended model.
 
-use super::{has_ollama_binary, SETUP_START_POLL_ATTEMPTS};
+use super::{has_ollama_binary, start_ollama_server, wait_until_available};
+use crate::constants::commands::{OLLAMA_INSTALL_SCRIPT_URL, SETUP_START_POLL_ATTEMPTS};
 use crate::model_select::calculate_memory_budget;
 use crate::models;
 use crate::ollama::OllamaClient;
 use anyhow::{bail, Context, Result};
 use std::process::Stdio;
-use std::time::Duration;
 
 /// One-command onboarding: install/start Ollama and pull a recommended model.
 pub(crate) async fn setup(client: &OllamaClient) -> Result<()> {
@@ -46,33 +46,31 @@ async fn install_and_start_ollama(
     on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     if !has_ollama_binary() {
-        on_status(
-            "⬇️  Ollama not found. Installing with the official script (may ask for sudo)...",
-        );
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("curl -fsSL https://ollama.com/install.sh | sh")
-            .status()
-            .context("failed to run Ollama installer")?;
-        if !status.success() {
-            bail!("Ollama install failed. Install manually from https://ollama.com/download/linux");
-        }
+        install_ollama(on_status)?;
     }
 
     on_status("🔄 Starting Ollama...");
-    let _child = std::process::Command::new("ollama")
-        .arg("serve")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    for _ in 0..SETUP_START_POLL_ATTEMPTS {
-        tokio::time::sleep(Duration::from_millis(super::OLLAMA_POLL_INTERVAL_MILLIS)).await;
-        if client.is_available().await {
-            on_status(&format!("✅ Ollama started at {}", client.base_url));
-            return Ok(());
-        }
+    start_ollama_server();
+    if wait_until_available(client, SETUP_START_POLL_ATTEMPTS).await? {
+        on_status(&format!("✅ Ollama started at {}", client.base_url));
+        return Ok(());
     }
 
     bail!("Ollama was installed but did not start. Try `ollama serve` manually.")
+}
+
+/// Install Ollama with the official script (may ask for sudo).
+fn install_ollama(on_status: &(dyn Fn(&str) + Sync)) -> Result<()> {
+    on_status("⬇️  Ollama not found. Installing with the official script (may ask for sudo)...");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("curl -fsSL {OLLAMA_INSTALL_SCRIPT_URL} | sh"))
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to run Ollama installer")?;
+    if !status.success() {
+        bail!("Ollama install failed. Install manually from https://ollama.com/download/linux");
+    }
+    Ok(())
 }

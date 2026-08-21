@@ -4,57 +4,19 @@
 //! on the current hardware. It balances memory fit, coding suitability,
 //! parameter count, context window, and quantization quality.
 
+use crate::constants::models::{
+    BYTES_PER_GIGABYTE, BYTES_PER_KIB, CODING_FALLBACK_BONUS, CODING_KEYWORDS,
+    DEFAULT_CONTEXT_LENGTH, FALLBACK_7B_MEMORY_THRESHOLD_BYTES, FALLBACK_MODEL_3B,
+    FALLBACK_MODEL_7B, FALLBACK_SYSTEM_MEMORY_BYTES, IDEAL_CONTEXT_LENGTH, MAX_LARGE_MODEL_B,
+    MAX_MEDIUM_MODEL_B, MAX_SMALL_MODEL_B, MEMORY_COMFORT_DIVISOR, MEMORY_FACTOR_COMFORTABLE,
+    MEMORY_FACTOR_OVERFLOW, MEMORY_FACTOR_TIGHT, MEMORY_FACTOR_UNKNOWN, MIN_CONTEXT_LENGTH,
+    MIN_SMALL_MODEL_B, PARAMETERS_MILLION_DIVISOR, QUANT_FALLBACK_BONUS, QUANT_KEYWORDS,
+    SCORE_SCALE, SIZE_FACTOR_HUGE, SIZE_FACTOR_LARGE, SIZE_FACTOR_MEDIUM, SIZE_FACTOR_SMALL,
+    SIZE_FACTOR_UNKNOWN, STRONG_CODING_SCORE, WEIGHT_CODING, WEIGHT_CONTEXT, WEIGHT_MEMORY,
+    WEIGHT_QUANTIZATION, WEIGHT_SIZE,
+};
 use crate::ollama::OllamaModel;
 use std::path::Path;
-
-/// Fallback memory size used when `/proc/meminfo` is unavailable (8 GiB).
-const FALLBACK_SYSTEM_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// Minimum context length assumed for a model with unknown context.
-const DEFAULT_CONTEXT_LENGTH: u64 = 4_096;
-/// Context length clamped to at least this value.
-const MIN_CONTEXT_LENGTH: u64 = 2_048;
-
-/// Context length considered "ideal" for agentic coding (32K).
-const IDEAL_CONTEXT_LENGTH: f64 = 32_768.0;
-
-/// Parameter-size sweet spots (in billions of parameters).
-const MIN_SMALL_MODEL_B: f64 = 1.0;
-const MAX_SMALL_MODEL_B: f64 = 4.0;
-const MAX_MEDIUM_MODEL_B: f64 = 8.0;
-const MAX_LARGE_MODEL_B: f64 = 14.0;
-
-/// Scoring weights for each model quality factor. Weights sum to 1.0.
-const WEIGHT_MEMORY: f64 = 0.45;
-const WEIGHT_SIZE: f64 = 0.20;
-const WEIGHT_CODING: f64 = 0.20;
-const WEIGHT_CONTEXT: f64 = 0.10;
-const WEIGHT_QUANTIZATION: f64 = 0.05;
-
-/// Score multipliers for memory fit.
-const MEMORY_FACTOR_UNKNOWN: f64 = 0.5;
-const MEMORY_FACTOR_COMFORTABLE: f64 = 1.0;
-const MEMORY_FACTOR_TIGHT: f64 = 0.6;
-const MEMORY_FACTOR_OVERFLOW: f64 = 0.0;
-
-/// Threshold for "comfortably fits": model size must be at most half the budget.
-const MEMORY_COMFORT_DIVISOR: u64 = 2;
-
-/// Parameter-size score multipliers.
-const SIZE_FACTOR_SMALL: f64 = 0.7;
-const SIZE_FACTOR_MEDIUM: f64 = 1.0;
-const SIZE_FACTOR_LARGE: f64 = 0.8;
-const SIZE_FACTOR_HUGE: f64 = 0.4;
-const SIZE_FACTOR_UNKNOWN: f64 = 0.5;
-
-/// Score threshold for considering a model "strongly coding".
-const STRONG_CODING_SCORE: f64 = 0.9;
-
-/// Score is stored as 0..100 instead of 0..1.
-const SCORE_SCALE: f64 = 100.0;
-
-/// Memory threshold (bytes) above which the 7B fallback model is preferred.
-const FALLBACK_7B_MEMORY_THRESHOLD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// `ModelScore` summarizes why a model is (or is not) a good agentic-coding pick.
 #[derive(Debug, Clone)]
@@ -87,8 +49,8 @@ pub fn total_system_memory_bytes() -> u64 {
                 .split_whitespace()
                 .next()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES / 1024);
-            return kilobytes * 1024;
+                .unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES / BYTES_PER_KIB);
+            return kilobytes * BYTES_PER_KIB;
         }
     }
     FALLBACK_SYSTEM_MEMORY_BYTES
@@ -110,7 +72,7 @@ fn parse_parameter_size(label: &str) -> f64 {
         .parse()
         .unwrap_or(0.0);
     if normalized.contains('m') {
-        number / 1000.0
+        number / PARAMETERS_MILLION_DIVISOR
     } else {
         number
     }
@@ -125,29 +87,11 @@ fn parse_parameter_size(label: &str) -> f64 {
 /// A value from 0.3 to 1.0; higher means more coding-oriented.
 fn coding_bonus(name: &str) -> f64 {
     let normalized = name.to_ascii_lowercase();
-    if normalized.contains("coder")
-        || normalized.contains("deepseek")
-        || normalized.contains("starcoder")
-    {
-        1.0
-    } else if normalized.contains("code")
-        || normalized.contains("devstral")
-        || normalized.contains("gpt-oss")
-    {
-        0.9
-    } else if normalized.contains("qwen3")
-        || normalized.contains("qwen2.5")
-        || normalized.contains("llama3.3")
-    {
-        0.6
-    } else if normalized.contains("phi")
-        || normalized.contains("gemma")
-        || normalized.contains("mistral")
-    {
-        0.5
-    } else {
-        0.3
-    }
+    CODING_KEYWORDS
+        .iter()
+        .find(|(needle, _)| normalized.contains(needle))
+        .map(|(_, bonus)| *bonus)
+        .unwrap_or(CODING_FALLBACK_BONUS)
 }
 
 /// Heuristic bonus for quantization quality.
@@ -159,21 +103,11 @@ fn coding_bonus(name: &str) -> f64 {
 /// A value from 0.5 to 1.0; higher means better quality-to-size tradeoff.
 fn quant_bonus(quantization: &str) -> f64 {
     let normalized = quantization.to_ascii_uppercase();
-    if normalized.contains("Q4_K_M") || normalized.contains("Q4_K_S") {
-        1.0
-    } else if normalized.contains("Q5") {
-        0.9
-    } else if normalized.contains("Q4_0") {
-        0.85
-    } else if normalized.contains("Q6") {
-        0.8
-    } else if normalized.contains("Q8") {
-        0.75
-    } else if normalized.contains("F16") || normalized.contains("FP16") {
-        0.5
-    } else {
-        0.8
-    }
+    QUANT_KEYWORDS
+        .iter()
+        .find(|(needle, _)| normalized.contains(needle))
+        .map(|(_, bonus)| *bonus)
+        .unwrap_or(QUANT_FALLBACK_BONUS)
 }
 
 /// Score a single model against a memory budget and minimum context window.
@@ -242,8 +176,8 @@ fn memory_fit_factor(model: &OllamaModel, mem_budget: u64, reasons: &mut Vec<Str
     if model.size <= mem_budget / MEMORY_COMFORT_DIVISOR {
         reasons.push(format!(
             "fits comfortably ({:.1} GB / {:.1} GB budget)",
-            model.size as f64 / 1e9,
-            mem_budget as f64 / 1e9
+            model.size as f64 / BYTES_PER_GIGABYTE,
+            mem_budget as f64 / BYTES_PER_GIGABYTE
         ));
         MEMORY_FACTOR_COMFORTABLE
     } else if model.size <= mem_budget {
@@ -252,8 +186,8 @@ fn memory_fit_factor(model: &OllamaModel, mem_budget: u64, reasons: &mut Vec<Str
     } else {
         reasons.push(format!(
             "model file ({:.1} GB) exceeds memory budget ({:.1} GB)",
-            model.size as f64 / 1e9,
-            mem_budget as f64 / 1e9
+            model.size as f64 / BYTES_PER_GIGABYTE,
+            mem_budget as f64 / BYTES_PER_GIGABYTE
         ));
         MEMORY_FACTOR_OVERFLOW
     }
@@ -303,9 +237,9 @@ pub fn score_models(models: &[OllamaModel], mem_budget: u64, min_context: u64) -
 /// 16GB devices for snappy UX, and the 7B model on larger machines.
 pub fn recommended_fallback_model(mem_budget: u64) -> &'static str {
     if mem_budget >= FALLBACK_7B_MEMORY_THRESHOLD_BYTES {
-        "qwen2.5-coder:7b"
+        FALLBACK_MODEL_7B
     } else {
-        "qwen2.5-coder:3b"
+        FALLBACK_MODEL_3B
     }
 }
 

@@ -1,12 +1,10 @@
 //! Shell command execution for the agent.
 
 use super::text::truncate;
+use crate::constants::tools::MIN_COMMAND_TIMEOUT_SECONDS;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::time::Duration;
-
-/// Minimum shell timeout in seconds (avoids instant timeout bugs).
-const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
 
 /// Run a shell command in the workspace and capture combined output.
 ///

@@ -11,16 +11,14 @@ mod types;
 
 pub(crate) use types::{ChatMessage, ChatRequest, OllamaModel, PullRequest, TagsResponse};
 
+use crate::constants::ollama::{
+    API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
+    HTTP_TIMEOUT_SECONDS,
+};
 use anyhow::{anyhow, Context, Result};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Duration;
-
-/// How long a full HTTP request may take before it is aborted.
-const HTTP_TIMEOUT_SECONDS: u64 = 600;
-
-/// How long to wait for the initial TCP connection to the Ollama server.
-const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 
 /// Client for talking to a local Ollama server.
 #[derive(Clone)]
@@ -57,7 +55,7 @@ impl OllamaClient {
     /// `true` if `GET /api/tags` succeeds, otherwise `false`.
     pub async fn is_available(&self) -> bool {
         self.http
-            .get(format!("{}/api/tags", self.base_url))
+            .get(format!("{}{API_TAGS_PATH}", self.base_url))
             .send()
             .await
             .map(|response| response.status().is_success())
@@ -72,7 +70,7 @@ impl OllamaClient {
     pub async fn tags(&self) -> Result<Vec<OllamaModel>> {
         let response = self
             .http
-            .get(format!("{}/api/tags", self.base_url))
+            .get(format!("{}{API_TAGS_PATH}", self.base_url))
             .send()
             .await
             .context("failed to reach Ollama server; is `ollama serve` running?")?;
@@ -101,7 +99,7 @@ impl OllamaClient {
     pub async fn show(&self, name: &str) -> Result<Value> {
         let response = self
             .http
-            .post(format!("{}/api/show", self.base_url))
+            .post(format!("{}{API_SHOW_PATH}", self.base_url))
             .json(&serde_json::json!({ "name": name }))
             .send()
             .await
@@ -136,7 +134,7 @@ impl OllamaClient {
         request.stream = true;
         let response = self
             .http
-            .post(format!("{}/api/chat", self.base_url))
+            .post(format!("{}{API_CHAT_PATH}", self.base_url))
             .json(&request)
             .send()
             .await
@@ -192,7 +190,7 @@ impl OllamaClient {
         ));
         let response = self
             .http
-            .post(format!("{}/api/pull", self.base_url))
+            .post(format!("{}{API_PULL_PATH}", self.base_url))
             .json(&PullRequest {
                 name: name.to_string(),
                 stream: false,

@@ -1,5 +1,6 @@
 //! Model listing command.
 
+use crate::constants::models::{BYTES_PER_GIGABYTE, CONTEXT_LENGTH_KILO_DIVISOR};
 use crate::model_select::calculate_memory_budget;
 use crate::models;
 use crate::ollama::{OllamaClient, OllamaModel};
@@ -37,9 +38,9 @@ fn list_models_lines_from_tags(tags: &[OllamaModel], min_context: u64) -> Vec<St
         lines.push(format!(
             "{:<28} {:>7.1}G {:>8} {:>7}K {:>8} {:>6.0}  {}",
             model.name,
-            model.size_bytes as f64 / 1e9,
+            model.size_bytes as f64 / BYTES_PER_GIGABYTE,
             model.parameter_size,
-            model.context_length / 1000,
+            model.context_length / CONTEXT_LENGTH_KILO_DIVISOR,
             model.quantization,
             model.score,
             model.reasons.join("; ")

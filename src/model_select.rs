@@ -1,26 +1,14 @@
 //! Model auto-selection, validation, and fallback pulling.
 
 use crate::cli::ModelPrefs;
+use crate::constants::models::{
+    CONTEXT_LENGTH_KEY_SUFFIX, FALLBACK_CONTEXT_LENGTH, GOOD_MODEL_SCORE_THRESHOLD,
+    MEMORY_BUDGET_DENOMINATOR, MEMORY_BUDGET_NUMERATOR, MODEL_SELECT_MAX_ATTEMPTS,
+};
 use crate::models;
 use crate::models::ModelScore;
 use crate::ollama::OllamaClient;
 use anyhow::{anyhow, bail, Result};
-
-/// Maximum number of auto-pull retries while selecting a model.
-const MODEL_SELECT_MAX_ATTEMPTS: u32 = 3;
-
-/// Models scoring below this are considered unsuitable for agentic coding.
-const GOOD_MODEL_SCORE_THRESHOLD: f64 = 60.0;
-
-/// Fallback context length when Ollama metadata is missing.
-const FALLBACK_CONTEXT_LENGTH: u64 = 8_192;
-
-/// Suffix of Ollama metadata keys that contain the context length.
-const CONTEXT_LENGTH_KEY_SUFFIX: &str = ".context_length";
-
-/// Fraction of total system memory treated as the model memory budget.
-const MEMORY_BUDGET_NUMERATOR: u64 = 3;
-const MEMORY_BUDGET_DENOMINATOR: u64 = 4;
 
 /// Resolve a model from an optional explicit slot or auto-selection.
 ///
@@ -60,6 +48,7 @@ async fn select_model(
     on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<ModelScore> {
     let mut attempts = 0u32;
+
     loop {
         attempts += 1;
         if attempts > MODEL_SELECT_MAX_ATTEMPTS {
@@ -72,24 +61,20 @@ async fn select_model(
 
         let tags = client.tags().await?;
         if tags.is_empty() {
-            match prefs.is_auto_pull_disabled {
-                true => bail!("no models installed and --no-auto-pull is set"),
-                false => pull_fallback(client, mem_budget, on_status).await?,
+            if prefs.is_auto_pull_disabled {
+                bail!("no models installed and --no-auto-pull is set");
             }
+            pull_fallback(client, mem_budget, on_status).await?;
             continue;
         }
 
-        let scored = models::score_models(&tags, mem_budget, prefs.min_context);
-        match scored.first() {
-            Some(best)
-                if best.score < GOOD_MODEL_SCORE_THRESHOLD && !prefs.is_auto_pull_disabled =>
-            {
+        match models::score_models(&tags, mem_budget, prefs.min_context).first() {
+            Some(best) if needs_fallback(best, prefs) => {
                 on_status(&format!(
                     "⚠️  Best local model '{}' scores {:.0}/100 for agentic coding.",
                     best.name, best.score
                 ));
                 pull_fallback(client, mem_budget, on_status).await?;
-                continue;
             }
             Some(best) => return Ok(best.clone()),
             None if prefs.is_auto_pull_disabled => {
@@ -101,6 +86,11 @@ async fn select_model(
             None => pull_fallback(client, mem_budget, on_status).await?,
         }
     }
+}
+
+/// True when the best local model is weak enough to justify pulling a fallback.
+fn needs_fallback(best: &ModelScore, prefs: &ModelPrefs) -> bool {
+    best.score < GOOD_MODEL_SCORE_THRESHOLD && !prefs.is_auto_pull_disabled
 }
 
 /// Validate and score an explicitly requested model tag.

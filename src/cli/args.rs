@@ -1,16 +1,8 @@
 //! Clap argument definitions and default values.
 
+use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-
-/// Default Ollama server address.
-pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
-
-/// Default maximum agent iterations.
-pub(crate) const DEFAULT_MAX_STEPS: usize = 12;
-
-/// Default minimum acceptable context window for auto model selection.
-pub(crate) const DEFAULT_MIN_CONTEXT: usize = 8_192;
 
 /// Command-line interface definition.
 #[derive(Parser)]
@@ -81,6 +73,7 @@ pub(crate) enum Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 
     #[test]
     fn parses_defaults_without_arguments() {

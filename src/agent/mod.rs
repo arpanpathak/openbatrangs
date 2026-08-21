@@ -1,58 +1,35 @@
+//! Agentic coding loop: model conversation, tool-call parsing, and execution.
+//!
+//! Responsibilities are split into focused submodules:
+//! - `reporter`: output abstraction for stdout and TUI.
+//! - `tool`: typed tool calls, argument parsing, and JSON response parsing.
+//! - `stream`: incremental JSON field streaming.
+//! - `execute`: tool execution, confirmation, and path formatting.
+//!
+//! This module owns the orchestration: the run loop, step handling, and
+//! conversation-history management.
+
+mod execute;
+mod reporter;
+mod stream;
+mod tool;
+
+use crate::constants::agent::{
+    AGENT_TEMPERATURE, MAX_CONTEXT_TOKENS, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
+};
+use crate::constants::ansi::{
+    ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
+};
+use crate::constants::tools::DEFAULT_LIST_DEPTH;
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
-use anyhow::{anyhow, bail, Context, Result};
-use futures_util::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
-use std::io::Write;
+use anyhow::{bail, Context, Result};
+use execute::{execute_tool_or_report_error, print_changed_files};
 use std::path::{Path, PathBuf};
+use stream::stream_model_response;
+use tool::{parse_agent_response, Tool, ToolCall};
 
-/// Colors used by the stdout reporter. The TUI reporter strips these before rendering.
-const COLOR_CYAN: &str = "\x1b[36m";
-const COLOR_MAGENTA: &str = "\x1b[35m";
-const COLOR_BOLD: &str = "\x1b[1m";
-const COLOR_DIM: &str = "\x1b[2m";
-const COLOR_RESET: &str = "\x1b[0m";
-
-/// Model context window caps. Lower max keeps attention faster on edge GPUs.
-const MAX_CONTEXT_TOKENS: u64 = 16_384;
-const MIN_CONTEXT_TOKENS: u64 = 4_096;
-
-/// Tool argument defaults.
-const DEFAULT_READ_CHARS: usize = 8_000;
-const DEFAULT_GREP_MAX_RESULTS: usize = 200;
-const COMMAND_TIMEOUT_SECONDS: u64 = 120;
-
-/// Conversation trimming keeps the system message, the initial task, and this many recent exchanges.
-const MAX_HISTORY_MESSAGES: usize = 40;
-
-/// Sampling temperature for agentic tool-calling determinism.
-const AGENT_TEMPERATURE: f64 = 0.2;
-
-/// Receives agent output. `line` is a complete line; `chunk` is streaming text
-/// that should be appended to the current live line.
-pub trait Reporter: Send {
-    fn line(&mut self, msg: String);
-    fn chunk(&mut self, msg: &str);
-}
-
-/// Prints agent output directly to stdout (used by one-shot mode).
-pub struct StdoutReporter;
-
-impl Reporter for StdoutReporter {
-    fn line(&mut self, msg: String) {
-        if msg.is_empty() {
-            println!();
-        } else {
-            println!("{msg}");
-        }
-    }
-
-    fn chunk(&mut self, msg: &str) {
-        print!("{msg}");
-        let _ = std::io::stdout().flush();
-    }
-}
+pub use reporter::{Reporter, StdoutReporter};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -62,124 +39,6 @@ pub struct AgentConfig {
     pub should_confirm: bool,
     pub show_thinking: bool,
 }
-
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    name: String,
-    arguments: Value,
-}
-
-/// Typed, exhaustively-matched representation of every tool the agent can invoke.
-#[derive(Debug)]
-enum Tool {
-    ListFiles {
-        path: String,
-    },
-    ReadFile {
-        path: String,
-        max_chars: usize,
-    },
-    GrepFiles {
-        pattern: String,
-        path: String,
-        max_results: usize,
-    },
-    WriteFile {
-        path: String,
-        content: String,
-    },
-    RunCommand {
-        command: String,
-    },
-    Finish {
-        summary: String,
-    },
-}
-
-impl Tool {
-    fn from_call(call: ToolCall) -> Result<Self> {
-        let args = &call.arguments;
-        match call.name.as_str() {
-            "list_files" => Ok(Self::ListFiles {
-                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
-            }),
-            "read_file" => Ok(Self::ReadFile {
-                path: required_string_arg(args, "path", "read_file")?.to_string(),
-                max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
-                    as usize,
-            }),
-            "grep_files" => Ok(Self::GrepFiles {
-                pattern: required_string_arg(args, "pattern", "grep_files")?.to_string(),
-                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
-                max_results: optional_u64_arg(args, "max_results")?
-                    .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
-                    as usize,
-            }),
-            "write_file" => Ok(Self::WriteFile {
-                path: required_string_arg(args, "path", "write_file")?.to_string(),
-                content: required_string_arg(args, "content", "write_file")?.to_string(),
-            }),
-            "run_command" => Ok(Self::RunCommand {
-                command: required_string_arg(args, "command", "run_command")?.to_string(),
-            }),
-            "finish" => Ok(Self::Finish {
-                summary: string_arg(args, "summary")?.unwrap_or("done").to_string(),
-            }),
-            other => bail!("unknown tool: {other}"),
-        }
-    }
-
-    /// Human-readable one-line description shown before the tool executes.
-    fn describe(&self) -> String {
-        match self {
-            Self::ListFiles { path } => format!("list_files → {path}"),
-            Self::ReadFile { path, .. } => format!("read_file → {path}"),
-            Self::GrepFiles { pattern, path, .. } => format!("grep_files → {pattern:?} in {path}"),
-            Self::WriteFile { path, .. } => format!("write_file → {path}"),
-            Self::RunCommand { command } => format!("run_command → {command}"),
-            Self::Finish { .. } => "finish".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentResponse {
-    #[serde(default)]
-    tool: Option<ToolCall>,
-    #[serde(default)]
-    answer: Option<String>,
-}
-
-const SYSTEM_PROMPT: &str = r#"You are openBatarangs, an autonomous coding agent running on a local edge device (Jetson-class hardware).
-
-You must respond with ONLY one JSON object. Never use markdown fences. Never add prose outside the JSON.
-
-Two valid response shapes:
-
-1. To call a tool:
-{"thought": "short reasoning", "tool": {"name": "tool_name", "arguments": {"arg": "value"}}}
-
-2. To finish:
-{"thought": "short reasoning", "answer": "final answer for the user"}
-
-Available tools:
-- list_files: arguments {"path": "relative_dir"} — list files in a directory (max depth 5)
-- read_file: arguments {"path": "relative_file", "max_chars": 8000} — read a text file
-- grep_files: arguments {"pattern": "regex", "path": "relative_dir", "max_results": 200} — search file contents
-- write_file: arguments {"path": "relative_file", "content": "full file content"} — write/overwrite a file
-- run_command: arguments {"command": "shell command"} — run a read/build/test shell command in the workspace
-- finish: arguments {"summary": "done"} — same as answer, use to end
-
-Rules:
-- Always use paths relative to the workspace root. Absolute paths and '..' are rejected. "." is the workspace root.
-- When asked to analyze the current directory or codebase, start with list_files path "." and then read the key files before concluding.
-- Explore before editing. Read files before rewriting them.
-- Prefer small, focused edits. Run build/test commands to verify when possible.
-- Never invent file contents as done unless you actually wrote them.
-- Implement complete, working solutions. Never return hello-world stubs, placeholders, or toy examples unless the task explicitly asks for an example. Read the real files, implement the actual logic, and handle errors properly.
-- Write clean code: use guard clauses and early returns, avoid deeply nested conditionals, keep functions focused, and use descriptive names.
-- When the task is complete, provide a concise answer with what changed and any commands the user should run.
-- Keep tool outputs in mind, but do not repeat them verbatim in the final answer."#;
 
 /// The outcome of one agent iteration.
 enum AgentStepOutcome {
@@ -270,7 +129,7 @@ async fn run_agent_step<R: Reporter>(
 
     if let Some(answer) = response.answer {
         if !answer_was_streamed {
-            reporter.line(format!("\n\x1b[32m✅\x1b[0m {answer}"));
+            reporter.line(format!("\n{ANSI_GREEN_CHECK} {answer}"));
         }
         print_changed_files(&context.config.cwd, changed_files, reporter);
         return Ok(AgentStepOutcome::Finished);
@@ -303,7 +162,7 @@ async fn handle_tool_call<R: Reporter>(
 ) -> Result<AgentStepOutcome> {
     let tool = Tool::from_call(tool_call)?;
     if let Tool::Finish { summary } = &tool {
-        reporter.line(format!("\n\x1b[32m✅\x1b[0m {summary}"));
+        reporter.line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
         print_changed_files(&config.cwd, changed_files, reporter);
         return Ok(AgentStepOutcome::Finished);
     }
@@ -340,18 +199,6 @@ fn report_parse_error<R: Reporter>(reporter: &mut R, error: &anyhow::Error, cont
     reporter.line(format!("\n{content}"));
 }
 
-async fn execute_tool_or_report_error(
-    config: &AgentConfig,
-    cwd: &Path,
-    tool: &Tool,
-    changed_files: &mut Vec<String>,
-) -> String {
-    match execute_tool(config, cwd, tool, changed_files).await {
-        Ok(text) => text,
-        Err(error) => format!("Tool error: {error:#}"),
-    }
-}
-
 fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
     if !cwd.is_dir() {
         bail!("working directory does not exist: {}", cwd.display());
@@ -360,7 +207,7 @@ fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
 }
 
 fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
-    let initial_listing = tools::list_files(cwd, ".", tools::DEFAULT_LIST_DEPTH)
+    let initial_listing = tools::list_files(cwd, ".", DEFAULT_LIST_DEPTH)
         .unwrap_or_else(|error| format!("(could not list files: {error})"));
     let user_content = format!(
         "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
@@ -385,192 +232,12 @@ fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequ
         model: model.to_string(),
         messages: messages.to_vec(),
         stream: false,
-        format: Some(Value::String("json".to_string())),
+        format: Some(serde_json::Value::String("json".to_string())),
         options: Some(serde_json::json!({
             "temperature": AGENT_TEMPERATURE,
             "num_ctx": num_ctx,
         })),
     }
-}
-
-/// Streams a model response, forwarding thought/answer text to the reporter,
-/// and returns the complete raw JSON content plus whether the answer was streamed.
-async fn stream_model_response<R: Reporter>(
-    client: &OllamaClient,
-    request: ChatRequest,
-    reporter: &mut R,
-    show_thinking: bool,
-) -> Result<(String, bool)> {
-    let mut stream = Box::pin(client.chat_stream(request).await?);
-    let mut buffer = String::new();
-    let mut thought = StreamState::new("thought", show_thinking);
-    let mut answer = StreamState::new("answer", true);
-
-    while let Some(delta) = stream.next().await {
-        let delta = delta?;
-        buffer.push_str(&delta);
-        thought.feed(reporter, &buffer)?;
-        answer.feed(reporter, &buffer)?;
-    }
-
-    let answer_was_streamed = answer.did_print();
-    Ok((buffer.trim().to_string(), answer_was_streamed))
-}
-
-/// Tracks incremental extraction of a JSON string field from a streaming buffer.
-struct StreamState {
-    key: &'static str,
-    has_printed_prefix: bool,
-    printed_length: usize,
-    is_complete: bool,
-    is_skipped: bool,
-}
-
-impl StreamState {
-    fn new(key: &'static str, enabled: bool) -> Self {
-        Self {
-            key,
-            has_printed_prefix: false,
-            printed_length: 0,
-            is_complete: false,
-            is_skipped: key == "thought" && !enabled,
-        }
-    }
-
-    fn feed<R: Reporter>(&mut self, reporter: &mut R, buffer: &str) -> Result<()> {
-        if self.is_complete || self.is_skipped {
-            return Ok(());
-        }
-
-        // If a top-level tool call exists before this field, don't stream it —
-        // it might be text inside tool arguments rather than the real field.
-        if let (Some(field_pos), Some(tool_pos)) =
-            (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
-        {
-            if tool_pos < field_pos {
-                self.is_skipped = true;
-                return Ok(());
-            }
-        }
-
-        if let Some((text, is_complete)) = extract_json_string(buffer, self.key) {
-            if !self.has_printed_prefix && !text.is_empty() {
-                reporter.chunk(&self.prefix());
-                self.has_printed_prefix = true;
-            }
-            if text.len() > self.printed_length && text.is_char_boundary(self.printed_length) {
-                reporter.chunk(&text[self.printed_length..]);
-                self.printed_length = text.len();
-            }
-            if is_complete {
-                self.is_complete = true;
-                reporter.line(String::new());
-            }
-        }
-        Ok(())
-    }
-
-    fn prefix(&self) -> String {
-        match self.key {
-            "thought" => format!("{COLOR_CYAN}🧠 {COLOR_RESET}"),
-            "answer" => "\n\x1b[32m✅\x1b[0m ".to_string(),
-            _ => String::new(),
-        }
-    }
-
-    fn did_print(&self) -> bool {
-        self.has_printed_prefix
-    }
-}
-
-async fn execute_tool(
-    config: &AgentConfig,
-    cwd: &Path,
-    tool: &Tool,
-    changed_files: &mut Vec<String>,
-) -> Result<String> {
-    match tool {
-        Tool::ListFiles { path } => tools::list_files(cwd, path, tools::DEFAULT_LIST_DEPTH),
-        Tool::ReadFile { path, max_chars } => {
-            let max_chars = (*max_chars).min(tools::MAX_TOOL_OUTPUT);
-            tools::read_file(cwd, path, max_chars)
-        }
-        Tool::GrepFiles {
-            pattern,
-            path,
-            max_results,
-        } => tools::grep_files(cwd, pattern, path, *max_results),
-        Tool::WriteFile { path, content } => {
-            ensure_not_read_only(config)?;
-            confirm_or_abort(config, &format!("write file '{path}'?"))?;
-            let result = tools::write_file(cwd, path, content)?;
-            changed_files.push(path.clone());
-            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
-        }
-        Tool::RunCommand { command } => {
-            ensure_not_read_only(config)?;
-            confirm_or_abort(config, &format!("run command: {command}"))?;
-            tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS).await
-        }
-        Tool::Finish { summary } => Ok(format!("✅ {summary}")),
-    }
-}
-
-fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
-    if config.is_read_only {
-        bail!("this tool is disabled in read-only mode");
-    }
-    Ok(())
-}
-
-fn required_string_arg<'a>(args: &'a Value, key: &str, tool_name: &str) -> Result<&'a str> {
-    string_arg(args, key)?.ok_or_else(|| anyhow!("{tool_name} requires '{key}'"))
-}
-
-fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
-    match args.get(key) {
-        Some(Value::String(value)) => Ok(Some(value)),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => bail!("argument '{key}' must be a string"),
-    }
-}
-
-fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
-    match args.get(key) {
-        Some(Value::Number(number)) => number
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer")),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => bail!("argument '{key}' must be a number"),
-    }
-}
-
-fn confirm_or_abort(config: &AgentConfig, prompt: &str) -> Result<()> {
-    if !config.should_confirm {
-        return Ok(());
-    }
-    print!("❓ {prompt} [y/N] ");
-    std::io::stdout().flush().ok();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
-    if !input.trim().eq_ignore_ascii_case("y") {
-        bail!("aborted by user");
-    }
-    Ok(())
-}
-
-fn parse_agent_response(content: &str) -> Result<AgentResponse> {
-    let cleaned = content
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let value: Value = serde_json::from_str(cleaned)
-        .with_context(|| format!("invalid JSON from model: {content}"))?;
-    serde_json::from_value(value)
-        .with_context(|| format!("JSON did not match agent schema: {content}"))
 }
 
 fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
@@ -588,102 +255,9 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
     messages.extend(tail);
 }
 
-fn find_key_pos(buffer: &str, key: &str) -> Option<usize> {
-    buffer.find(&format!("\"{key}\""))
-}
-
-/// Extract the current value of a JSON string field from a partial JSON buffer.
-/// Returns `(value_so_far, is_complete)`.
-fn extract_json_string(buffer: &str, key: &str) -> Option<(String, bool)> {
-    let key_pattern = format!("\"{key}\"");
-    let start = buffer.find(&key_pattern)?;
-    let after_key = &buffer[start + key_pattern.len()..];
-    let after_key = after_key.trim_start();
-    let after_key = after_key.strip_prefix(':')?.trim_start();
-    let after_key = after_key.strip_prefix('"')?;
-
-    let mut out = String::new();
-    let mut complete = false;
-    let mut chars = after_key.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push('\\');
-                    out.push(n);
-                }
-            }
-            '"' => {
-                complete = true;
-                break;
-            }
-            _ => out.push(c),
-        }
-    }
-    Some((out, complete))
-}
-
-/// Terminal-clickable file path (OSC 8 hyperlink). Always emits an absolute path.
-fn clickable_path(cwd: &Path, path: &str) -> String {
-    let joined = cwd.join(path);
-    let full = std::path::absolute(&joined).unwrap_or(joined);
-    let display = full.to_string_lossy();
-    let encoded = display
-        .replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('#', "%23")
-        .replace('?', "%3F");
-    format!("\x1b]8;;file://{encoded}\x1b\\{display}\x1b]8;;\x1b\\")
-}
-
-fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
-    if files.is_empty() {
-        return;
-    }
-    reporter.line("\n\x1b[1;33m📁 Files changed:\x1b[0m".to_string());
-    for file in files {
-        reporter.line(format!("   {}", clickable_path(cwd, file)));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_agent_response_without_code_fence() {
-        let response =
-            parse_agent_response(r#"{"answer":"done"}"#).expect("valid response should parse");
-        assert_eq!(response.answer.as_deref(), Some("done"));
-        assert!(response.tool.is_none());
-    }
-
-    #[test]
-    fn parses_agent_response_with_code_fence() {
-        let response = parse_agent_response(
-            "```json\n{\"tool\":{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}}\n```",
-        )
-        .expect("valid fenced response should parse");
-        assert!(response.tool.is_some());
-    }
-
-    #[test]
-    fn rejects_invalid_agent_response() {
-        assert!(parse_agent_response("not json").is_err());
-    }
-
-    #[test]
-    fn extracts_json_string_incrementally() {
-        let key = "answer";
-        assert_eq!(
-            extract_json_string(r#"{"answer":"hel"#, key),
-            Some(("hel".to_string(), false))
-        );
-        assert_eq!(
-            extract_json_string(r#"{"answer":"hello"}"#, key),
-            Some(("hello".to_string(), true))
-        );
-    }
 
     #[test]
     fn trims_messages_but_keeps_system_and_first_user() {
@@ -714,120 +288,5 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content, "task");
         assert_eq!(messages[2].content, "a2");
-    }
-
-    #[test]
-    fn rejects_non_string_tool_argument() {
-        let args = serde_json::json!({"path": 42});
-        assert!(string_arg(&args, "path").is_err());
-    }
-
-    #[test]
-    fn tool_from_call_parses_known_tools() {
-        let call = ToolCall {
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({"path": "a.txt", "content": "x"}),
-        };
-        let tool = Tool::from_call(call).unwrap();
-        assert!(
-            matches!(tool, Tool::WriteFile { path, content } if path == "a.txt" && content == "x")
-        );
-    }
-
-    #[test]
-    fn tool_from_call_rejects_unknown_tool() {
-        let call = ToolCall {
-            name: "rm_rf".to_string(),
-            arguments: serde_json::json!({}),
-        };
-        assert!(Tool::from_call(call).is_err());
-    }
-
-    #[test]
-    fn tool_describe_is_human_readable() {
-        let tool = Tool::ListFiles {
-            path: "src".to_string(),
-        };
-        assert_eq!(tool.describe(), "list_files → src");
-    }
-
-    #[test]
-    fn clickable_path_encodes_special_characters() {
-        let path = std::path::Path::new("/tmp/a b#c");
-        let link = clickable_path(path, "x");
-        assert!(link.contains("a%20b%23c"));
-        assert!(link.contains("/tmp/a b#c"));
-    }
-
-    #[test]
-    fn stream_state_skips_when_disabled() {
-        let mut state = StreamState::new("thought", false);
-        assert!(state.is_skipped);
-        state
-            .feed(&mut StdoutReporter, r#"{"thought":"secret"}"#)
-            .unwrap();
-        assert!(!state.did_print());
-    }
-
-    #[test]
-    fn stream_state_streams_incrementally() {
-        struct Sink(Vec<String>);
-        impl Reporter for Sink {
-            fn line(&mut self, msg: String) {
-                self.0.push(msg);
-            }
-            fn chunk(&mut self, msg: &str) {
-                self.0.push(msg.to_string());
-            }
-        }
-        let mut state = StreamState::new("answer", true);
-        let mut sink = Sink(Vec::new());
-        state.feed(&mut sink, r#"{"answer":"hel"#).unwrap();
-        state.feed(&mut sink, r#"{"answer":"hello"}"#).unwrap();
-        assert!(sink.0.iter().any(|part| part.contains("hel")));
-        assert!(sink.0.iter().any(|part| part.contains("lo")));
-    }
-
-    #[tokio::test]
-    async fn execute_tool_reads_what_it_writes() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("openbatrangs-agent-test-{unique}"));
-        std::fs::create_dir_all(&root).unwrap();
-        let config = AgentConfig {
-            cwd: root.clone(),
-            max_steps: 1,
-            is_read_only: false,
-            should_confirm: false,
-            show_thinking: true,
-        };
-        let mut changed = Vec::new();
-        execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "src/lib.rs".to_string(),
-                content: "pub fn f() {}".to_string(),
-            },
-            &mut changed,
-        )
-        .await
-        .unwrap();
-        let output = execute_tool(
-            &config,
-            &root,
-            &Tool::ReadFile {
-                path: "src/lib.rs".to_string(),
-                max_chars: 100,
-            },
-            &mut changed,
-        )
-        .await
-        .unwrap();
-        assert!(output.contains("pub fn f() {}"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

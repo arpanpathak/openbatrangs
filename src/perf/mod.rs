@@ -6,15 +6,13 @@
 
 mod gpu;
 
+use crate::constants::perf::{KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS};
 use gpu::{parse_nvidia_smi, parse_tegrastats, GpuStats};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
-
-/// How often the TUI refreshes the performance panel.
-pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+use std::time::Instant;
 
 /// A point-in-time snapshot of system and GPU health.
 #[derive(Clone, Debug, Default)]
@@ -158,7 +156,7 @@ impl PerfMonitor {
 pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<std::process::Child> {
     let mut child = Command::new("tegrastats")
         .arg("--interval")
-        .arg("1000")
+        .arg(TEGRASTATS_INTERVAL_MILLIS)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -225,13 +223,13 @@ fn read_memory_mb() -> MemoryStats {
             _ => {}
         }
     }
-    let total_mb = total_kb / 1024;
-    let free_mb = free_kb / 1024;
-    let buffers_mb = buffers_kb / 1024;
-    let cached_mb = (cached_kb + reclaimable_kb) / 1024;
-    let shared_mb = shared_kb / 1024;
+    let total_mb = total_kb / KIB_PER_MIB;
+    let free_mb = free_kb / KIB_PER_MIB;
+    let buffers_mb = buffers_kb / KIB_PER_MIB;
+    let cached_mb = (cached_kb + reclaimable_kb) / KIB_PER_MIB;
+    let shared_mb = shared_kb / KIB_PER_MIB;
     let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb + reclaimable_kb);
-    let used_mb = used_kb.saturating_sub(shared_kb) / 1024;
+    let used_mb = used_kb.saturating_sub(shared_kb) / KIB_PER_MIB;
     MemoryStats {
         used_mb,
         total_mb,
@@ -298,6 +296,10 @@ mod tests {
     #[test]
     fn cpu_sampler_primes_without_panicking() {
         let mut sampler = CpuSampler::new();
-        assert!(sampler.sample().is_none() || sampler.sample().is_some());
+        // The second read can legitimately be `None` when `/proc/stat` counters
+        // did not advance between samples; the point of this test is that
+        // sampling never panics.
+        let _ = sampler.sample();
+        let _ = sampler.sample();
     }
 }

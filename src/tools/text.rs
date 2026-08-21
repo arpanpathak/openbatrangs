@@ -1,7 +1,6 @@
 //! Output truncation helpers.
 
-/// Maximum number of characters returned by any tool to protect context memory.
-pub(crate) const MAX_TOOL_OUTPUT: usize = 20_000;
+use crate::constants::tools::MAX_TOOL_OUTPUT;
 
 /// Truncate a string to `MAX_TOOL_OUTPUT` characters.
 pub(crate) fn truncate(text: String) -> String {

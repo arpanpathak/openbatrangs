@@ -1,5 +1,6 @@
 //! GPU metric parsing from `tegrastats` (Jetson) and `nvidia-smi`.
 
+use crate::constants::perf::MILLIWATTS_PER_WATT;
 use regex::Regex;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -39,7 +40,7 @@ pub(super) fn parse_tegrastats(line: &str) -> Option<GpuStats> {
         .captures(line)
         .and_then(|captures| captures.get(1))
         .and_then(|value| value.as_str().parse::<f64>().ok())
-        .map(|milliwatts| milliwatts / 1000.0);
+        .map(|milliwatts| milliwatts / MILLIWATTS_PER_WATT);
 
     Some(GpuStats {
         name: None,
