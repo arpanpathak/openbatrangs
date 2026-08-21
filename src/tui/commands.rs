@@ -7,8 +7,26 @@
 use super::app::{App, PickerState};
 use super::split_command;
 use crate::cli::AgentMode;
-use crate::ollama::OllamaClient;
+use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
+
+/// What `/model <name>` should do after checking installed tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCommandAction {
+    /// The model is already installed; just switch to it.
+    Activate,
+    /// The model is missing; pull it before switching.
+    Pull,
+}
+
+/// Decide whether to activate or pull a requested model (pure and testable).
+fn model_action(tags: &[OllamaModel], requested: &str) -> ModelCommandAction {
+    if tags.iter().any(|model| model.name == requested) {
+        ModelCommandAction::Activate
+    } else {
+        ModelCommandAction::Pull
+    }
+}
 
 impl App {
     pub(super) async fn run_slash_command(
@@ -43,8 +61,9 @@ impl App {
         self.log.push("Commands:".to_string());
         self.log
             .push("  /help, /exit, /quit, /setup, /models".to_string());
-        self.log
-            .push("  /model <tag>, /read-only, /confirm, /perf".to_string());
+        self.log.push(
+            "  /model <tag> (auto-pulls if missing), /read-only, /confirm, /perf".to_string(),
+        );
         self.log
             .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log.push(
@@ -82,25 +101,55 @@ impl App {
         arg: &str,
     ) -> anyhow::Result<()> {
         if arg.is_empty() {
-            match &self.model {
-                Some(model) => self.log.push(format!("Current model: {model}")),
-                None => self
-                    .log
-                    .push("Auto mode — best model will be selected on first task.".to_string()),
-            }
-        } else {
-            let tags = client.tags().await?;
-            if tags.iter().any(|model| model.name == arg) {
-                self.model = Some(arg.to_string());
-                self.log.push(format!("✅ Model set to {arg}"));
-                self.refresh_model_info(client).await;
-            } else {
-                self.log.push(format!(
-                    "❌ Model '{arg}' is not installed. Try /models or /setup."
-                ));
-            }
+            self.log_current_model();
+            return Ok(());
+        }
+
+        let tags = client.tags().await?;
+        match model_action(&tags, arg) {
+            ModelCommandAction::Activate => self.activate_model(client, arg).await,
+            ModelCommandAction::Pull => self.pull_and_activate_model(client, arg).await,
         }
         Ok(())
+    }
+
+    fn log_current_model(&mut self) {
+        match &self.model {
+            Some(model) => self.log.push(format!("Current model: {model}")),
+            None => self
+                .log
+                .push("Auto mode — best model will be selected on first task.".to_string()),
+        }
+    }
+
+    async fn activate_model(&mut self, client: &OllamaClient, name: &str) {
+        self.model = Some(name.to_string());
+        self.log.push(format!("✅ Model set to {name}"));
+        self.refresh_model_info(client).await;
+    }
+
+    async fn pull_and_activate_model(&mut self, client: &OllamaClient, name: &str) {
+        self.log.push(format!("⬇️  Pulling model '{name}'..."));
+        let messages = std::sync::Mutex::new(Vec::new());
+        let result = client
+            .pull(name, &|msg| {
+                if let Ok(mut messages) = messages.lock() {
+                    messages.push(msg.to_string());
+                }
+            })
+            .await;
+        let messages = messages.into_inner().unwrap_or_default();
+        self.log.extend(messages);
+
+        match result {
+            Ok(()) => {
+                self.log.push(format!("✅ Model ready: {name}"));
+                self.activate_model(client, name).await;
+            }
+            Err(error) => self
+                .log
+                .push(format!("❌ Failed to pull model '{name}': {error:#}")),
+        }
     }
 
     fn toggle_read_only(&mut self) {
@@ -262,5 +311,41 @@ impl App {
     fn log_unknown_command(&mut self, name: &str) {
         self.log
             .push(format!("Unknown command: /{name}. Try /help"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn installed_model(name: &str) -> OllamaModel {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "size": 123,
+        }))
+        .expect("valid model JSON")
+    }
+
+    #[test]
+    fn model_action_activates_installed_models() {
+        let tags = vec![installed_model("qwen2.5-coder:7b")];
+        assert_eq!(
+            model_action(&tags, "qwen2.5-coder:7b"),
+            ModelCommandAction::Activate
+        );
+    }
+
+    #[test]
+    fn model_action_pulls_missing_models() {
+        let tags = vec![installed_model("qwen2.5-coder:7b")];
+        assert_eq!(model_action(&tags, "llama3.2:3b"), ModelCommandAction::Pull);
+    }
+
+    #[test]
+    fn model_action_pulls_when_no_models_installed() {
+        assert_eq!(
+            model_action(&[], "qwen2.5-coder:7b"),
+            ModelCommandAction::Pull
+        );
     }
 }
