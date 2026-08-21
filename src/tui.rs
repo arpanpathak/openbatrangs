@@ -46,12 +46,30 @@ struct ChannelReporter {
 
 impl Reporter for ChannelReporter {
     fn line(&mut self, msg: String) {
-        let _ = self.tx.send(UiEvent::Log(msg));
+        let _ = self.tx.send(UiEvent::Log(strip_ansi(&msg)));
     }
 
     fn chunk(&mut self, msg: String) {
-        let _ = self.tx.send(UiEvent::Chunk(msg));
+        let _ = self.tx.send(UiEvent::Chunk(strip_ansi(&msg)));
     }
+}
+
+/// Remove ANSI escape sequences before rendering in ratatui.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() || n == '\\' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 struct App {
