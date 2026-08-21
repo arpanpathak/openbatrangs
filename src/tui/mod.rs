@@ -81,8 +81,8 @@ const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;
 const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 const CHAT_SCROLL_STEP: usize = 5;
-/// Banner height: wordmark + Batman art + quote + model info + prompt.
-const COMPACT_BANNER_HEIGHT: u16 = 23;
+/// Banner height: title + compact Batman art + quote + model info + prompt.
+const COMPACT_BANNER_HEIGHT: u16 = 9;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 const CHAT_SYSTEM_PROMPT: &str =
@@ -380,7 +380,7 @@ mod tests {
         let banner = strip_ansi(&banner::banner_text());
         assert!(!banner.contains('\x1b'));
         assert!(banner.lines().count() > 5);
-        assert!(banner.contains('█'));
+        assert!(banner.contains('⣿') || banner.contains('█'));
     }
 
     #[test]
@@ -402,8 +402,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains('█'), "banner pixel art should render");
-        assert!(content.contains("openBatarangs") || content.contains("perf"));
+        assert!(
+            content.contains('⣿') || content.contains('█'),
+            "banner pixel art should render"
+        );
+        assert!(content.contains("OPEN-BATARANGS") || content.contains("perf"));
     }
 
     #[test]

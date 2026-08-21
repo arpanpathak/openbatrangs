@@ -82,12 +82,12 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
             if full {
                 true
             } else {
-                // Small terminal: wordmark + quote only.
-                *index < 5 || *index + 1 == app.banner_lines.len()
+                // Small terminal: title + quote only.
+                *index == 0 || *index + 1 == app.banner_lines.len()
             }
         })
         .map(|(index, text)| {
-            let style = if index < 5 {
+            let style = if index == 0 {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)

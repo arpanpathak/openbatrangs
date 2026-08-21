@@ -13,12 +13,8 @@ const COLOR_RESET: &str = "\x1b[0m";
 /// Colors cycled through for the random quote, one per launch.
 const QUOTE_COLORS: &[&str] = &[COLOR_YELLOW, COLOR_CYAN, COLOR_GREEN, COLOR_PURPLE];
 
-/// Pixel-art wordmark for `openBatarangs`.
-const OPENBATARANGS_ART: &str = r#" █  ██  ███ █ █ ██   █  ███  █  ██   █  █ █  ██  ██
-█ █ █ █ █   ███ █ █ █ █  █  █ █ █ █ █ █ ███ █   █  
-█ █ ██  ██  █ █ ██  ███  █  ███ ██  ███ █ █ █ █  █ 
-█ █ █   █   █ █ █ █ █ █  █  █ █ █ █ █ █ █ █ █ █   █
- █  █   ███ █ █ ██  █ █  █  █ █ █ █ █ █ █ █  ██ ██ "#;
+/// Pixel-art wordmark for `openBatarangs` (compact title line).
+const OPENBATARANGS_ART: &str = "🦇 OPEN-BATARANGS!";
 
 /// Random Batman quotes shown at startup.
 const BATMAN_QUOTES: &[&str] = &[
@@ -39,21 +35,11 @@ const BATMAN_QUOTES: &[&str] = &[
 /// # Returns
 /// Multi-line string containing the Batman logo and a random Batman quote.
 pub fn banner_text() -> String {
-    let batman = r#"MMMMMMMMMMMMMMMMMMMMM.                             MMMMMMMMMMMMMMMMMMMMM
- `MMMMMMMMMMMMMMMMMMMM           M\  /M           MMMMMMMMMMMMMMMMMMMM'
-   `MMMMMMMMMMMMMMMMMMM          MMMMMM          MMMMMMMMMMMMMMMMMMM'
-     MMMMMMMMMMMMMMMMMMM-_______MMMMMMMM_______-MMMMMMMMMMMMMMMMMMM
-      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
-      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
-      MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
-     .MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM.
-    MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
-                   `MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM'
-                          `MMMMMMMMMMMMMMMMMM'
-                              `MMMMMMMMMM'
-                                 MMMMMM :F_P:
-                                  MMMM
-                                   MM
+    let batman = r#"⣿⣿⣟⣛⠛⠛⠛⠛⠛⠛⠛⣿⣿⣿⢿⣿⣿⣿⡟⠛⠛⠛⠛⠛⠛⢛⣛⣿⣿⣿
+⣿⣿⣿⣿⣷⣦⠀⠀⠀⠀⠀⠙⠻⠟⠈⠙⠿⠛⠁⠀⠀⠀⠀⢠⣶⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣀⠀⢀⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣆⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
 "#;
 
     let quote_index = random_quote_index();
@@ -97,8 +83,8 @@ mod tests {
     #[test]
     fn banner_contains_art_and_quote() {
         let banner = banner_text();
-        assert!(banner.contains('█'));
-        assert!(banner.contains('_'));
+        assert!(banner.contains('⣿') || banner.contains('█'));
+        assert!(banner.contains('🦇'));
     }
 
     #[test]
