@@ -49,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "clear",
     "perf",
     "mode",
+    "thinking",
 ];
 
 /// Spinner frames shown while the agent is working.
@@ -78,12 +79,8 @@ const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;
 const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 const CHAT_SCROLL_STEP: usize = 5;
-/// Compact banner height when the terminal is small (wordmark + quote).
-const COMPACT_BANNER_HEIGHT: u16 = 6;
-/// Full banner height when the terminal is tall enough.
-const FULL_BANNER_HEIGHT: u16 = 19;
-/// Terminal height threshold for showing the full banner.
-const FULL_BANNER_MIN_HEIGHT: u16 = 30;
+/// Compact banner height when the terminal is small (wordmark + quote + model info).
+const COMPACT_BANNER_HEIGHT: u16 = 7;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 const CHAT_SYSTEM_PROMPT: &str =
@@ -199,6 +196,7 @@ async fn run_agent_worker(
         max_steps: config.max_steps,
         is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
+        show_thinking: config.show_thinking,
     };
     let mut reporter = ChannelReporter { tx };
     crate::agent::run_agent(
@@ -296,6 +294,7 @@ async fn run_loop(
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
     let mut app = app::App::new(cli, tegrastats_shared);
+    app.refresh_model_info(client).await;
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut events = event::EventStream::new();
 

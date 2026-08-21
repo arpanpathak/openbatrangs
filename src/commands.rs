@@ -161,6 +161,7 @@ async fn run_agent_task(
         max_steps: config.max_steps,
         is_read_only: config.is_read_only || config.mode == crate::cli::AgentMode::Plan,
         should_confirm: config.should_confirm,
+        show_thinking: true,
     };
 
     let mut reporter = agent::StdoutReporter;

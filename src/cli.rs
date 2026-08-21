@@ -111,8 +111,10 @@ pub(crate) struct AgentRunConfig {
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
     pub(crate) should_confirm: bool,
-    /// Agent vs planning mode.
+    /// Agent vs planning vs chat mode.
     pub(crate) mode: AgentMode,
+    /// Stream the model's internal reasoning in agent mode.
+    pub(crate) show_thinking: bool,
 }
 
 /// Build model-selection preferences from parsed CLI arguments.
@@ -132,5 +134,6 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         is_read_only: cli.is_read_only,
         should_confirm: cli.should_confirm,
         mode: AgentMode::Agent,
+        show_thinking: true,
     }
 }

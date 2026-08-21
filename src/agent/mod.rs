@@ -60,6 +60,7 @@ pub struct AgentConfig {
     pub max_steps: usize,
     pub is_read_only: bool,
     pub should_confirm: bool,
+    pub show_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,9 +248,14 @@ async fn run_agent_step<R: Reporter>(
     report_step_start(reporter, step, context.config.max_steps, context.model);
 
     let request = chat_request(context.model, messages, context.num_ctx);
-    let (content, answer_was_streamed) = stream_model_response(context.client, request, reporter)
-        .await
-        .with_context(|| format!("model call failed at step {step}"))?;
+    let (content, answer_was_streamed) = stream_model_response(
+        context.client,
+        request,
+        reporter,
+        context.config.show_thinking,
+    )
+    .await
+    .with_context(|| format!("model call failed at step {step}"))?;
 
     let response = match parse_agent_response(&content) {
         Ok(parsed) => parsed,
@@ -390,11 +396,12 @@ async fn stream_model_response<R: Reporter>(
     client: &OllamaClient,
     request: ChatRequest,
     reporter: &mut R,
+    show_thinking: bool,
 ) -> Result<(String, bool)> {
     let mut stream = Box::pin(client.chat_stream(request).await?);
     let mut buffer = String::new();
-    let mut thought = StreamState::new("thought");
-    let mut answer = StreamState::new("answer");
+    let mut thought = StreamState::new("thought", show_thinking);
+    let mut answer = StreamState::new("answer", true);
 
     while let Some(delta) = stream.next().await {
         let delta = delta?;
@@ -417,13 +424,13 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(key: &'static str) -> Self {
+    fn new(key: &'static str, enabled: bool) -> Self {
         Self {
             key,
             has_printed_prefix: false,
             printed_length: 0,
             is_complete: false,
-            is_skipped: false,
+            is_skipped: key == "thought" && !enabled,
         }
     }
 

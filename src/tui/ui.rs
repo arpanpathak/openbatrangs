@@ -2,15 +2,18 @@
 
 use super::app::App;
 use super::{
-    COMPACT_BANNER_HEIGHT, FULL_BANNER_HEIGHT, FULL_BANNER_MIN_HEIGHT, INPUT_BOX_PADDING,
-    MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT, MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, SUGGESTIONS_HEIGHT,
+    COMPACT_BANNER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT,
+    MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MIN_TERMINAL_HEIGHT,
+    PERF_PANEL_HEIGHT, SUGGESTIONS_HEIGHT,
 };
 use crate::cli::AgentMode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
@@ -30,12 +33,8 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
-fn banner_height(area_height: u16) -> u16 {
-    if area_height >= FULL_BANNER_MIN_HEIGHT {
-        FULL_BANNER_HEIGHT
-    } else {
-        COMPACT_BANNER_HEIGHT
-    }
+fn banner_height(_area_height: u16) -> u16 {
+    COMPACT_BANNER_HEIGHT
 }
 
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
@@ -66,18 +65,13 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let full = area.height >= FULL_BANNER_HEIGHT;
-    let lines: Vec<Line> = app
+    let mut lines: Vec<Line> = app
         .banner_lines
         .iter()
         .enumerate()
         .filter(|(index, _)| {
-            if full {
-                true
-            } else {
-                // Compact: wordmark (first 5 lines) + the quote (last line).
-                *index < 5 || *index + 1 == app.banner_lines.len()
-            }
+            // Compact: wordmark (first 5 lines) + the quote (last line).
+            *index < 5 || *index + 1 == app.banner_lines.len()
         })
         .map(|(index, text)| {
             let style = if index < 5 {
@@ -92,6 +86,10 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Line::from(Span::styled(text.clone(), style))
         })
         .collect();
+    lines.push(Line::from(Span::styled(
+        app.model_info_line(),
+        Style::default().fg(Color::Green),
+    )));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -108,6 +106,27 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     f.render_widget(chat, area);
+
+    let content_height = app.chat_text().lines().count().max(1) as u16;
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = content_height.saturating_sub(visible_height);
+    if max_scroll > 0 && area.width >= 3 {
+        let scrollbar_area = Rect {
+            x: area.x + area.width.saturating_sub(2),
+            y: area.y + 1,
+            width: 1,
+            height: area.height.saturating_sub(2),
+        };
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll as usize).position(scroll_y.min(max_scroll) as usize);
+        f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 }
 
 /// Compute a safe vertical scroll offset that never overflows `u16`.

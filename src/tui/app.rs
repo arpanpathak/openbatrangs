@@ -39,6 +39,8 @@ pub(super) struct App {
     pub(super) picker: Option<PickerState>,
     pub(super) should_quit: bool,
     model: Option<String>,
+    server_url: String,
+    model_info: Option<String>,
     pub(super) run_config: AgentRunConfig,
     min_context: u64,
     is_auto_pull_disabled: bool,
@@ -82,12 +84,15 @@ impl App {
             picker: None,
             should_quit: false,
             model: cli.model.clone(),
+            server_url: cli.ollama_url.clone(),
+            model_info: None,
             run_config: AgentRunConfig {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
                 should_confirm: cli.should_confirm,
                 mode: AgentMode::Agent,
+                show_thinking: true,
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
@@ -106,16 +111,83 @@ impl App {
     }
 
     pub(super) fn suggestions(&self) -> Vec<String> {
-        if self.input.starts_with('/') {
-            let query = &self.input[1..];
-            COMMANDS
-                .iter()
-                .filter(|command| command.starts_with(query))
-                .map(|command| format!("/{command}"))
-                .collect()
-        } else {
-            vec![]
+        if !self.input.starts_with('/') {
+            return vec![];
         }
+        let query = &self.input[1..];
+        if let Some(arg) = query.strip_prefix("mode ") {
+            return ["agent", "plan", "chat"]
+                .iter()
+                .filter(|option| option.starts_with(arg))
+                .map(|option| format!("/mode {option}"))
+                .collect();
+        }
+        if query == "mode" {
+            return vec![
+                "/mode agent".to_string(),
+                "/mode plan".to_string(),
+                "/mode chat".to_string(),
+            ];
+        }
+        if let Some(arg) = query.strip_prefix("thinking ") {
+            return ["on", "off"]
+                .iter()
+                .filter(|option| option.starts_with(arg))
+                .map(|option| format!("/thinking {option}"))
+                .collect();
+        }
+        if query == "thinking" {
+            return vec!["/thinking on".to_string(), "/thinking off".to_string()];
+        }
+        COMMANDS
+            .iter()
+            .filter(|command| command.starts_with(query))
+            .map(|command| format!("/{command}"))
+            .collect()
+    }
+
+    pub(super) fn model_info_line(&self) -> String {
+        match &self.model_info {
+            Some(info) => format!("{info} · server {}", self.server_url),
+            None => format!(
+                "model: {} · server {}",
+                self.model.as_deref().unwrap_or("auto"),
+                self.server_url
+            ),
+        }
+    }
+
+    pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
+        let Ok(tags) = client.tags().await else {
+            return;
+        };
+        let Some(model) = tags.iter().find(|model| {
+            self.model
+                .as_ref()
+                .is_some_and(|selected| selected == &model.name)
+        }) else {
+            return;
+        };
+        let size_gb = model.size as f64 / 1e9;
+        let params = model
+            .details
+            .as_ref()
+            .and_then(|details| details.parameter_size.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let quant = model
+            .details
+            .as_ref()
+            .and_then(|details| details.quantization_level.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let context = model
+            .details
+            .as_ref()
+            .and_then(|details| details.context_length)
+            .unwrap_or(0);
+        self.model_info = Some(format!(
+            "model: {} · {size_gb:.1} GB · {params} · {quant} · {context} ctx",
+            model.name
+        ));
     }
 
     pub(super) fn flush_live(&mut self) {
@@ -237,7 +309,7 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         if self.picker.is_some() {
-            self.handle_picker_key(key);
+            self.handle_picker_key(key, client).await;
             return Ok(false);
         }
 
@@ -340,7 +412,7 @@ impl App {
         chat_text
     }
 
-    fn handle_picker_key(&mut self, key: event::KeyEvent) {
+    async fn handle_picker_key(&mut self, key: event::KeyEvent, client: &OllamaClient) {
         let Some(picker) = &mut self.picker else {
             return;
         };
@@ -353,6 +425,7 @@ impl App {
                 if let Some(name) = picker.models.get(picker.selected) {
                     self.model = Some(name.clone());
                     self.log.push(format!("✅ Model set to {name}"));
+                    self.refresh_model_info(client).await;
                 }
                 self.picker = None;
             }
@@ -478,6 +551,7 @@ impl App {
             "clear" => self.clear_chat(),
             "perf" => self.toggle_perf(),
             "mode" => self.handle_mode_command(arg),
+            "thinking" => self.handle_thinking_command(arg),
             _ => self.log_unknown_command(name),
         }
         Ok(())
@@ -490,7 +564,7 @@ impl App {
         self.log
             .push("  /model <tag>, /read-only, /confirm, /perf".to_string());
         self.log
-            .push("  /mode agent|plan|chat, /steps <n>, /cwd <path>".to_string());
+            .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log
             .push("  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll".to_string());
         self.log
@@ -529,6 +603,7 @@ impl App {
             if tags.iter().any(|model| model.name == arg) {
                 self.model = Some(arg.to_string());
                 self.log.push(format!("✅ Model set to {arg}"));
+                self.refresh_model_info(client).await;
             } else {
                 self.log.push(format!(
                     "❌ Model '{arg}' is not installed. Try /models or /setup."
@@ -580,6 +655,29 @@ impl App {
                     .push("Mode: chat (no tools, conversation + code)".to_string());
             }
             _ => self.log.push("Usage: /mode agent|plan|chat".to_string()),
+        }
+    }
+
+    fn handle_thinking_command(&mut self, arg: &str) {
+        match arg {
+            "on" => {
+                self.run_config.show_thinking = true;
+                self.log.push("Thinking display: ON".to_string());
+            }
+            "off" => {
+                self.run_config.show_thinking = false;
+                self.log.push("Thinking display: OFF".to_string());
+            }
+            _ => {
+                self.log.push(format!(
+                    "Thinking display: {} · Usage: /thinking on|off",
+                    if self.run_config.show_thinking {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                ));
+            }
         }
     }
 
