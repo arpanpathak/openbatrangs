@@ -1,6 +1,6 @@
 //! Path-safety helpers for agent-supplied paths.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf};
 
 /// Resolve a model-supplied path safely inside `root`.
@@ -24,9 +24,25 @@ pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(root.join(requested))
 }
 
+/// Canonicalize `resolved` and verify it still lives under `root`.
+///
+/// This closes symlink-escape holes: a symlink inside the workspace that points
+/// outside must not let the agent read or write files elsewhere on the system.
+pub(super) fn ensure_canonical_within_root(root: &Path, resolved: &Path) -> Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve workspace root: {}", root.display()))?;
+    let canonical_path = std::fs::canonicalize(resolved)
+        .with_context(|| format!("failed to resolve path: {}", resolved.display()))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        bail!("path escapes the workspace: {}", resolved.display());
+    }
+    Ok(canonical_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn rejects_absolute_paths() {
@@ -58,5 +74,28 @@ mod tests {
             resolve_in_root(root, "./src").unwrap(),
             Path::new("/tmp/project/src")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_via_canonicalization() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("openbatrangs-path-test-{unique}"));
+        let root = base.join("workspace");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let escaped = root.join("escape");
+        assert!(ensure_canonical_within_root(&root, &escaped).is_err());
+        assert!(ensure_canonical_within_root(&root, &root).is_ok());
+        fs::remove_dir_all(&base).unwrap();
     }
 }

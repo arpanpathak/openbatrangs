@@ -1,6 +1,6 @@
 //! Filesystem tools: list, read, write, grep.
 
-use super::path::resolve_in_root;
+use super::path::{ensure_canonical_within_root, resolve_in_root};
 use super::text::{truncate, truncate_to};
 use crate::constants::tools::{BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, HEAVY_DIRS, MAX_LISTED_FILES};
 use anyhow::{bail, Context, Result};
@@ -55,6 +55,7 @@ pub(crate) fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<St
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
     }
+    let directory = ensure_canonical_within_root(root, &directory)?;
 
     let mut output = String::new();
     let mut count = 0usize;
@@ -96,6 +97,7 @@ pub(crate) fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<Str
     if !file.is_file() {
         bail!("not a file: {}", file.display());
     }
+    let file = ensure_canonical_within_root(root, &file)?;
     let content = std::fs::read_to_string(&file).context("failed to read file (may be binary)")?;
     let truncated = truncate_to(content, max_chars);
     Ok(format!(
@@ -116,10 +118,14 @@ pub(crate) fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<Str
 /// A confirmation string with the absolute path and byte count.
 pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     let file = resolve_in_root(root, path)?;
-    if let Some(parent) = file.parent() {
+    let file = if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent dirs for {}", file.display()))?;
-    }
+        let canonical_parent = ensure_canonical_within_root(root, parent)?;
+        canonical_parent.join(file.file_name().unwrap_or_default())
+    } else {
+        file
+    };
     std::fs::write(&file, content)
         .with_context(|| format!("failed to write {}", file.display()))?;
     Ok(format!(
@@ -149,6 +155,7 @@ pub(crate) fn grep_files(
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
     }
+    let directory = ensure_canonical_within_root(root, &directory)?;
     let regex = Regex::new(pattern).context("invalid regex pattern")?;
     let mut output = String::new();
     let mut count = 0usize;
@@ -232,12 +239,15 @@ mod tests {
     fn list_files_skips_heavy_dirs() {
         let root = temp_dir();
         fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join(".agent/cache")).unwrap();
         fs::write(root.join("target/ignored.txt"), "x").unwrap();
+        fs::write(root.join(".agent/cache/secret.txt"), "x").unwrap();
         fs::write(root.join("keep.txt"), "y").unwrap();
 
         let output = list_files(&root, ".", 5).unwrap();
         assert!(output.contains("keep.txt"));
         assert!(!output.contains("target/ignored.txt"));
+        assert!(!output.contains(".agent/cache/secret.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -306,5 +316,38 @@ mod tests {
         let output = grep_files(&root, "match", ".", 10).unwrap();
         assert!(output.contains("(no matches)"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_rejects_parent_dir_traversal() {
+        let root = temp_dir();
+        assert!(write_file(&root, "../evil.txt", "x").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_rejects_parent_dir_traversal() {
+        let root = temp_dir();
+        assert!(read_file(&root, "../etc/passwd", 100).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        assert!(read_file(&root, "escape/secret.txt", 100).is_err());
+        assert!(list_files(&root, "escape", 5).is_err());
+        assert!(grep_files(&root, "secret", "escape", 10).is_err());
+        assert!(write_file(&root, "escape/new.txt", "x").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

@@ -105,6 +105,7 @@ mod tests {
     use super::*;
     use crate::agent::tool::Tool;
     use crate::agent::AgentConfig;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -154,6 +155,89 @@ mod tests {
         .await
         .unwrap();
         assert!(output.contains("pub fn f() {}"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_config(root: &std::path::Path, is_read_only: bool) -> AgentConfig {
+        AgentConfig {
+            cwd: root.to_path_buf(),
+            max_steps: 1,
+            is_read_only,
+            should_confirm: false,
+            show_thinking: true,
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openbatrangs-execute-test-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn execute_tool_write_rejects_parent_traversal() {
+        let root = temp_root();
+        let config = test_config(&root, false);
+        let mut changed = Vec::new();
+        let result = execute_tool(
+            &config,
+            &root,
+            &Tool::WriteFile {
+                path: "../evil.txt".to_string(),
+                content: "x".to_string(),
+            },
+            &mut changed,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!root.parent().unwrap().join("evil.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_write_respects_read_only_mode() {
+        let root = temp_root();
+        let config = test_config(&root, true);
+        let mut changed = Vec::new();
+        let result = execute_tool(
+            &config,
+            &root,
+            &Tool::WriteFile {
+                path: "a.txt".to_string(),
+                content: "x".to_string(),
+            },
+            &mut changed,
+        )
+        .await;
+        assert!(result.is_err());
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("read-only"));
+        assert!(!root.join("a.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_run_command_respects_read_only_mode() {
+        let root = temp_root();
+        let config = test_config(&root, true);
+        let mut changed = Vec::new();
+        let result = execute_tool(
+            &config,
+            &root,
+            &Tool::RunCommand {
+                command: "touch nope.txt".to_string(),
+            },
+            &mut changed,
+        )
+        .await;
+        assert!(result.is_err());
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("read-only"));
+        assert!(!root.join("nope.txt").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
