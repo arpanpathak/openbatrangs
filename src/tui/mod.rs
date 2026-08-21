@@ -18,6 +18,7 @@
 
 mod app;
 mod commands;
+mod session;
 mod text;
 mod ui;
 mod worker;

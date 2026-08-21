@@ -109,6 +109,25 @@ Do not add explanation text.
 | 16 GB | `llama3.1:8b`, `gemma2:9b`, `qwen2.5-coder:7b`, `mistral-nemo`, `ALIENTELLIGENCE/psychologist` |
 | 32 GB+ | larger quants (Q5/Q6), 13B+ models, multiple packs side-by-side |
 
+## Jetson power throttling ("throttled due to overcurrent")
+
+When a larger model like `samantha-mistral:7b` loads, power draw can spike and
+the Jetson's PMIC may throttle the GPU with `throttled due to overcurrent`.
+This is a hardware power limit, not a model bug.
+
+Mitigations:
+
+- Use a proper power supply: original 5V/4A+ USB-C (or the OEM barrel adapter).
+  Cheap chargers cause overcurrent throttling.
+- Check current power mode: `sudo nvpmodel -q`. Try a lower mode (e.g. 15W)
+  to stay within the supply budget, or MAXN if the supply is adequate.
+- Prefer smaller/quanted models: `qwen2.5-coder:3b`, `llama3.2:3b`,
+  `samantha-mistral:7b` at Q4_K_M instead of higher quants.
+- Lower `num_ctx` (e.g. 4096 instead of 8192) to reduce sustained memory
+  bandwidth and power.
+- Watch live stats: `sudo tegrastats` shows GPU throttling reason in real time.
+- Avoid heavy CPU+GPU work at the same time (builds while a model is loaded).
+
 ## Ready-to-use therapist Modelfile
 
 ```dockerfile

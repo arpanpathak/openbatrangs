@@ -92,6 +92,12 @@ pub const CHARS_PER_TOKEN: f64 = 4.0;
 /// Separator line length used before a user task in the TUI log.
 pub const CHAT_SEPARATOR_LENGTH: usize = 60;
 
+/// Maximum chat lines kept in memory before older lines spill to disk.
+pub const MAX_LOG_LINES: usize = 1_000;
+
+/// How many older lines to load from disk at a time when scrolling up.
+pub const LOG_LOAD_CHUNK: usize = 500;
+
 /// Chat-mode system prompt: no tools, direct conversation and code.
 pub const CHAT_SYSTEM_PROMPT: &str = "You are openBatarangs, an expert coding assistant in chat mode. Answer coding questions and write complete, production-quality code when asked. Never give hello-world stubs, placeholders, or toy examples: implement the requested feature in full with real logic, proper error handling, and idiomatic code. Write clean code: use guard clauses and early returns, avoid deeply nested conditionals, keep functions focused, and use descriptive names. Match the user's language and project context, be practical and concise, and do not mention tools.";
 

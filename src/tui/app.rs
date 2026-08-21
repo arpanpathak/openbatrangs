@@ -1,12 +1,17 @@
 //! TUI application state and event handling.
 
-use super::{chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, UiEvent};
+use super::session::SessionLog;
+use super::{
+    chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, text_wrapped_height,
+    UiEvent,
+};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
-    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, COMMANDS, MAX_CHAT_HISTORY_MESSAGES,
-    MAX_LIVE_CHARS, PREFIXED_COMMANDS, SPINNER, TOKEN_RATE_MIN_ELAPSED,
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, COMMANDS, LOG_LOAD_CHUNK,
+    MAX_CHAT_HISTORY_MESSAGES, MAX_LIVE_CHARS, MAX_LOG_LINES, PREFIXED_COMMANDS, SPINNER,
+    TOKEN_RATE_MIN_ELAPSED,
 };
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
@@ -24,7 +29,7 @@ pub(super) struct PickerState {
 }
 
 pub(super) struct App {
-    pub(super) log: Vec<String>,
+    pub(super) log: SessionLog,
     pub(super) live: String,
     pub(super) input: String,
     pub(super) cursor: usize,
@@ -66,11 +71,12 @@ impl App {
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
         let banner = strip_ansi(&crate::banner::banner_text());
         let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
-        let log = vec![
-            String::new(),
+        let mut log = SessionLog::new(MAX_LOG_LINES);
+        log.push(String::new());
+        log.push(
             "Type a task, or /help. Enter sends, Shift+Enter adds a new line. /models picks a model."
                 .to_string(),
-        ];
+        );
         Self {
             log,
             live: String::new(),
@@ -443,18 +449,52 @@ impl App {
 
     pub(super) fn scroll_chat(&mut self, delta: i32) {
         self.auto_scroll = false;
-        self.chat_scroll_offset = (self.chat_scroll_offset as i32 + delta).max(0) as usize;
+        let next = self.chat_scroll_offset as i32 + delta;
+        if next <= 0 && delta < 0 && self.log.has_more_history() {
+            self.log.load_more(LOG_LOAD_CHUNK);
+            self.chat_scroll_offset = 0;
+        } else {
+            self.chat_scroll_offset = next.max(0) as usize;
+        }
     }
 
     pub(super) fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
             MouseEventKind::ScrollDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
-            MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left)
+                if !self.handle_scrollbar_click(event.column, event.row) =>
+            {
                 self.open_clicked_file(event.column, event.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.handle_scrollbar_click(event.column, event.row);
             }
             _ => {}
         }
+    }
+
+    /// Handle clicks/drags on the chat scrollbar. Returns `true` when consumed.
+    fn handle_scrollbar_click(&mut self, column: u16, row: u16) -> bool {
+        let Some(area) = self.last_chat_area else {
+            return false;
+        };
+        if column != area.x + area.width.saturating_sub(2) {
+            return false;
+        }
+        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
+            return false;
+        }
+        let visible_height = area.height.saturating_sub(2).max(1) as usize;
+        let max_text_width = (area.width as usize).saturating_sub(2).max(1);
+        let content_height = text_wrapped_height(&self.chat_text(), max_text_width);
+        let max_scroll = content_height.saturating_sub(visible_height);
+        let relative = (row - area.y - 1) as usize;
+        let ratio = relative as f64 / visible_height.saturating_sub(1).max(1) as f64;
+        let offset = (max_scroll as f64 * ratio).round() as usize;
+        self.auto_scroll = offset >= max_scroll;
+        self.chat_scroll_offset = offset.min(max_scroll);
+        true
     }
 
     pub(super) fn open_clicked_file(&mut self, column: u16, row: u16) {
@@ -492,7 +532,7 @@ impl App {
     }
 
     pub(super) fn chat_text(&self) -> String {
-        let mut chat_text = self.log.join("\n");
+        let mut chat_text = self.log.text();
         if !self.live.is_empty() {
             if !chat_text.is_empty() {
                 chat_text.push('\n');
@@ -789,6 +829,37 @@ mod tests {
         assert_eq!(app.chat_scroll_offset, 0);
         app.scroll_chat(10);
         assert_eq!(app.chat_scroll_offset, 10);
+    }
+
+    #[test]
+    fn scrollbar_click_jumps_to_scroll_position() {
+        let mut app = test_app();
+        for i in 0..100 {
+            app.log.push(format!("line {i}"));
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        app.last_chat_area = Some(area);
+        let consumed = app.handle_scrollbar_click(area.width - 2, area.y + area.height - 2);
+        assert!(consumed);
+        assert!(app.chat_scroll_offset > 0);
+    }
+
+    #[test]
+    fn scrollbar_click_outside_scrollbar_is_not_consumed() {
+        let mut app = test_app();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        app.last_chat_area = Some(area);
+        assert!(!app.handle_scrollbar_click(area.width - 5, area.y + 5));
     }
 
     #[test]
