@@ -166,8 +166,9 @@ pub fn score_models(models: &[OllamaModel], mem_budget: u64, min_context: u64) -
 }
 
 /// A safe default coding model to auto-pull when nothing good is installed.
+/// Prefers the faster 3B model on Jetson-class 16GB devices for snappy UX.
 pub fn recommended_fallback_model(mem_budget: u64) -> &'static str {
-    if mem_budget >= 12 * 1024 * 1024 * 1024 {
+    if mem_budget >= 20 * 1024 * 1024 * 1024 {
         "qwen2.5-coder:7b"
     } else {
         "qwen2.5-coder:3b"

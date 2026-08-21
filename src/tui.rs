@@ -34,6 +34,8 @@ const COMMANDS: &[&str] = &[
     "clear",
 ];
 
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 enum UiEvent {
     Log(String),
     Chunk(String),
@@ -54,7 +56,6 @@ impl Reporter for ChannelReporter {
     }
 }
 
-/// Remove ANSI escape sequences before rendering in ratatui.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -72,6 +73,11 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+struct PickerState {
+    models: Vec<String>,
+    selected: usize,
+}
+
 struct App {
     log: Vec<String>,
     live: String,
@@ -82,6 +88,10 @@ struct App {
     selected: usize,
     running: bool,
     status: String,
+    last_action: String,
+    spinner_frame: u64,
+    task_queue: Vec<String>,
+    picker: Option<PickerState>,
     quit: bool,
     model: Option<String>,
     read_only: bool,
@@ -99,7 +109,10 @@ impl App {
             .map(|s| s.to_string())
             .collect::<Vec<_>>();
         log.push(String::new());
-        log.push("Type a task, or /help. Enter sends, Shift+Enter adds a new line.".to_string());
+        log.push(
+            "Type a task, or /help. Enter sends, Shift+Enter adds a new line. /models picks a model."
+                .to_string(),
+        );
         Self {
             log,
             live: String::new(),
@@ -110,6 +123,10 @@ impl App {
             selected: 0,
             running: false,
             status: "ready".to_string(),
+            last_action: String::new(),
+            spinner_frame: 0,
+            task_queue: Vec::new(),
+            picker: None,
             quit: false,
             model: cli.model.clone(),
             read_only: cli.read_only,
@@ -140,9 +157,60 @@ impl App {
         }
     }
 
-    fn handle_event(&mut self, ev: UiEvent) {
+    fn spinner(&self) -> &'static str {
+        SPINNER[(self.spinner_frame as usize) % SPINNER.len()]
+    }
+
+    fn start_task(
+        &mut self,
+        task: String,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        self.log.push(format!("🦇 {task}"));
+        self.running = true;
+        self.status = "running".to_string();
+        self.last_action.clear();
+        let tx2 = tx.clone();
+        let client2 = client.clone();
+        let cwd = self.cwd.clone();
+        let max_steps = self.max_steps;
+        let read_only = self.read_only;
+        let confirm = self.confirm;
+        let model = self.model.clone();
+        let prefs = ModelPrefs {
+            model: model.clone(),
+            no_auto_pull: self.no_auto_pull,
+            min_context: self.min_context,
+        };
+        tokio::spawn(async move {
+            let result = run_agent_worker(
+                client2,
+                cwd,
+                max_steps,
+                read_only,
+                confirm,
+                model,
+                prefs,
+                task,
+                tx2.clone(),
+            )
+            .await;
+            let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    fn handle_event(
+        &mut self,
+        ev: UiEvent,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         match ev {
             UiEvent::Log(msg) => {
+                if msg.starts_with("🔧") {
+                    self.last_action = msg.trim().to_string();
+                }
                 self.flush_live();
                 if !msg.is_empty() {
                     self.log.push(msg);
@@ -150,24 +218,30 @@ impl App {
             }
             UiEvent::Chunk(msg) => {
                 self.live.push_str(&msg);
-                if self.live.len() > 20_000 {
-                    self.live.truncate(20_000);
+                if self.live.len() > 50_000 {
+                    self.live.truncate(50_000);
                 }
             }
             UiEvent::Done(result) => {
                 self.flush_live();
                 match result {
                     Ok(()) => {
-                        self.status = "done".to_string();
                         self.log.push(String::new());
                         self.log.push("✅ Agent finished.".to_string());
                     }
                     Err(e) => {
-                        self.status = "error".to_string();
                         self.log.push(format!("⚠️ {e}"));
                     }
                 }
                 self.running = false;
+                self.last_action.clear();
+                if let Some(next) = self.task_queue.first().cloned() {
+                    self.task_queue.remove(0);
+                    self.log.push("▶️  Starting next queued task.".to_string());
+                    self.start_task(next, client, tx);
+                } else {
+                    self.status = "ready".to_string();
+                }
             }
         }
     }
@@ -178,11 +252,25 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> Result<bool> {
-        if self.running {
-            if key.code == KeyCode::Esc {
-                self.quit = true;
+        // Model picker takes priority.
+        if let Some(picker) = &mut self.picker {
+            match key.code {
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.models.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(name) = picker.models.get(picker.selected) {
+                        self.model = Some(name.clone());
+                        self.log.push(format!("✅ Model set to {name}"));
+                    }
+                    self.picker = None;
+                }
+                KeyCode::Esc => self.picker = None,
+                _ => {}
             }
-            return Ok(self.quit);
+            return Ok(false);
         }
 
         match key.code {
@@ -264,38 +352,13 @@ impl App {
                     }
                     self.history.push(task.clone());
                     if task.starts_with('/') {
-                        self.run_slash_command(client, &task, tx).await?;
+                        self.run_slash_command(client, &task).await?;
+                    } else if self.running {
+                        self.task_queue.push(task);
+                        self.log
+                            .push("⏳ Queued — will run after the current task.".to_string());
                     } else {
-                        self.log.push(format!("🦇 {task}"));
-                        self.running = true;
-                        self.status = "running".to_string();
-                        let tx2 = tx.clone();
-                        let client2 = client.clone();
-                        let cwd = self.cwd.clone();
-                        let max_steps = self.max_steps;
-                        let read_only = self.read_only;
-                        let confirm = self.confirm;
-                        let model = self.model.clone();
-                        let prefs = ModelPrefs {
-                            model: model.clone(),
-                            no_auto_pull: self.no_auto_pull,
-                            min_context: self.min_context,
-                        };
-                        tokio::spawn(async move {
-                            let result = run_agent_worker(
-                                client2,
-                                cwd,
-                                max_steps,
-                                read_only,
-                                confirm,
-                                model,
-                                prefs,
-                                task,
-                                tx2.clone(),
-                            )
-                            .await;
-                            let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
-                        });
+                        self.start_task(task, client, tx);
                     }
                 }
             }
@@ -305,12 +368,7 @@ impl App {
         Ok(self.quit)
     }
 
-    async fn run_slash_command(
-        &mut self,
-        client: &OllamaClient,
-        line: &str,
-        _tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> Result<()> {
+    async fn run_slash_command(&mut self, client: &OllamaClient, line: &str) -> Result<()> {
         let mut parts = line[1..].splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
@@ -329,8 +387,16 @@ impl App {
             }
             "exit" | "quit" => self.quit = true,
             "models" => {
-                for l in crate::list_models_lines(client, self.min_context).await? {
-                    self.log.push(l);
+                let tags = client.tags().await?;
+                if tags.is_empty() {
+                    self.log
+                        .push("No models installed. Run /setup.".to_string());
+                } else {
+                    self.picker = Some(PickerState {
+                        models: tags.into_iter().map(|m| m.name).collect(),
+                        selected: 0,
+                    });
+                    self.status = "select model".to_string();
                 }
             }
             "model" => {
@@ -393,7 +459,10 @@ impl App {
                 crate::setup(client).await?;
                 self.log.push("✅ Setup finished.".to_string());
             }
-            "clear" => self.log.clear(),
+            "clear" => {
+                self.log.clear();
+                self.live.clear();
+            }
             _ => self
                 .log
                 .push(format!("Unknown command: /{name}. Try /help")),
@@ -455,42 +524,45 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // Chat area
-    let mut items: Vec<ListItem> = app
-        .log
-        .iter()
-        .map(|l| ListItem::new(Line::from(Span::raw(l))))
-        .collect();
+    // Chat area (wraps long lines)
+    let mut chat_text = app.log.join("\n");
     if !app.live.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            app.live.clone(),
-            Style::default().fg(Color::Cyan),
-        ))));
+        if !chat_text.is_empty() {
+            chat_text.push('\n');
+        }
+        chat_text.push_str(&app.live);
     }
-    let chat = List::new(items)
+    let chat = Paragraph::new(chat_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" openBatarangs "),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        .wrap(Wrap { trim: false })
+        .scroll((u16::MAX, 0));
     f.render_widget(chat, chunks[0]);
 
-    // Status line
+    // Status line with spinner + current action
+    let status_line = if app.running {
+        let spin = app.spinner();
+        if app.last_action.is_empty() {
+            format!("{spin} {} — thinking...", app.status)
+        } else {
+            format!("{spin} {} — {}", app.status, app.last_action)
+        }
+    } else if app.picker.is_some() {
+        "↑↓ select · Enter confirm · Esc cancel".to_string()
+    } else if !app.task_queue.is_empty() {
+        format!("ready — {} queued", app.task_queue.len())
+    } else {
+        app.status.clone()
+    };
     let status_style = if app.running {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Green)
     };
-    f.render_widget(
-        Paragraph::new(format!(
-            "{} · {}",
-            app.status,
-            if app.running { "working..." } else { "ready" }
-        ))
-        .style(status_style),
-        chunks[1],
-    );
+    f.render_widget(Paragraph::new(status_line).style(status_style), chunks[1]);
 
     // Suggestions
     if chunks[2].height > 0 {
@@ -536,6 +608,64 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let x = chunks[3].x + 1 + col as u16;
     let y = chunks[3].y + 1 + line_idx as u16;
     f.set_cursor_position((x, y.min(chunks[3].y + chunks[3].height.saturating_sub(1))));
+
+    // Model picker overlay
+    if let Some(picker) = &app.picker {
+        let area = centered_rect(60, 40, f.area());
+        let items: Vec<ListItem> = picker
+            .models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let style = if i == picker.selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(m.clone(), style)))
+            })
+            .collect();
+        f.render_widget(
+            List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Select model "),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            area,
+        );
+    }
+}
+
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup[1])[1]
 }
 
 fn input_height(app: &App) -> usize {
@@ -565,7 +695,7 @@ pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
         tokio::select! {
             maybe = rx.recv() => {
                 if let Some(ev) = maybe {
-                    app.handle_event(ev);
+                    app.handle_event(ev, client, &tx);
                 }
             }
             maybe = events.next() => {
@@ -581,7 +711,9 @@ pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                app.spinner_frame += 1;
+            }
         }
     }
 
