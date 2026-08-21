@@ -101,7 +101,13 @@ if ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
 fi
 
 echo ""
+echo "🔄 Running first-time setup (pulls a coding model)..."
+"${BIN}" setup || {
+  echo "⚠️  First-time setup did not complete."
+  echo "   You can retry it later with: ${BIN} setup"
+}
+
+echo ""
 echo "🎉 Done!"
 echo "   Run:    ${BIN}"
-echo "   Setup:  ${BIN} setup"
 echo "   Update: curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | sh"
