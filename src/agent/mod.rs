@@ -176,6 +176,8 @@ Rules:
 - Explore before editing. Read files before rewriting them.
 - Prefer small, focused edits. Run build/test commands to verify when possible.
 - Never invent file contents as done unless you actually wrote them.
+- Implement complete, working solutions. Never return hello-world stubs, placeholders, or toy examples unless the task explicitly asks for an example. Read the real files, implement the actual logic, and handle errors properly.
+- Write clean code: use guard clauses and early returns, avoid deeply nested conditionals, keep functions focused, and use descriptive names.
 - When the task is complete, provide a concise answer with what changed and any commands the user should run.
 - Keep tool outputs in mind, but do not repeat them verbatim in the final answer."#;
 

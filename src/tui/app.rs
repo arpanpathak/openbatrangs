@@ -1,11 +1,11 @@
 //! TUI application state and event handling.
 
 use super::{
-    open_in_vim, run_agent_worker, split_command, strip_ansi, UiEvent, CHAT_SCROLL_STEP, COMMANDS,
-    MAX_LIVE_CHARS, TOKEN_RATE_MIN_ELAPSED,
+    chat_visual_line_indices, open_in_vim, run_agent_worker, split_command, strip_ansi, UiEvent,
+    CHAT_SCROLL_STEP, COMMANDS, MAX_CHAT_HISTORY_MESSAGES, MAX_LIVE_CHARS, TOKEN_RATE_MIN_ELAPSED,
 };
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
-use crate::ollama::OllamaClient;
+use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
 use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
@@ -36,6 +36,7 @@ pub(super) struct App {
     pub(super) chat_scroll_offset: usize,
     pub(super) spinner_frame: u64,
     pub(super) task_queue: VecDeque<String>,
+    chat_history: Vec<ChatMessage>,
     pub(super) picker: Option<PickerState>,
     pub(super) should_quit: bool,
     model: Option<String>,
@@ -83,6 +84,7 @@ impl App {
             chat_scroll_offset: 0,
             spinner_frame: 0,
             task_queue: VecDeque::new(),
+            chat_history: Vec::new(),
             picker: None,
             should_quit: false,
             model: cli.model.clone(),
@@ -241,6 +243,14 @@ impl App {
         self.tokens_per_sec = 0.0;
         self.rate_window_chars = 0;
         self.rate_window_start = None;
+        if self.run_config.mode == AgentMode::Chat {
+            self.chat_history.push(ChatMessage {
+                role: "user".to_string(),
+                content: task.clone(),
+            });
+            self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
+        }
+        let chat_history = self.chat_history.clone();
         let tx2 = tx.clone();
         let client2 = client.clone();
         let run_config = self.run_config.clone();
@@ -251,8 +261,16 @@ impl App {
             min_context: self.min_context,
         };
         let handle = tokio::spawn(async move {
-            let result =
-                run_agent_worker(client2, run_config, model, prefs, task, tx2.clone()).await;
+            let result = run_agent_worker(
+                client2,
+                run_config,
+                model,
+                prefs,
+                task,
+                chat_history,
+                tx2.clone(),
+            )
+            .await;
             let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
         });
         self.current_task = Some(handle);
@@ -264,7 +282,6 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        self.auto_scroll = true;
         match event {
             UiEvent::Log(msg) => {
                 if msg.starts_with("🔧") {
@@ -301,7 +318,17 @@ impl App {
             }
             UiEvent::Done(result) => {
                 self.current_task = None;
-                self.flush_live();
+                let assistant_text = std::mem::take(&mut self.live);
+                if !assistant_text.is_empty() {
+                    self.log.push(assistant_text.clone());
+                    if self.run_config.mode == AgentMode::Chat {
+                        self.chat_history.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: assistant_text,
+                        });
+                        self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
+                    }
+                }
                 match result {
                     Ok(()) => {
                         self.log.push(String::new());
@@ -313,7 +340,6 @@ impl App {
                 }
                 self.is_running = false;
                 self.last_action.clear();
-                self.auto_scroll = true;
                 if let Some(next) = self.task_queue.pop_front() {
                     self.log.push("▶️  Starting next queued task.".to_string());
                     self.start_task(next, client, tx);
@@ -384,6 +410,14 @@ impl App {
         if let Some(handle) = self.current_task.take() {
             handle.abort();
         }
+        if self.run_config.mode == AgentMode::Chat
+            && self
+                .chat_history
+                .last()
+                .is_some_and(|message| message.role == "user")
+        {
+            self.chat_history.pop();
+        }
         self.is_running = false;
         self.status = "ready".to_string();
         self.last_action.clear();
@@ -417,16 +451,21 @@ impl App {
         }
         let relative = (row - area.y - 1) as usize;
         let chat_text = self.chat_text();
-        let lines: Vec<&str> = chat_text.lines().collect();
-        let content_height = lines.len().max(1);
+        let max_text_width = (area.width as usize).saturating_sub(2).max(1);
+        let visual_lines = chat_visual_line_indices(&chat_text, max_text_width);
+        let content_height = visual_lines.len().max(1);
         let visible_height = area.height.saturating_sub(2) as usize;
         let scroll = if self.auto_scroll {
             content_height.saturating_sub(visible_height)
         } else {
             self.chat_scroll_offset.min(content_height)
         };
-        let line_index = scroll + relative;
-        let Some(line) = lines.get(line_index) else {
+        let visual_index = scroll + relative;
+        let Some(source_index) = visual_lines.get(visual_index).copied() else {
+            return;
+        };
+        let lines: Vec<&str> = chat_text.split('\n').collect();
+        let Some(line) = lines.get(source_index) else {
             return;
         };
         let _ = column;
@@ -522,7 +561,10 @@ impl App {
     fn move_up(&mut self) {
         let suggestions = self.suggestions();
         if !suggestions.is_empty() {
-            self.selected = self.selected.saturating_sub(1);
+            self.selected = self
+                .selected
+                .min(suggestions.len().saturating_sub(1))
+                .saturating_sub(1);
         } else if !self.history.is_empty() {
             let idx = match self.history_idx {
                 Some(i) if i > 0 => i - 1,
@@ -554,7 +596,8 @@ impl App {
 
     fn accept_suggestion(&mut self) {
         let suggestions = self.suggestions();
-        if let Some(suggestion) = suggestions.get(self.selected) {
+        let selected = self.selected.min(suggestions.len().saturating_sub(1));
+        if let Some(suggestion) = suggestions.get(selected) {
             self.input = suggestion.clone();
             self.cursor = self.input.len();
         }
@@ -809,7 +852,15 @@ impl App {
 
     async fn handle_setup_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
         self.log.push("Running setup...".to_string());
-        crate::commands::setup(client).await?;
+        let messages = std::sync::Mutex::new(Vec::new());
+        crate::commands::setup_with_status(client, &|msg| {
+            if let Ok(mut messages) = messages.lock() {
+                messages.push(msg.to_string());
+            }
+        })
+        .await?;
+        let messages = messages.into_inner().unwrap_or_default();
+        self.log.extend(messages);
         self.log.push("✅ Setup finished.".to_string());
         Ok(())
     }
@@ -818,6 +869,7 @@ impl App {
         self.log.clear();
         self.live.clear();
         self.current_prompt = None;
+        self.chat_history.clear();
     }
 
     fn toggle_perf(&mut self) {

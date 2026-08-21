@@ -2,9 +2,9 @@
 
 use super::app::App;
 use super::{
-    COMPACT_BANNER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT,
-    MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MIN_TERMINAL_HEIGHT,
-    PERF_PANEL_HEIGHT,
+    text_wrapped_height, wrap_text_to_lines, COMPACT_BANNER_HEIGHT, INPUT_BOX_PADDING,
+    MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT, MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT,
 };
 use crate::cli::AgentMode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -19,6 +19,11 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+/// Maximum height of the performance panel once wrapped lines are accounted for.
+const PERF_MAX_PANEL_HEIGHT: u16 = 8;
 
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
@@ -54,6 +59,12 @@ fn suggestions_height(app: &App) -> u16 {
     }
 }
 
+fn perf_height(app: &App, width: u16) -> u16 {
+    let max_text_width = (width as usize).saturating_sub(2).max(1);
+    let rows = text_wrapped_height(&app.perf_lines().join("\n"), max_text_width);
+    (rows as u16 + 2).clamp(PERF_PANEL_HEIGHT, PERF_MAX_PANEL_HEIGHT)
+}
+
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
@@ -63,7 +74,7 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Max(if perf_visible(app, area.height) {
-                PERF_PANEL_HEIGHT
+                perf_height(app, area.width)
             } else {
                 0
             }),
@@ -78,7 +89,7 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let full = area.height >= COMPACT_BANNER_HEIGHT;
+    let full = area.height >= COMPACT_BANNER_HEIGHT && area.width >= 20;
     let mut lines: Vec<Line> = app
         .banner_lines
         .iter()
@@ -101,17 +112,20 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::Magenta)
             };
-            Line::from(Span::styled(text.clone(), style))
+            Line::from(Span::styled(
+                truncate_to_width(text, area.width as usize),
+                style,
+            ))
         })
         .collect();
     lines.push(Line::from(Span::styled(
-        app.model_info_line(),
+        truncate_to_width(&app.model_info_line(), area.width as usize),
         Style::default().fg(Color::Green),
     )));
     if full {
         if let Some(prompt) = app.prompt_line() {
             lines.push(Line::from(Span::styled(
-                format!("Prompt: {prompt}"),
+                truncate_to_width(&format!("Prompt: {prompt}"), area.width as usize),
                 Style::default().fg(Color::Yellow),
             )));
         }
@@ -202,7 +216,19 @@ fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
 fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
-    let scroll_y = chat_scroll(app, &chat_text, area.height);
+    let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width)) as u16;
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = content_height.saturating_sub(visible_height);
+    // Re-stick to the bottom when the user scrolls down to the latest line, but
+    // never yank them back down while they are reading older content.
+    if app.auto_scroll {
+        // Already following the latest output.
+    } else if app.chat_scroll_offset >= max_scroll as usize {
+        app.auto_scroll = true;
+    } else {
+        app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll as usize);
+    }
+    let scroll_y = chat_scroll(app, &chat_text, area);
     let chat_lines = highlighted_chat_lines(&chat_text);
     let chat = Paragraph::new(chat_lines)
         .block(
@@ -214,9 +240,6 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .scroll((scroll_y, 0));
     f.render_widget(chat, area);
 
-    let content_height = app.chat_text().lines().count().max(1) as u16;
-    let visible_height = area.height.saturating_sub(2);
-    let max_scroll = content_height.saturating_sub(visible_height);
     if max_scroll > 0 && area.width >= 3 {
         let scrollbar_area = Rect {
             x: area.x + area.width.saturating_sub(2),
@@ -236,13 +259,18 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn chat_inner_width(area_width: u16) -> usize {
+    (area_width as usize).saturating_sub(2).max(1)
+}
+
 /// Compute a safe vertical scroll offset that never overflows `u16`.
-fn chat_scroll(app: &App, chat_text: &str, area_height: u16) -> u16 {
-    let content_height = chat_text.lines().count().max(1) as u16;
-    let visible_height = area_height.saturating_sub(2);
+fn chat_scroll(app: &App, chat_text: &str, area: Rect) -> u16 {
+    let content_height = text_wrapped_height(chat_text, chat_inner_width(area.width)) as u16;
+    let visible_height = area.height.saturating_sub(2);
+    let max_scroll = content_height.saturating_sub(visible_height);
     match app.auto_scroll {
-        true => content_height.saturating_sub(visible_height),
-        false => app.chat_scroll_offset.min(content_height as usize) as u16,
+        true => max_scroll,
+        false => (app.chat_scroll_offset as u16).min(max_scroll),
     }
 }
 
@@ -271,13 +299,34 @@ fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::Green)
     };
+    let status_line = truncate_to_width(&status_line, area.width as usize);
     f.render_widget(Paragraph::new(status_line).style(status_style), area);
+}
+
+/// Truncate a string to `max_width` display cells, adding an ellipsis when cut.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if width + grapheme_width + 1 > max_width {
+            out.push('…');
+            return out;
+        }
+        out.push_str(grapheme);
+        width += grapheme_width;
+    }
+    out
 }
 
 fn render_perf_panel(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let content = app.perf_lines().join("\n");
     let panel = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL).title(" ⚡ perf "))
+        .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(panel, area);
 }
@@ -287,11 +336,12 @@ fn render_suggestions(f: &mut ratatui::Frame, app: &App, area: Rect) {
         return;
     }
     let suggestions = app.suggestions();
+    let selected = app.selected.min(suggestions.len().saturating_sub(1));
     let suggestion_items: Vec<ListItem> = suggestions
         .iter()
         .enumerate()
         .map(|(index, suggestion)| {
-            let style = if index == app.selected {
+            let style = if index == selected {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
@@ -312,24 +362,47 @@ fn render_suggestions(f: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn render_input_box(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let input_paragraph = Paragraph::new(app.input.clone())
+    let lines: Vec<Line> = wrap_text_to_lines(&app.input, input_inner_width(area.width))
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    let input_paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" input "))
-        .wrap(Wrap { trim: false });
+        .scroll((input_scroll_y(app, area), 0));
     f.render_widget(input_paragraph, area);
 }
 
+fn input_inner_width(area_width: u16) -> usize {
+    (area_width as usize).saturating_sub(2).max(1)
+}
+
+fn input_scroll_y(app: &App, area: Rect) -> u16 {
+    let Some((cursor_line, _)) = input_cursor_position(app, area.width) else {
+        return 0;
+    };
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    cursor_line.saturating_sub(inner_height.saturating_sub(1)) as u16
+}
+
+/// Return the visual (row, column) of the text cursor within the wrapped input.
+fn input_cursor_position(app: &App, area_width: u16) -> Option<(usize, u16)> {
+    let prefix = app.input.get(..app.cursor)?;
+    let rows = wrap_text_to_lines(prefix, input_inner_width(area_width));
+    let line = rows.len().saturating_sub(1);
+    let column = rows.last().map(|row| row.width() as u16).unwrap_or(0);
+    Some((line, column))
+}
+
 fn render_cursor(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let Some(prefix) = app.input.get(..app.cursor) else {
+    let Some((cursor_line, column)) = input_cursor_position(app, area.width) else {
         return;
     };
-    let max_text_width = (area.width as usize).saturating_sub(2).max(1);
-    let line_start = prefix.rfind('\n').map(|index| index + 1).unwrap_or(0);
-    let current_line = &prefix[line_start..];
-    let column = current_line.chars().count();
-    let newline_count = prefix.matches('\n').count();
-    let x = area.x + 1 + (column % max_text_width) as u16;
-    let y = area.y + 1 + (newline_count + column / max_text_width) as u16;
-    f.set_cursor_position((x, y.min(area.y + area.height.saturating_sub(1))));
+    let scroll_y = input_scroll_y(app, area) as usize;
+    let x = area.x + 1 + column;
+    let y = area.y + 1 + cursor_line.saturating_sub(scroll_y) as u16;
+    if y < area.y + area.height {
+        f.set_cursor_position((x, y));
+    }
 }
 
 fn render_model_picker(f: &mut ratatui::Frame, app: &App) {
@@ -397,17 +470,53 @@ fn centered_rect(
 }
 
 fn input_height(app: &App, width: u16, area_height: u16) -> usize {
-    let max_text_width = (width as usize)
-        .saturating_sub(INPUT_BOX_PADDING + 2)
-        .max(1);
-    let mut text_lines = 0usize;
-    for line in app.input.split('\n') {
-        let char_count = line.chars().count();
-        text_lines += (char_count / max_text_width).max(1);
-    }
+    let text_lines = wrap_text_to_lines(&app.input, input_inner_width(width)).len();
     let desired = (text_lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT);
     let available = (area_height as usize)
         .saturating_sub(4)
         .max(MIN_INPUT_BOX_HEIGHT);
     desired.min(available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+    use clap::Parser;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn input_height_grows_for_wrapped_long_lines() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let shared = Arc::new(Mutex::new(None));
+        let mut app = App::new(&cli, shared);
+        let width = 20u16;
+        let area_height = 40u16;
+
+        let single_line_height = input_height(&app, width, area_height);
+        app.input = "a".repeat(100);
+        let wrapped_height = input_height(&app, width, area_height);
+        assert!(wrapped_height > single_line_height);
+        assert!(wrapped_height <= MAX_INPUT_LINES + INPUT_BOX_PADDING);
+    }
+
+    #[test]
+    fn input_height_handles_wide_unicode() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let shared = Arc::new(Mutex::new(None));
+        let mut app = App::new(&cli, shared);
+        let width = 20u16;
+        let area_height = 40u16;
+        app.input = "😀".repeat(30);
+        let height = input_height(&app, width, area_height);
+        assert!(height > MIN_INPUT_BOX_HEIGHT);
+    }
+
+    #[test]
+    fn wrap_text_to_lines_never_loses_graphemes() {
+        let text = "héllo 世界 abcdefghijklmnopqrstuvwxyz";
+        let rows = wrap_text_to_lines(text, 10);
+        assert_eq!(rows.concat(), text);
+        assert!(rows.len() > 1);
+    }
 }

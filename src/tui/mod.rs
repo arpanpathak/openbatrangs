@@ -35,6 +35,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Slash commands recognized by the TUI.
 const COMMANDS: &[&str] = &[
@@ -68,6 +70,8 @@ const INPUT_BOX_PADDING: usize = 2;
 const MIN_INPUT_BOX_HEIGHT: usize = 3;
 /// Cap for the streaming live line to avoid unbounded memory.
 const MAX_LIVE_CHARS: usize = 50_000;
+/// Maximum chat messages kept in memory for conversational context.
+const MAX_CHAT_HISTORY_MESSAGES: usize = 40;
 /// Redraw interval in milliseconds (drives the spinner).
 const TICK_MILLIS: u64 = 80;
 /// Width of the model picker popup as a percentage of the screen.
@@ -86,8 +90,7 @@ const CHAT_SCROLL_STEP: usize = 5;
 const COMPACT_BANNER_HEIGHT: u16 = 9;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
-const CHAT_SYSTEM_PROMPT: &str =
-    "You are openBatarangs in chat mode. Answer coding questions, explain ideas, and write code when asked. Be concise, practical, and do not mention tools.";
+const CHAT_SYSTEM_PROMPT: &str = "You are openBatarangs, an expert coding assistant in chat mode. Answer coding questions and write complete, production-quality code when asked. Never give hello-world stubs, placeholders, or toy examples: implement the requested feature in full with real logic, proper error handling, and idiomatic code. Write clean code: use guard clauses and early returns, avoid deeply nested conditionals, keep functions focused, and use descriptive names. Match the user's language and project context, be practical and concise, and do not mention tools.";
 
 enum UiEvent {
     Log(String),
@@ -128,21 +131,85 @@ fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
             chars.next();
             for n in chars.by_ref() {
                 match n {
-                    '\x07' | '\x1b' => break,
+                    '\x07' => break,
+                    '\x1b' => {
+                        // Consume the backslash of ESC \ (ST) as well.
+                        let _ = chars.next();
+                        break;
+                    }
                     _ => {}
                 }
             }
         }
-        // CSI / other: ESC [ ... final byte
+        // CSI / other: ESC [ ... final byte in 0x40..=0x7E
         _ => {
             for n in chars.by_ref() {
-                match n {
-                    value if value.is_ascii_alphabetic() || value == '\\' => break,
-                    _ => {}
+                if n.is_ascii() && ('\u{40}'..='\u{7e}').contains(&n) {
+                    break;
                 }
             }
         }
     }
+}
+
+/// Number of visual rows a line of `display_width` cells occupies when wrapped
+/// at `max_text_width` cells. Empty lines still occupy one row.
+pub(super) fn wrapped_line_count(display_width: usize, max_text_width: usize) -> usize {
+    let max_text_width = max_text_width.max(1);
+    match display_width {
+        0 => 1,
+        _ => display_width.div_ceil(max_text_width),
+    }
+}
+
+/// Number of visual rows `text` occupies when each source line is wrapped at
+/// `max_text_width` cells.
+pub(super) fn text_wrapped_height(text: &str, max_text_width: usize) -> usize {
+    text.split('\n')
+        .map(|line| wrapped_line_count(line.width(), max_text_width))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Wrap a multi-line string into rows that each fit within `max_text_width` cells.
+///
+/// Hard-wraps on grapheme boundaries so wide Unicode characters are preserved
+/// and never silently clipped by the input box.
+pub(super) fn wrap_text_to_lines(text: &str, max_text_width: usize) -> Vec<String> {
+    let max_text_width = max_text_width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for grapheme in line.graphemes(true) {
+            let grapheme_width = grapheme.width();
+            if current_width + grapheme_width > max_text_width && current_width > 0 {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push_str(grapheme);
+            current_width += grapheme_width;
+        }
+        rows.push(current);
+    }
+    rows
+}
+
+/// Map every visual row of `text` back to its source line index.
+///
+/// This keeps mouse hit-testing and scrollbar math correct when chat lines wrap.
+pub(super) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec<usize> {
+    let max_text_width = max_text_width.max(1);
+    let mut indices = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let rows = wrapped_line_count(line.width(), max_text_width);
+        indices.extend(std::iter::repeat_n(index, rows));
+    }
+    indices
 }
 
 fn split_command(line: &str) -> (&str, &str) {
@@ -199,10 +266,11 @@ async fn run_agent_worker(
     model_slot: Option<String>,
     prefs: ModelPrefs,
     task: String,
+    chat_history: Vec<ChatMessage>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     if config.mode == AgentMode::Chat {
-        return run_chat_worker(client, config, model_slot, prefs, task, tx).await;
+        return run_chat_worker(client, config, model_slot, prefs, task, chat_history, tx).await;
     }
 
     let mem_budget = calculate_memory_budget();
@@ -237,7 +305,8 @@ async fn run_chat_worker(
     _config: AgentRunConfig,
     model_slot: Option<String>,
     prefs: ModelPrefs,
-    task: String,
+    _task: String,
+    history: Vec<ChatMessage>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     let mem_budget = calculate_memory_budget();
@@ -250,18 +319,16 @@ async fn run_chat_worker(
         .await?
         .clamp(4_096, 16_384);
 
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: CHAT_SYSTEM_PROMPT.to_string(),
+    }];
+    messages.extend(history);
+    messages.truncate(MAX_CHAT_HISTORY_MESSAGES + 1);
+
     let request = ChatRequest {
         model: selected.name.clone(),
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: CHAT_SYSTEM_PROMPT.to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: task,
-            },
-        ],
+        messages,
         stream: true,
         format: None,
         options: Some(serde_json::json!({
@@ -487,5 +554,17 @@ mod tests {
         terminal
             .draw(|frame| ui::ui(frame, &mut app))
             .expect("draw with large pasted input should not panic");
+    }
+
+    #[test]
+    fn wrapped_height_counts_visual_rows() {
+        assert_eq!(text_wrapped_height("", 10), 1);
+        assert_eq!(text_wrapped_height(&"a".repeat(100), 10), 10);
+        assert_eq!(text_wrapped_height("a\nbb\n", 10), 3);
+    }
+
+    #[test]
+    fn visual_line_indices_map_wrapped_rows_to_sources() {
+        assert_eq!(chat_visual_line_indices("aaaaaa\nbb", 3), vec![0, 0, 1]);
     }
 }
