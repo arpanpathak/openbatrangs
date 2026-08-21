@@ -87,22 +87,6 @@ pub struct ChatRequest {
     pub options: Option<Value>,
 }
 
-/// Non-streaming chat response body.
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-pub struct ChatResponse {
-    /// The assistant's reply message.
-    pub message: ChatResponseMessage,
-}
-
-/// The assistant's reply message in a non-streaming response.
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-pub struct ChatResponseMessage {
-    /// Reply text.
-    pub content: String,
-}
-
 /// Payload for `POST /api/pull`.
 #[derive(Serialize, Debug)]
 struct PullRequest {
@@ -110,6 +94,14 @@ struct PullRequest {
     name: String,
     /// Whether to stream pull progress. We use `false` for simplicity.
     stream: bool,
+}
+
+/// A meaningful event extracted from one Ollama NDJSON stream line.
+enum StreamLine {
+    /// Assistant content delta.
+    Content(String),
+    /// Terminal `done: true` marker.
+    Done,
 }
 
 impl OllamaClient {
@@ -196,36 +188,10 @@ impl OllamaClient {
             ));
         }
 
-        Ok(response
+        response
             .json()
             .await
-            .context("failed to parse Ollama /api/show response")?)
-    }
-
-    /// Perform a non-streaming chat completion.
-    ///
-    /// Kept for callers that want the whole response at once.
-    #[allow(dead_code)]
-    pub async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let response = self
-            .http
-            .post(format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await
-            .context("failed to call Ollama /api/chat")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Ollama /api/chat returned HTTP {status}: {text}"));
-        }
-
-        let body: ChatResponse = response
-            .json()
-            .await
-            .context("failed to parse Ollama /api/chat response")?;
-        Ok(body)
+            .context("failed to parse Ollama /api/show response")
     }
 
     /// Stream a chat completion as a sequence of content deltas.
@@ -260,34 +226,16 @@ impl OllamaClient {
             (byte_stream, String::new()),
             |(mut byte_stream, mut buffer)| async move {
                 loop {
+                    match drain_complete_lines(&mut buffer) {
+                        LineDrain::Content(content) => {
+                            return Some((Ok(content), (byte_stream, buffer)));
+                        }
+                        LineDrain::Done => return None,
+                        LineDrain::NeedMore => {}
+                    }
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
                             buffer.push_str(&String::from_utf8_lossy(&bytes));
-                            while let Some(newline_pos) = buffer.find('\n') {
-                                let line = buffer[..newline_pos].trim().to_string();
-                                buffer = buffer[newline_pos + 1..].to_string();
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                                    if let Some(content) = value
-                                        .pointer("/message/content")
-                                        .and_then(|content| content.as_str())
-                                    {
-                                        return Some((
-                                            Ok(content.to_string()),
-                                            (byte_stream, buffer),
-                                        ));
-                                    }
-                                    if value
-                                        .get("done")
-                                        .and_then(|done| done.as_bool())
-                                        .unwrap_or(false)
-                                    {
-                                        return None;
-                                    }
-                                }
-                            }
                         }
                         Some(Err(error)) => {
                             return Some((
@@ -339,5 +287,78 @@ impl OllamaClient {
             .unwrap_or("done");
         println!("✅ Pull finished: {status}");
         Ok(())
+    }
+}
+
+/// Result of draining complete NDJSON lines from the stream buffer.
+enum LineDrain {
+    /// A content delta is ready to emit.
+    Content(String),
+    /// The stream's terminal `done` marker was seen.
+    Done,
+    /// No complete payload line is available yet.
+    NeedMore,
+}
+
+/// Consume complete lines from `buffer`, returning the first meaningful event.
+fn drain_complete_lines(buffer: &mut String) -> LineDrain {
+    while let Some(newline_pos) = buffer.find('\n') {
+        let line = buffer[..newline_pos].trim().to_string();
+        *buffer = buffer[newline_pos + 1..].to_string();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_stream_line(&line) {
+            Some(StreamLine::Content(content)) => return LineDrain::Content(content),
+            Some(StreamLine::Done) => return LineDrain::Done,
+            None => {}
+        }
+    }
+    LineDrain::NeedMore
+}
+
+/// Parse one NDJSON line from an Ollama chat stream.
+///
+/// Returns `None` for non-payload lines (progress, keep-alive, malformed JSON).
+fn parse_stream_line(line: &str) -> Option<StreamLine> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if let Some(content) = value
+        .pointer("/message/content")
+        .and_then(|content| content.as_str())
+    {
+        return Some(StreamLine::Content(content.to_string()));
+    }
+    if value
+        .get("done")
+        .and_then(|done| done.as_bool())
+        .unwrap_or(false)
+    {
+        return Some(StreamLine::Done);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_content_delta_from_stream_line() {
+        let line = r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#;
+        match parse_stream_line(line) {
+            Some(StreamLine::Content(content)) => assert_eq!(content, "hello"),
+            _ => panic!("expected content delta"),
+        }
+    }
+
+    #[test]
+    fn parses_done_marker_from_stream_line() {
+        let line = r#"{"done":true}"#;
+        assert!(matches!(parse_stream_line(line), Some(StreamLine::Done)));
+    }
+
+    #[test]
+    fn ignores_malformed_stream_line() {
+        assert!(parse_stream_line("not json").is_none());
     }
 }

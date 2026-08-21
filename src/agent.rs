@@ -33,7 +33,7 @@ const AGENT_TEMPERATURE: f64 = 0.2;
 /// that should be appended to the current live line.
 pub trait Reporter: Send {
     fn line(&mut self, msg: String);
-    fn chunk(&mut self, msg: String);
+    fn chunk(&mut self, msg: &str);
 }
 
 /// Prints agent output directly to stdout (used by one-shot mode).
@@ -48,7 +48,7 @@ impl Reporter for StdoutReporter {
         }
     }
 
-    fn chunk(&mut self, msg: String) {
+    fn chunk(&mut self, msg: &str) {
         print!("{msg}");
         let _ = std::io::stdout().flush();
     }
@@ -58,8 +58,8 @@ impl Reporter for StdoutReporter {
 pub struct AgentConfig {
     pub cwd: PathBuf,
     pub max_steps: usize,
-    pub read_only: bool,
-    pub confirm: bool,
+    pub is_read_only: bool,
+    pub should_confirm: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,9 +144,6 @@ impl Tool {
 #[derive(Debug, Deserialize)]
 struct AgentResponse {
     #[serde(default)]
-    #[allow(dead_code)]
-    thought: Option<String>,
-    #[serde(default)]
     tool: Option<ToolCall>,
     #[serde(default)]
     answer: Option<String>,
@@ -180,6 +177,22 @@ Rules:
 - When the task is complete, provide a concise answer with what changed and any commands the user should run.
 - Keep tool outputs in mind, but do not repeat them verbatim in the final answer."#;
 
+/// The outcome of one agent iteration.
+enum AgentStepOutcome {
+    /// The agent answered or hit a terminal parse error.
+    Finished,
+    /// The agent called a tool and should continue to the next step.
+    Continue,
+}
+
+/// Immutable inputs shared by every agent step.
+struct AgentRunContext<'a> {
+    config: &'a AgentConfig,
+    client: &'a OllamaClient,
+    model: &'a str,
+    num_ctx: u64,
+}
+
 pub async fn run_agent<R: Reporter>(
     config: &AgentConfig,
     client: &OllamaClient,
@@ -194,69 +207,26 @@ pub async fn run_agent<R: Reporter>(
     let mut messages = initial_messages(&config.cwd, task);
     let mut changed_files: Vec<String> = Vec::new();
 
+    let step_context = AgentRunContext {
+        config,
+        client,
+        model,
+        num_ctx,
+    };
+
     for step in 1..=config.max_steps {
-        reporter.line(format!(
-            "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}",
-            max = config.max_steps
-        ));
-
-        let request = chat_request(model, &messages, num_ctx);
-        let (content, answer_was_streamed) = stream_model_response(client, request, reporter)
-            .await
-            .with_context(|| format!("model call failed at step {step}"))?;
-
-        let response = match parse_agent_response(&content) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                reporter.line(format!("\n⚠️  Could not parse model JSON: {error}"));
-                reporter.line("Showing raw model output as the final response.".to_string());
-                reporter.line(format!("\n{content}"));
-                return Ok(());
-            }
-        };
-
-        if let Some(answer) = response.answer {
-            if !answer_was_streamed {
-                reporter.line(format!("\n\x1b[32m✅\x1b[0m {answer}"));
-            }
-            print_changed_files(&config.cwd, &changed_files, reporter);
-            return Ok(());
+        let outcome = run_agent_step(
+            &step_context,
+            &mut messages,
+            &mut changed_files,
+            reporter,
+            step,
+        )
+        .await?;
+        match outcome {
+            AgentStepOutcome::Finished => return Ok(()),
+            AgentStepOutcome::Continue => {}
         }
-
-        if let Some(tool_call) = response.tool {
-            let tool = Tool::from_call(tool_call)?;
-            if let Tool::Finish { summary } = &tool {
-                reporter.line(format!("\n\x1b[32m✅\x1b[0m {summary}"));
-                print_changed_files(&config.cwd, &changed_files, reporter);
-                return Ok(());
-            }
-
-            messages.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: content.clone(),
-            });
-
-            reporter.line(format!(
-                "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
-                tool.describe()
-            ));
-            let result_text =
-                match execute_tool(config, &config.cwd, &tool, &mut changed_files).await {
-                    Ok(text) => text,
-                    Err(error) => format!("Tool error: {error:#}"),
-                };
-            reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
-
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: format!("Tool result:\n{result_text}"),
-            });
-            trim_messages(&mut messages, MAX_HISTORY_MESSAGES);
-            continue;
-        }
-
-        reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
-        return Ok(());
     }
 
     reporter.line(format!(
@@ -264,6 +234,113 @@ pub async fn run_agent<R: Reporter>(
         config.max_steps
     ));
     Ok(())
+}
+
+/// Run one agent iteration: stream a response, parse it, and act on it.
+async fn run_agent_step<R: Reporter>(
+    context: &AgentRunContext<'_>,
+    messages: &mut Vec<ChatMessage>,
+    changed_files: &mut Vec<String>,
+    reporter: &mut R,
+    step: usize,
+) -> Result<AgentStepOutcome> {
+    report_step_start(reporter, step, context.config.max_steps, context.model);
+
+    let request = chat_request(context.model, messages, context.num_ctx);
+    let (content, answer_was_streamed) = stream_model_response(context.client, request, reporter)
+        .await
+        .with_context(|| format!("model call failed at step {step}"))?;
+
+    let response = match parse_agent_response(&content) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            report_parse_error(reporter, &error, &content);
+            return Ok(AgentStepOutcome::Finished);
+        }
+    };
+
+    if let Some(answer) = response.answer {
+        if !answer_was_streamed {
+            reporter.line(format!("\n\x1b[32m✅\x1b[0m {answer}"));
+        }
+        print_changed_files(&context.config.cwd, changed_files, reporter);
+        return Ok(AgentStepOutcome::Finished);
+    }
+
+    if let Some(tool_call) = response.tool {
+        return handle_tool_call(
+            context.config,
+            messages,
+            changed_files,
+            reporter,
+            &content,
+            tool_call,
+        )
+        .await;
+    }
+
+    reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
+    Ok(AgentStepOutcome::Finished)
+}
+
+/// Execute a parsed tool call and append the assistant/tool messages.
+async fn handle_tool_call<R: Reporter>(
+    config: &AgentConfig,
+    messages: &mut Vec<ChatMessage>,
+    changed_files: &mut Vec<String>,
+    reporter: &mut R,
+    content: &str,
+    tool_call: ToolCall,
+) -> Result<AgentStepOutcome> {
+    let tool = Tool::from_call(tool_call)?;
+    if let Tool::Finish { summary } = &tool {
+        reporter.line(format!("\n\x1b[32m✅\x1b[0m {summary}"));
+        print_changed_files(&config.cwd, changed_files, reporter);
+        return Ok(AgentStepOutcome::Finished);
+    }
+
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+    });
+
+    reporter.line(format!(
+        "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
+        tool.describe()
+    ));
+    let result_text = execute_tool_or_report_error(config, &config.cwd, &tool, changed_files).await;
+    reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
+
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: format!("Tool result:\n{result_text}"),
+    });
+    trim_messages(messages, MAX_HISTORY_MESSAGES);
+    Ok(AgentStepOutcome::Continue)
+}
+
+fn report_step_start<R: Reporter>(reporter: &mut R, step: usize, max_steps: usize, model: &str) {
+    reporter.line(format!(
+        "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max_steps}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}"
+    ));
+}
+
+fn report_parse_error<R: Reporter>(reporter: &mut R, error: &anyhow::Error, content: &str) {
+    reporter.line(format!("\n⚠️  Could not parse model JSON: {error}"));
+    reporter.line("Showing raw model output as the final response.".to_string());
+    reporter.line(format!("\n{content}"));
+}
+
+async fn execute_tool_or_report_error(
+    config: &AgentConfig,
+    cwd: &Path,
+    tool: &Tool,
+    changed_files: &mut Vec<String>,
+) -> String {
+    match execute_tool(config, cwd, tool, changed_files).await {
+        Ok(text) => text,
+        Err(error) => format!("Tool error: {error:#}"),
+    }
 }
 
 fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
@@ -333,25 +410,25 @@ async fn stream_model_response<R: Reporter>(
 /// Tracks incremental extraction of a JSON string field from a streaming buffer.
 struct StreamState {
     key: &'static str,
-    prefix_printed: bool,
-    printed_len: usize,
-    complete: bool,
-    skipped: bool,
+    has_printed_prefix: bool,
+    printed_length: usize,
+    is_complete: bool,
+    is_skipped: bool,
 }
 
 impl StreamState {
     fn new(key: &'static str) -> Self {
         Self {
             key,
-            prefix_printed: false,
-            printed_len: 0,
-            complete: false,
-            skipped: false,
+            has_printed_prefix: false,
+            printed_length: 0,
+            is_complete: false,
+            is_skipped: false,
         }
     }
 
     fn feed<R: Reporter>(&mut self, reporter: &mut R, buffer: &str) -> Result<()> {
-        if self.complete || self.skipped {
+        if self.is_complete || self.is_skipped {
             return Ok(());
         }
 
@@ -361,22 +438,22 @@ impl StreamState {
             (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
         {
             if tool_pos < field_pos {
-                self.skipped = true;
+                self.is_skipped = true;
                 return Ok(());
             }
         }
 
         if let Some((text, is_complete)) = extract_json_string(buffer, self.key) {
-            if !self.prefix_printed && !text.is_empty() {
-                reporter.chunk(self.prefix());
-                self.prefix_printed = true;
+            if !self.has_printed_prefix && !text.is_empty() {
+                reporter.chunk(&self.prefix());
+                self.has_printed_prefix = true;
             }
-            if text.len() > self.printed_len {
-                reporter.chunk(text[self.printed_len..].to_string());
-                self.printed_len = text.len();
+            if text.len() > self.printed_length && text.is_char_boundary(self.printed_length) {
+                reporter.chunk(&text[self.printed_length..]);
+                self.printed_length = text.len();
             }
             if is_complete {
-                self.complete = true;
+                self.is_complete = true;
                 reporter.line(String::new());
             }
         }
@@ -392,7 +469,7 @@ impl StreamState {
     }
 
     fn did_print(&self) -> bool {
-        self.prefix_printed
+        self.has_printed_prefix
     }
 }
 
@@ -430,7 +507,7 @@ async fn execute_tool(
 }
 
 fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
-    if config.read_only {
+    if config.is_read_only {
         bail!("this tool is disabled in read-only mode");
     }
     Ok(())
@@ -460,7 +537,7 @@ fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
 }
 
 fn confirm_or_abort(config: &AgentConfig, prompt: &str) -> Result<()> {
-    if !config.confirm {
+    if !config.should_confirm {
         return Ok(());
     }
     print!("❓ {prompt} [y/N] ");
@@ -556,5 +633,82 @@ fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut
     reporter.line("\n\x1b[1;33m📁 Files changed:\x1b[0m".to_string());
     for file in files {
         reporter.line(format!("   {}", clickable_path(cwd, file)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agent_response_without_code_fence() {
+        let response =
+            parse_agent_response(r#"{"answer":"done"}"#).expect("valid response should parse");
+        assert_eq!(response.answer.as_deref(), Some("done"));
+        assert!(response.tool.is_none());
+    }
+
+    #[test]
+    fn parses_agent_response_with_code_fence() {
+        let response = parse_agent_response(
+            "```json\n{\"tool\":{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}}\n```",
+        )
+        .expect("valid fenced response should parse");
+        assert!(response.tool.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_agent_response() {
+        assert!(parse_agent_response("not json").is_err());
+    }
+
+    #[test]
+    fn extracts_json_string_incrementally() {
+        let key = "answer";
+        assert_eq!(
+            extract_json_string(r#"{"answer":"hel"#, key),
+            Some(("hel".to_string(), false))
+        );
+        assert_eq!(
+            extract_json_string(r#"{"answer":"hello"}"#, key),
+            Some(("hello".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn trims_messages_but_keeps_system_and_first_user() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "system".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "task".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "a1".to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "u1".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "a2".to_string(),
+            },
+        ];
+        trim_messages(&mut messages, 3);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].content, "task");
+        assert_eq!(messages[2].content, "a2");
+    }
+
+    #[test]
+    fn rejects_non_string_tool_argument() {
+        let args = serde_json::json!({"path": 42});
+        assert!(string_arg(&args, "path").is_err());
     }
 }

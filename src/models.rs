@@ -84,7 +84,6 @@ pub fn total_system_memory_bytes() -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kilobytes: u64 = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|value| value.parse().ok())
@@ -263,9 +262,9 @@ fn memory_fit_factor(model: &OllamaModel, mem_budget: u64, reasons: &mut Vec<Str
 /// Parameter-size factor favoring 4B-8B coding models on edge devices.
 fn parameter_size_factor(parameters_b: f64) -> f64 {
     match parameters_b {
-        p if p >= MIN_SMALL_MODEL_B && p < MAX_SMALL_MODEL_B => SIZE_FACTOR_SMALL,
-        p if p >= MAX_SMALL_MODEL_B && p < MAX_MEDIUM_MODEL_B => SIZE_FACTOR_MEDIUM,
-        p if p >= MAX_MEDIUM_MODEL_B && p < MAX_LARGE_MODEL_B => SIZE_FACTOR_LARGE,
+        p if (MIN_SMALL_MODEL_B..MAX_SMALL_MODEL_B).contains(&p) => SIZE_FACTOR_SMALL,
+        p if (MAX_SMALL_MODEL_B..MAX_MEDIUM_MODEL_B).contains(&p) => SIZE_FACTOR_MEDIUM,
+        p if (MAX_MEDIUM_MODEL_B..MAX_LARGE_MODEL_B).contains(&p) => SIZE_FACTOR_LARGE,
         p if p >= MAX_LARGE_MODEL_B => SIZE_FACTOR_HUGE,
         _ => SIZE_FACTOR_UNKNOWN,
     }

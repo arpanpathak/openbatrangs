@@ -299,3 +299,37 @@ fn truncate_to(text: String, max: usize) -> String {
     ));
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_in_root_rejects_absolute_paths() {
+        let root = Path::new("/tmp/project");
+        assert!(resolve_in_root(root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn resolve_in_root_rejects_parent_dir_traversal() {
+        let root = Path::new("/tmp/project");
+        assert!(resolve_in_root(root, "../secret").is_err());
+    }
+
+    #[test]
+    fn resolve_in_root_accepts_relative_paths() {
+        let root = Path::new("/tmp/project");
+        assert_eq!(
+            resolve_in_root(root, "src/main.rs").expect("relative path should resolve"),
+            Path::new("/tmp/project/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn truncate_appends_omission_note() {
+        let text = "x".repeat(MAX_TOOL_OUTPUT + 100);
+        let result = truncate(text);
+        assert!(result.len() < MAX_TOOL_OUTPUT + 200);
+        assert!(result.contains("truncated"));
+    }
+}

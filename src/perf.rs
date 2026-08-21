@@ -1,0 +1,351 @@
+//! Lightweight system/GPU performance sampling for the TUI task manager.
+//!
+//! On Jetson-class devices this reads live `tegrastats` output. On systems with
+//! discrete NVIDIA GPUs it falls back to `nvidia-smi`. CPU and RAM are always
+//! read from `/proc`.
+
+use regex::Regex;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How often the TUI refreshes the performance panel.
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A point-in-time snapshot of system and GPU health.
+#[derive(Clone, Debug, Default)]
+pub struct SystemStats {
+    /// GPU model name, when known.
+    pub gpu_name: Option<String>,
+    /// GPU utilization percentage.
+    pub gpu_util_percent: Option<f64>,
+    /// Used GPU memory in MiB.
+    pub gpu_memory_used_mb: Option<u64>,
+    /// Total GPU memory in MiB.
+    pub gpu_memory_total_mb: Option<u64>,
+    /// GPU power draw in watts.
+    pub gpu_power_watts: Option<f64>,
+    /// GPU temperature in Celsius.
+    pub gpu_temp_c: Option<f64>,
+    /// Overall CPU utilization percentage.
+    pub cpu_util_percent: Option<f64>,
+    /// Number of logical CPU cores.
+    pub cpu_cores: usize,
+    /// Used system memory in MiB.
+    pub memory_used_mb: u64,
+    /// Total system memory in MiB.
+    pub memory_total_mb: u64,
+}
+
+/// GPU-only fields parsed from either `tegrastats` or `nvidia-smi`.
+#[derive(Clone, Debug, Default)]
+struct GpuStats {
+    name: Option<String>,
+    util_percent: Option<f64>,
+    memory_used_mb: Option<u64>,
+    memory_total_mb: Option<u64>,
+    power_watts: Option<f64>,
+    temp_c: Option<f64>,
+}
+
+/// Tracks the previous `/proc/stat` sample so CPU utilization is a delta.
+struct CpuSampler {
+    previous: Option<(u64, u64)>,
+}
+
+impl CpuSampler {
+    fn new() -> Self {
+        let mut sampler = Self { previous: None };
+        // Prime the delta so the first visible sample is meaningful.
+        let _ = sampler.sample();
+        sampler
+    }
+
+    fn sample(&mut self) -> Option<f64> {
+        let current = read_cpu_times()?;
+        let utilization = match self.previous {
+            Some((previous_idle, previous_total)) => {
+                let idle_delta = current.0.saturating_sub(previous_idle);
+                let total_delta = current.1.saturating_sub(previous_total);
+                if total_delta == 0 {
+                    None
+                } else {
+                    Some(100.0 * (1.0 - idle_delta as f64 / total_delta as f64))
+                }
+            }
+            None => None,
+        };
+        self.previous = Some(current);
+        utilization
+    }
+}
+
+/// Monitors system stats and the latest `tegrastats` line.
+pub struct PerfMonitor {
+    tegrastats: Arc<Mutex<Option<String>>>,
+    cpu: CpuSampler,
+    last_sample: Option<Instant>,
+}
+
+impl PerfMonitor {
+    pub fn new(tegrastats: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            tegrastats,
+            cpu: CpuSampler::new(),
+            last_sample: None,
+        }
+    }
+
+    /// Sample at most once per `SAMPLE_INTERVAL`.
+    pub fn sample_if_due(&mut self, now: Instant) -> Option<SystemStats> {
+        let is_due = self
+            .last_sample
+            .map(|last| now.duration_since(last) >= SAMPLE_INTERVAL)
+            .unwrap_or(true);
+        if !is_due {
+            return None;
+        }
+        self.last_sample = Some(now);
+        Some(self.sample())
+    }
+
+    fn sample(&mut self) -> SystemStats {
+        let latest_tegrastats = self
+            .tegrastats
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let tegrastats_stats = latest_tegrastats.as_deref().and_then(parse_tegrastats);
+        let gpu = match &tegrastats_stats {
+            // On Jetson, tegrastats RAM is the shared system memory, not a
+            // dedicated VRAM pool; leave GPU memory fields for nvidia-smi only.
+            Some(stats) => GpuStats {
+                name: None,
+                util_percent: stats.util_percent,
+                memory_used_mb: None,
+                memory_total_mb: None,
+                power_watts: stats.power_watts,
+                temp_c: stats.temp_c,
+            },
+            None => parse_nvidia_smi().unwrap_or_default(),
+        };
+        // Match jtop/free accounting: MemTotal - MemFree - Buffers - Cached.
+        let (memory_used_mb, memory_total_mb) = read_memory_mb();
+
+        SystemStats {
+            gpu_name: gpu.name,
+            gpu_util_percent: gpu.util_percent,
+            gpu_memory_used_mb: gpu.memory_used_mb,
+            gpu_memory_total_mb: gpu.memory_total_mb,
+            gpu_power_watts: gpu.power_watts,
+            gpu_temp_c: gpu.temp_c,
+            cpu_util_percent: self.cpu.sample(),
+            cpu_cores: std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(0),
+            memory_used_mb,
+            memory_total_mb,
+        }
+    }
+}
+
+/// Spawn `tegrastats` in the background and keep its latest line in `shared`.
+pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<std::process::Child> {
+    let mut child = Command::new("tegrastats")
+        .arg("--interval")
+        .arg("1000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(mut guard) = shared.lock() {
+                *guard = Some(line);
+            }
+        }
+    });
+    Some(child)
+}
+
+/// Kills the background `tegrastats` process when dropped.
+pub struct TegrastatsGuard(Option<std::process::Child>);
+
+impl TegrastatsGuard {
+    pub fn start(shared: Arc<Mutex<Option<String>>>) -> Self {
+        Self(start_tegrastats(shared))
+    }
+}
+
+impl Drop for TegrastatsGuard {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn parse_tegrastats(line: &str) -> Option<GpuStats> {
+    let patterns = tegra_patterns();
+
+    let ram = patterns.ram.captures(line)?;
+    let memory_used_mb = ram.get(1)?.as_str().parse().ok();
+    let memory_total_mb = ram.get(2)?.as_str().parse().ok();
+
+    let util_percent = patterns
+        .gr3d
+        .captures(line)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse().ok());
+
+    let temp_c = patterns
+        .gpu_temp
+        .captures(line)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse().ok());
+
+    let power_watts = patterns
+        .vdd_in
+        .captures(line)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse::<f64>().ok())
+        .map(|milliwatts| milliwatts / 1000.0);
+
+    Some(GpuStats {
+        name: None,
+        util_percent,
+        memory_used_mb,
+        memory_total_mb,
+        power_watts,
+        temp_c,
+    })
+}
+
+fn parse_nvidia_smi() -> Option<GpuStats> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next()?;
+    let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+    if fields.len() < 6 {
+        return None;
+    }
+
+    Some(GpuStats {
+        name: Some(fields[0].to_string()),
+        util_percent: parse_float(fields[1]),
+        memory_used_mb: fields[2].parse().ok(),
+        memory_total_mb: fields[3].parse().ok(),
+        power_watts: parse_float(fields[4]),
+        temp_c: parse_float(fields[5]),
+    })
+}
+
+/// Parse a numeric CSV field, treating `[N/A]` as missing.
+fn parse_float(field: &str) -> Option<f64> {
+    if field.contains("[N/A]") {
+        return None;
+    }
+    field.parse().ok()
+}
+
+fn read_memory_mb() -> (u64, u64) {
+    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut total_kb = 0u64;
+    let mut free_kb = 0u64;
+    let mut buffers_kb = 0u64;
+    let mut cached_kb = 0u64;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = parse_kibibytes(rest);
+        } else if let Some(rest) = line.strip_prefix("MemFree:") {
+            free_kb = parse_kibibytes(rest);
+        } else if let Some(rest) = line.strip_prefix("Buffers:") {
+            buffers_kb = parse_kibibytes(rest);
+        } else if let Some(rest) = line.strip_prefix("Cached:") {
+            cached_kb = parse_kibibytes(rest);
+        }
+    }
+    let total_mb = total_kb / 1024;
+    let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb);
+    let used_mb = used_kb / 1024;
+    (used_mb, total_mb)
+}
+
+fn parse_kibibytes(rest: &str) -> u64 {
+    rest.split_whitespace()
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn read_cpu_times() -> Option<(u64, u64)> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = content.lines().next()?;
+    let mut fields = line.split_whitespace().skip(1);
+    let user: u64 = fields.next()?.parse().ok()?;
+    let nice: u64 = fields.next()?.parse().ok()?;
+    let system: u64 = fields.next()?.parse().ok()?;
+    let idle: u64 = fields.next()?.parse().ok()?;
+    let iowait: u64 = fields.next()?.parse().ok()?;
+    let irq: u64 = fields.next()?.parse().ok()?;
+    let softirq: u64 = fields.next()?.parse().ok()?;
+    let steal: u64 = fields.next()?.parse().ok()?;
+
+    let idle_total = idle + iowait;
+    let total = user + nice + system + idle + iowait + irq + softirq + steal;
+    Some((idle_total, total))
+}
+
+struct TegrastatsPatterns {
+    ram: Regex,
+    gr3d: Regex,
+    gpu_temp: Regex,
+    vdd_in: Regex,
+}
+
+fn tegra_patterns() -> &'static TegrastatsPatterns {
+    static PATTERNS: OnceLock<TegrastatsPatterns> = OnceLock::new();
+    PATTERNS.get_or_init(|| TegrastatsPatterns {
+        ram: Regex::new(r"RAM (\d+)/(\d+)MB").expect("static RAM regex is valid"),
+        gr3d: Regex::new(r"GR3D_FREQ (\d+)%").expect("static GR3D regex is valid"),
+        gpu_temp: Regex::new(r"gpu@([\d.]+)C").expect("static GPU temperature regex is valid"),
+        vdd_in: Regex::new(r"VDD_IN (\d+)mW/").expect("static VDD_IN regex is valid"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tegrastats_gpu_fields() {
+        let line = "08-20-2026 20:27:02 RAM 9982/15656MB (lfb 55x4MB) SWAP 6301/16020MB (cached 45MB) CPU [8%@729,8%@729] GR3D_FREQ 0% cv0@51.812C cpu@55.906C gpu@54.437C tj@55.906C VDD_IN 7716mW/7716mW VDD_CPU_GPU_CV 908mW/908mW";
+        let stats = parse_tegrastats(line).unwrap();
+        assert_eq!(stats.memory_used_mb, Some(9982));
+        assert_eq!(stats.memory_total_mb, Some(15656));
+        assert_eq!(stats.util_percent, Some(0.0));
+        assert_eq!(stats.temp_c, Some(54.437));
+        assert_eq!(stats.power_watts, Some(7.716));
+    }
+
+    #[test]
+    fn parses_float_na_as_missing() {
+        assert!(parse_float("[N/A]").is_none());
+        assert_eq!(parse_float("42.5"), Some(42.5));
+    }
+}
