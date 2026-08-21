@@ -18,10 +18,12 @@ ARCH="$(uname -m)"
 
 case "${ARCH}" in
   aarch64|arm64) TARGET_ARCH="aarch64" ;;
-  x86_64|amd64) TARGET_ARCH="x86_64" ;;
   *)
-    echo "❌ Unsupported architecture: ${ARCH}"
-    echo "   openBatarangs prebuilt binaries are currently available for aarch64 and x86_64."
+    echo "❌ Unsupported architecture for the prebuilt binary: ${ARCH}"
+    echo "   Prebuilt releases currently target aarch64 (Jetson/ARM64)."
+    echo "   To build from source instead:"
+    echo "     git clone https://github.com/arpanpathak/openbatrangs.git"
+    echo "     cd openbatrangs && cargo build --release"
     exit 1
     ;;
 esac
