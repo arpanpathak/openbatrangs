@@ -6,9 +6,11 @@
 
 use super::app::{App, PickerState};
 use super::split_command;
+use super::{run_pull_worker, run_setup_worker, UiEvent};
 use crate::cli::AgentMode;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 /// True when a model tag is already installed locally (pure and testable).
 fn model_installed(tags: &[OllamaModel], requested: &str) -> bool {
@@ -20,6 +22,7 @@ impl App {
         &mut self,
         client: &OllamaClient,
         line: &str,
+        tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<()> {
         let (name, arg) = split_command(line);
         match name {
@@ -27,13 +30,13 @@ impl App {
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
             "model" => self.handle_model_command(client, arg).await?,
-            "pull" => self.handle_pull_command(client, arg).await?,
+            "pull" => self.handle_pull_command(client, arg, tx).await?,
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
             "steps" => self.handle_steps_command(arg),
             "cwd" => self.handle_cwd_command(arg),
             "doctor" => self.handle_doctor_command(client).await?,
-            "setup" => self.handle_setup_command(client).await?,
+            "setup" => self.handle_setup_command(client, tx).await?,
             "clear" => self.clear_chat(),
             "perf" => self.toggle_perf(),
             "mode" => self.handle_mode_command(arg),
@@ -122,35 +125,42 @@ impl App {
         &mut self,
         client: &OllamaClient,
         arg: &str,
+        tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<()> {
-        let name = arg.trim();
+        let name = arg.trim().to_string();
         if name.is_empty() {
             self.log.push("Usage: /pull <model-tag>".to_string());
             return Ok(());
         }
-
-        self.log.push(format!("⬇️  Pulling model '{name}'..."));
-        let messages = std::sync::Mutex::new(Vec::new());
-        let result = client
-            .pull(name, &|msg| {
-                if let Ok(mut messages) = messages.lock() {
-                    messages.push(msg.to_string());
-                }
-            })
-            .await;
-        let messages = messages.into_inner().unwrap_or_default();
-        self.log.extend(messages);
-
-        match result {
-            Ok(()) => {
-                self.log.push(format!("✅ Model ready: {name}"));
-                self.log.push(format!("Now select it with /model {name}"));
-            }
-            Err(error) => self
-                .log
-                .push(format!("❌ Failed to pull model '{name}': {error:#}")),
+        if self.is_running {
+            self.log
+                .push("⚠️  Busy — finish the current task before pulling a model.".to_string());
+            return Ok(());
         }
+
+        self.log
+            .push(format!("⬇️  Pulling model '{name}' in background..."));
+        self.start_pull(client, name, tx);
         Ok(())
+    }
+
+    fn start_pull(
+        &mut self,
+        client: &OllamaClient,
+        name: String,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        self.is_running = true;
+        self.status = "pulling model".to_string();
+        self.last_action = format!("pulling {name}");
+        self.auto_scroll = true;
+
+        let client = client.clone();
+        let tx = tx.clone();
+        let handle = tokio::spawn(async move {
+            run_pull_worker(client, name, tx).await;
+        });
+        self.current_task = Some(handle);
     }
 
     fn toggle_read_only(&mut self) {
@@ -279,18 +289,30 @@ impl App {
         Ok(())
     }
 
-    async fn handle_setup_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
-        self.log.push("Running setup...".to_string());
-        let messages = std::sync::Mutex::new(Vec::new());
-        crate::commands::setup_with_status(client, &|msg| {
-            if let Ok(mut messages) = messages.lock() {
-                messages.push(msg.to_string());
-            }
-        })
-        .await?;
-        let messages = messages.into_inner().unwrap_or_default();
-        self.log.extend(messages);
-        self.log.push("✅ Setup finished.".to_string());
+    async fn handle_setup_command(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> anyhow::Result<()> {
+        if self.is_running {
+            self.log
+                .push("⚠️  Busy — finish the current task before running setup.".to_string());
+            return Ok(());
+        }
+
+        self.log
+            .push("🔄 Running setup in background...".to_string());
+        self.is_running = true;
+        self.status = "running setup".to_string();
+        self.last_action = "setup".to_string();
+        self.auto_scroll = true;
+
+        let client = client.clone();
+        let tx = tx.clone();
+        let handle = tokio::spawn(async move {
+            run_setup_worker(client, tx).await;
+        });
+        self.current_task = Some(handle);
         Ok(())
     }
 
@@ -318,6 +340,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::sync::{Arc, Mutex};
 
     fn installed_model(name: &str) -> OllamaModel {
         serde_json::from_value(serde_json::json!({
@@ -342,5 +366,17 @@ mod tests {
     #[test]
     fn model_installed_false_with_no_models() {
         assert!(!model_installed(&[], "qwen2.5-coder:7b"));
+    }
+
+    #[tokio::test]
+    async fn pull_command_without_model_shows_usage_and_does_not_run() {
+        let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        let client = OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.handle_pull_command(&client, "", &tx).await.unwrap();
+        assert!(app.log.iter().any(|line| line.contains("Usage: /pull")));
+        assert!(!app.is_running);
+        assert!(app.current_task.is_none());
     }
 }

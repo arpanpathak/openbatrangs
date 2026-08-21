@@ -15,6 +15,11 @@ pub(crate) enum UiEvent {
     Log(String),
     Chunk(String),
     Done(Result<(), String>),
+    PullDone {
+        name: String,
+        result: Result<(), String>,
+    },
+    SetupDone(Result<(), String>),
 }
 
 struct ChannelReporter {
@@ -114,4 +119,34 @@ async fn run_chat_worker(
         let _ = tx.send(UiEvent::Chunk(chunk));
     }
     Ok(())
+}
+
+/// Pull a model in the background and stream progress to the TUI.
+pub(crate) async fn run_pull_worker(
+    client: OllamaClient,
+    model: String,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    let progress_tx = tx.clone();
+    let result = client
+        .pull(&model, &|msg| {
+            let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
+        })
+        .await;
+    let _ = tx.send(UiEvent::PullDone {
+        name: model,
+        result: result.map_err(|error| format!("{error:#}")),
+    });
+}
+
+/// Run `/setup` in the background and stream progress to the TUI.
+pub(crate) async fn run_setup_worker(client: OllamaClient, tx: mpsc::UnboundedSender<UiEvent>) {
+    let progress_tx = tx.clone();
+    let result = crate::commands::setup_with_status(&client, &|msg| {
+        let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
+    })
+    .await;
+    let _ = tx.send(UiEvent::SetupDone(
+        result.map_err(|error| format!("{error:#}")),
+    ));
 }

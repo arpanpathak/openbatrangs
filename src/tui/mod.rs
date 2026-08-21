@@ -26,7 +26,7 @@ pub(super) use text::{
     chat_visual_line_indices, extract_path_from_line, open_in_vim, split_command, strip_ansi,
     text_wrapped_height, wrap_text_to_lines,
 };
-pub(super) use worker::{run_agent_worker, UiEvent};
+pub(super) use worker::{run_agent_worker, run_pull_worker, run_setup_worker, UiEvent};
 
 use crate::cli::Cli;
 use crate::constants::tui::TICK_MILLIS;

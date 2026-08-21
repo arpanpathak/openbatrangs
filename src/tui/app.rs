@@ -330,6 +330,38 @@ impl App {
                     self.status = "ready".to_string();
                 }
             }
+            UiEvent::PullDone { name, result } => {
+                self.current_task = None;
+                self.is_running = false;
+                self.status = "ready".to_string();
+                self.last_action.clear();
+                match result {
+                    Ok(()) => {
+                        self.log.push(String::new());
+                        self.log.push(format!("✅ Model ready: {name}"));
+                        self.log.push(format!("Now select it with /model {name}"));
+                    }
+                    Err(error) => {
+                        self.log
+                            .push(format!("❌ Failed to pull model '{name}': {error}"));
+                    }
+                }
+            }
+            UiEvent::SetupDone(result) => {
+                self.current_task = None;
+                self.is_running = false;
+                self.status = "ready".to_string();
+                self.last_action.clear();
+                match result {
+                    Ok(()) => {
+                        self.log.push(String::new());
+                        self.log.push("✅ Setup finished.".to_string());
+                    }
+                    Err(error) => {
+                        self.log.push(format!("⚠️ Setup failed: {error}"));
+                    }
+                }
+            }
         }
     }
 
@@ -625,7 +657,7 @@ impl App {
             self.log.push(format!("You: {task}"));
         }
         if task.starts_with('/') {
-            self.run_slash_command(client, &task).await?;
+            self.run_slash_command(client, &task, tx).await?;
         } else if self.is_running {
             self.task_queue.push_back(task);
             self.log
@@ -810,5 +842,58 @@ mod tests {
         app.selected = 99;
         app.accept_suggestion();
         assert_eq!(app.input, "/mode chat");
+    }
+
+    #[test]
+    fn pull_done_event_marks_ready_and_logs_success() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.handle_event(
+            UiEvent::PullDone {
+                name: "samantha-mistral:7b".to_string(),
+                result: Ok(()),
+            },
+            &client,
+            &tx,
+        );
+        assert!(!app.is_running);
+        assert_eq!(app.status, "ready");
+        assert!(app.log.iter().any(|line| line.contains("Model ready")));
+    }
+
+    #[test]
+    fn pull_done_event_logs_failure_without_crashing() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.handle_event(
+            UiEvent::PullDone {
+                name: "bad-model".to_string(),
+                result: Err("registry not found".to_string()),
+            },
+            &client,
+            &tx,
+        );
+        assert!(!app.is_running);
+        assert_eq!(app.status, "ready");
+        assert!(app
+            .log
+            .iter()
+            .any(|line| line.contains("Failed to pull model 'bad-model'")));
+    }
+
+    #[test]
+    fn setup_done_event_marks_ready_and_logs_success() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.handle_event(UiEvent::SetupDone(Ok(())), &client, &tx);
+        assert!(!app.is_running);
+        assert_eq!(app.status, "ready");
+        assert!(app.log.iter().any(|line| line.contains("Setup finished")));
     }
 }
