@@ -228,7 +228,7 @@ pub async fn run_agent(
                 content: content.clone(),
             });
 
-            println!("\n{}🔧 {}{}", MAGENTA, tool_call.name, RESET);
+            println!("\n{}🔧 {}{}", MAGENTA, describe_tool(&tool_call), RESET);
             let result = execute_tool(config, &cwd, &tool_call, &mut changed_files).await;
             let result_text = match result {
                 Ok(text) => text,
@@ -313,6 +313,37 @@ async fn execute_tool(
             Ok(format!("✅ {summary}"))
         }
         _ => bail!("unknown tool: {name}"),
+    }
+}
+
+/// Human-readable one-line description of what a tool call is about to do.
+fn describe_tool(tool: &ToolCall) -> String {
+    let name = tool.name.as_str();
+    let args = &tool.arguments;
+    match name {
+        "write_file" => {
+            let path = get_str(args, "path").ok().flatten().unwrap_or("?");
+            format!("write_file → {path}")
+        }
+        "read_file" => {
+            let path = get_str(args, "path").ok().flatten().unwrap_or("?");
+            format!("read_file → {path}")
+        }
+        "grep_files" => {
+            let pattern = get_str(args, "pattern").ok().flatten().unwrap_or("?");
+            let path = get_str(args, "path").ok().flatten().unwrap_or(".");
+            format!("grep_files → {pattern:?} in {path}")
+        }
+        "list_files" => {
+            let path = get_str(args, "path").ok().flatten().unwrap_or(".");
+            format!("list_files → {path}")
+        }
+        "run_command" => {
+            let cmd = get_str(args, "command").ok().flatten().unwrap_or("?");
+            format!("run_command → {cmd}")
+        }
+        "finish" => "finish".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -413,9 +444,10 @@ fn extract_json_string(buf: &str, key: &str) -> Option<(String, bool)> {
     Some((out, complete))
 }
 
-/// Terminal-clickable file path (OSC 8 hyperlink).
+/// Terminal-clickable file path (OSC 8 hyperlink). Always emits an absolute path.
 fn clickable_path(cwd: &Path, path: &str) -> String {
-    let full = cwd.join(path);
+    let joined = cwd.join(path);
+    let full = std::path::absolute(&joined).unwrap_or(joined);
     let display = full.to_string_lossy();
     let encoded = display
         .replace('%', "%25")

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="openBatarangs" width="220"/>
+<img src="assets/logo.svg" alt="openBatarangs" width="340" style="max-width:100%;"/>
 
 # openBatarangs
 

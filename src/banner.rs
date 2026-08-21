@@ -6,7 +6,7 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-pub fn print_banner() {
+pub fn banner_text() -> String {
     let batarang = r#"
             /\          /\
            /  \        /  \
@@ -38,11 +38,16 @@ pub fn print_banner() {
         ██████ ██    ██    ██    ██   ██ ██   ██ ██      ██
 "#;
 
-    print!("\x1b[48;5;17m"); // Gotham night background
-    println!("{BLUE}{skyline}{RESET}");
-    println!("{PURPLE}{batarang}{RESET}");
-    println!("{CYAN}{BOLD}{gotham}{RESET}");
-    println!("{YELLOW}{BOLD}   ⚡ GOTHAM · SEATTLE NIGHTS — AGENTIC CODING TERMINAL{RESET}");
-    println!("{DIM}   local models · auto-discovery · no cloud{RESET}");
-    print!("{RESET}");
+    format!(
+        "\x1b[48;5;17m{BLUE}{skyline}{RESET}\n\
+         {PURPLE}{batarang}{RESET}\n\
+         {CYAN}{BOLD}{gotham}{RESET}\n\
+         {YELLOW}{BOLD}   ⚡ GOTHAM · SEATTLE NIGHTS — AGENTIC CODING TERMINAL{RESET}\n\
+         {DIM}   local models · auto-discovery · no cloud{RESET}\n\
+         {RESET}"
+    )
+}
+
+pub fn print_banner() {
+    print!("{}", banner_text());
 }
