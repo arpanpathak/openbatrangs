@@ -1,22 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# openBatarangs installer — builds the CLI and installs it to ~/.local/bin.
-# Also checks for Ollama and starts it if needed.
+# openBatarangs installer/updater
+#   Install:  curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
+#   Update:   same command (overwrites the old binary)
+#
+# Downloads the prebuilt release binary and installs it to ~/.local/bin
+# (or /usr/local/bin when run as root). Also ensures Ollama is present.
 
-BIN_DIR="${HOME}/.local/bin"
+REPO="arpanpathak/openbatrangs"
+VERSION="${OPENBATRANGS_VERSION:-latest}"
+BASE_URL="https://github.com/${REPO}/releases/${VERSION}/download"
+
+# --- Detect target ---------------------------------------------------------
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "${ARCH}" in
+  aarch64|arm64) TARGET_ARCH="aarch64" ;;
+  x86_64|amd64) TARGET_ARCH="x86_64" ;;
+  *)
+    echo "❌ Unsupported architecture: ${ARCH}"
+    echo "   openBatarangs prebuilt binaries are currently available for aarch64 and x86_64."
+    exit 1
+    ;;
+esac
+
+case "${OS}" in
+  Linux) ;;
+  Darwin)
+    echo "❌ macOS is not supported by the prebuilt release yet."
+    exit 1
+    ;;
+  *)
+    echo "❌ Unsupported OS: ${OS}"
+    exit 1
+    ;;
+esac
+
+# --- Install location ------------------------------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+  BIN_DIR="/usr/local/bin"
+else
+  BIN_DIR="${HOME}/.local/bin"
+fi
+
 BIN="${BIN_DIR}/openbatrangs"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "🦇 Installing openBatarangs..."
+# --- Download --------------------------------------------------------------
+echo "🦇 Installing/updating openBatarangs (${TARGET_ARCH})..."
+mkdir -p "${BIN_DIR}"
+TMP_BIN="$(mktemp)"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "❌ Rust/Cargo not found. Install it first: https://rustup.rs"
+echo "⬇️  Downloading ${BASE_URL}/openbatrangs ..."
+if ! curl -fsSL -o "${TMP_BIN}" "${BASE_URL}/openbatrangs"; then
+  echo "❌ Download failed. Check your network or GitHub availability."
+  rm -f "${TMP_BIN}"
   exit 1
 fi
 
+chmod +x "${TMP_BIN}"
+mv "${TMP_BIN}" "${BIN}"
+
+echo "✅ Installed: ${BIN}"
+
+# --- PATH ------------------------------------------------------------------
+case ":${PATH}:" in
+  *":${BIN_DIR}:"*) ;;
+  *)
+    echo ""
+    echo "⚠️  ${BIN_DIR} is not on your PATH yet."
+    if [ "$(id -u)" -ne 0 ]; then
+      RC_FILE="${HOME}/.bashrc"
+      if [ -f "${HOME}/.zshrc" ]; then
+        RC_FILE="${HOME}/.zshrc"
+      fi
+      if ! grep -q "${BIN_DIR}" "${RC_FILE}" 2>/dev/null; then
+        echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> "${RC_FILE}"
+        echo "   Added to ${RC_FILE}. Restart your shell or run: export PATH=\"${BIN_DIR}:\$PATH\""
+      fi
+    else
+      echo "   As root, it is already in a standard PATH location."
+    fi
+    ;;
+esac
+
+# --- Ollama ----------------------------------------------------------------
 if ! command -v ollama >/dev/null 2>&1; then
-  echo "⬇️  Ollama not found. Installing it..."
+  echo ""
+  echo "⬇️  Ollama not found. Installing it with the official script..."
   curl -fsSL https://ollama.com/install.sh | sh
 fi
 
@@ -26,15 +98,8 @@ if ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
   sleep 2
 fi
 
-echo "🔨 Building release binary..."
-cargo build --release --manifest-path "${REPO_DIR}/Cargo.toml"
-
-mkdir -p "${BIN_DIR}"
-cp "${REPO_DIR}/target/release/openbatrangs" "${BIN}"
-chmod +x "${BIN}"
-
 echo ""
-echo "✅ Installed: ${BIN}"
-echo "   Run it with: ${BIN}"
-echo "   One-time setup (pulls a coding model): ${BIN} setup"
-echo "   Add to PATH: export PATH=\"${BIN_DIR}:\$PATH\""
+echo "🎉 Done!"
+echo "   Run:    ${BIN}"
+echo "   Setup:  ${BIN} setup"
+echo "   Update: curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | sh"
