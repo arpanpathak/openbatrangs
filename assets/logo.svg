@@ -8,8 +8,12 @@
       <stop offset="0" stop-color="#22d3ee"/>
       <stop offset="1" stop-color="#a78bfa"/>
     </linearGradient>
+    <linearGradient id="batarang" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#475569"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
     <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feGaussianBlur stdDeviation="6" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
@@ -38,21 +42,20 @@
     <path d="M384 96 L416 128 L384 160"/>
   </g>
 
-  <!-- bat -->
+  <!-- Batarang weapon silhouette -->
   <g filter="url(#glow)">
     <path
       d="M256 120
-         L236 96 L226 132 L192 104 L196 156 L156 132 L166 188 L122 168 L140 220 L96 206 L122 254 L88 246 L124 292 L96 316 L176 302 L200 344 L256 322
-         L312 344 L336 302 L416 316 L388 292 L424 246 L390 254 L416 206 L372 220 L390 168 L346 188 L356 132 L316 156 L320 104 L286 132 L276 96 Z"
-      fill="url(#accent)"/>
+         L230 84 L224 140 L96 120 L140 170 L84 210 L140 240 L100 290 L180 280 L256 320
+         L332 280 L412 290 L372 240 L428 210 L372 170 L288 140 L282 84 Z"
+      fill="url(#batarang)"
+      stroke="url(#accent)"
+      stroke-width="4"
+      stroke-linejoin="round"/>
   </g>
 
-  <!-- eyes -->
-  <circle cx="232" cy="182" r="5" fill="#0b0f1a"/>
-  <circle cx="280" cy="182" r="5" fill="#0b0f1a"/>
-
-  <!-- terminal caret inside the bat body -->
-  <text x="256" y="282" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="44" font-weight="700" fill="#0b0f1a">&gt;_</text>
+  <!-- terminal caret inside the weapon body -->
+  <text x="256" y="272" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="42" font-weight="700" fill="#22d3ee">&gt;_</text>
 
   <!-- wordmark -->
   <text x="256" y="438" text-anchor="middle" font-family="'Inter', system-ui, sans-serif" font-size="44" font-weight="800" letter-spacing="1" fill="#f8fafc">
