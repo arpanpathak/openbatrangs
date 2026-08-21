@@ -465,7 +465,7 @@ impl App {
 
     fn insert_char(&mut self, character: char) {
         self.input.insert(self.cursor, character);
-        self.cursor += 1;
+        self.cursor += character.len_utf8();
     }
 
     fn insert_newline(&mut self) {
@@ -475,8 +475,12 @@ impl App {
 
     fn backspace(&mut self) {
         if self.cursor > 0 {
-            self.input.remove(self.cursor - 1);
-            self.cursor -= 1;
+            let mut index = self.cursor;
+            while index > 0 && !self.input.is_char_boundary(index - 1) {
+                index -= 1;
+            }
+            self.input.remove(index - 1);
+            self.cursor = index - 1;
         }
     }
 
@@ -487,12 +491,19 @@ impl App {
     }
 
     fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        if self.cursor > 0 {
+            let mut index = self.cursor;
+            while index > 0 && !self.input.is_char_boundary(index - 1) {
+                index -= 1;
+            }
+            self.cursor = index - 1;
+        }
     }
 
     fn move_right(&mut self) {
         if self.cursor < self.input.len() {
-            self.cursor += 1;
+            let character = self.input[self.cursor..].chars().next().unwrap_or_default();
+            self.cursor += character.len_utf8();
         }
     }
 
