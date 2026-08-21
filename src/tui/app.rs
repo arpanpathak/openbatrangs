@@ -41,6 +41,7 @@ pub(super) struct App {
     model: Option<String>,
     server_url: String,
     model_info: Option<String>,
+    current_prompt: Option<String>,
     pub(super) run_config: AgentRunConfig,
     min_context: u64,
     is_auto_pull_disabled: bool,
@@ -86,6 +87,7 @@ impl App {
             model: cli.model.clone(),
             server_url: cli.ollama_url.clone(),
             model_info: None,
+            current_prompt: None,
             run_config: AgentRunConfig {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
@@ -155,6 +157,10 @@ impl App {
                 self.server_url
             ),
         }
+    }
+
+    pub(super) fn prompt_line(&self) -> Option<String> {
+        self.current_prompt.clone()
     }
 
     pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
@@ -523,6 +529,7 @@ impl App {
         self.history.push(task.clone());
         self.auto_scroll = true;
         if !task.starts_with('/') {
+            self.current_prompt = Some(task.clone());
             self.log.push("─".repeat(60));
             self.log.push(format!("You: {task}"));
         }
@@ -720,6 +727,7 @@ impl App {
     fn clear_chat(&mut self) {
         self.log.clear();
         self.live.clear();
+        self.current_prompt = None;
     }
 
     fn toggle_perf(&mut self) {

@@ -99,6 +99,14 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
         app.model_info_line(),
         Style::default().fg(Color::Green),
     )));
+    if full {
+        if let Some(prompt) = app.prompt_line() {
+            lines.push(Line::from(Span::styled(
+                format!("Prompt: {prompt}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
