@@ -33,8 +33,12 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
-fn banner_height(_area_height: u16) -> u16 {
-    COMPACT_BANNER_HEIGHT
+fn banner_height(area_height: u16) -> u16 {
+    if area_height >= 30 {
+        COMPACT_BANNER_HEIGHT
+    } else {
+        7
+    }
 }
 
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
@@ -65,13 +69,18 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
+    let full = area.height >= COMPACT_BANNER_HEIGHT;
     let mut lines: Vec<Line> = app
         .banner_lines
         .iter()
         .enumerate()
         .filter(|(index, _)| {
-            // Compact: wordmark (first 5 lines) + the quote (last line).
-            *index < 5 || *index + 1 == app.banner_lines.len()
+            if full {
+                true
+            } else {
+                // Small terminal: wordmark + quote only.
+                *index < 5 || *index + 1 == app.banner_lines.len()
+            }
         })
         .map(|(index, text)| {
             let style = if index < 5 {
