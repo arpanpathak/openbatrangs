@@ -340,7 +340,11 @@ impl App {
             KeyCode::PageDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
             KeyCode::Tab => self.accept_suggestion(),
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                let modifiers = key.modifiers;
+                if modifiers.contains(KeyModifiers::SHIFT)
+                    || modifiers.contains(KeyModifiers::CONTROL)
+                    || modifiers.contains(KeyModifiers::ALT)
+                {
                     self.insert_newline();
                 } else {
                     return self.submit_input(client, tx).await;
@@ -581,7 +585,7 @@ impl App {
         self.log
             .push("  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll".to_string());
         self.log
-            .push("  Shift+Enter = new line · Enter = send".to_string());
+            .push("  Shift+Enter / Ctrl+J = new line · Enter = send".to_string());
     }
 
     async fn show_model_picker(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
