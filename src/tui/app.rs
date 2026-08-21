@@ -588,7 +588,8 @@ impl App {
         self.log
             .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log.push(
-            "  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll · F2 mouse select".to_string(),
+            "  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll · Shift+drag select/copy"
+                .to_string(),
         );
         self.log
             .push("  Shift+Enter / Ctrl+J = new line · Enter = send".to_string());

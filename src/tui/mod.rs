@@ -19,7 +19,7 @@ use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -32,7 +32,6 @@ use ratatui::Terminal;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -297,21 +296,6 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     Ok(())
 }
 
-/// Toggle between app mouse mode (scroll/click) and terminal selection mode.
-/// Press F2 to switch; while selection mode is on you can drag to select/copy.
-fn toggle_mouse_capture(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-    static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(true);
-    if MOUSE_CAPTURED.swap(false, Ordering::SeqCst) {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-        println!("\x1b[2m[selection mode: drag to select/copy, F2 to return]\x1b[0m");
-    } else {
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
-        MOUSE_CAPTURED.store(true, Ordering::SeqCst);
-        println!("\x1b[2m[app mouse mode: scroll/click, F2 to select/copy]\x1b[0m");
-    }
-    Ok(())
-}
-
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     cli: &Cli,
@@ -340,9 +324,7 @@ async fn run_loop(
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
-                        if key.code == KeyCode::F(2) {
-                            toggle_mouse_capture(terminal)?;
-                        } else if app.handle_key(key, client, &tx).await? {
+                        if app.handle_key(key, client, &tx).await? {
                             break;
                         }
                     }
