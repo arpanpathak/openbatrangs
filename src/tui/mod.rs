@@ -53,6 +53,7 @@ const COMMANDS: &[&str] = &[
     "perf",
     "mode",
     "thinking",
+    "mouse",
 ];
 
 /// Spinner frames shown while the agent is working.
@@ -270,7 +271,6 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -296,6 +296,27 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     Ok(())
 }
 
+/// Keep the terminal's mouse-capture state in sync with the app preference.
+/// Default is OFF so native text selection/copy always works.
+fn sync_mouse_capture(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    enabled: bool,
+    current: &mut bool,
+) -> Result<()> {
+    match (enabled, *current) {
+        (true, false) => {
+            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            *current = true;
+        }
+        (false, true) => {
+            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            *current = false;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     cli: &Cli,
@@ -305,10 +326,12 @@ async fn run_loop(
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
     let mut app = app::App::new(cli, tegrastats_shared);
     app.refresh_model_info(client).await;
+    let mut mouse_capture = false;
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut events = event::EventStream::new();
 
     loop {
+        sync_mouse_capture(terminal, app.mouse_capture, &mut mouse_capture)?;
         terminal.draw(|f| ui::ui(f, &mut app))?;
 
         if app.should_quit {

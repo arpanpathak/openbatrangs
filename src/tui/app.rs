@@ -46,6 +46,7 @@ pub(super) struct App {
     min_context: u64,
     is_auto_pull_disabled: bool,
     pub(super) show_perf: bool,
+    pub(super) mouse_capture: bool,
     pub(super) perf: PerfMonitor,
     pub(super) system_stats: SystemStats,
     stream_chars: u64,
@@ -99,6 +100,7 @@ impl App {
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
             show_perf: true,
+            mouse_capture: false,
             perf: PerfMonitor::new(tegrastats),
             system_stats: SystemStats::default(),
             stream_chars: 0,
@@ -140,6 +142,16 @@ impl App {
         }
         if query == "thinking" {
             return vec!["/thinking on".to_string(), "/thinking off".to_string()];
+        }
+        if let Some(arg) = query.strip_prefix("mouse ") {
+            return ["on", "off"]
+                .iter()
+                .filter(|option| option.starts_with(arg))
+                .map(|option| format!("/mouse {option}"))
+                .collect();
+        }
+        if query == "mouse" {
+            return vec!["/mouse on".to_string(), "/mouse off".to_string()];
         }
         COMMANDS
             .iter()
@@ -574,6 +586,7 @@ impl App {
             "perf" => self.toggle_perf(),
             "mode" => self.handle_mode_command(arg),
             "thinking" => self.handle_thinking_command(arg),
+            "mouse" => self.handle_mouse_command(arg),
             _ => self.log_unknown_command(name),
         }
         Ok(())
@@ -588,8 +601,10 @@ impl App {
         self.log
             .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log.push(
-            "  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll · Shift+drag select/copy"
-                .to_string(),
+            "  /doctor, /clear, /mouse on|off · Ctrl+C cancel · PgUp/PgDn scroll".to_string(),
+        );
+        self.log.push(
+            "  Mouse select/copy always on by default · /mouse on for wheel/click".to_string(),
         );
         self.log
             .push("  Shift+Enter / Ctrl+J = new line · Enter = send".to_string());
@@ -694,6 +709,31 @@ impl App {
                     } else {
                         "OFF"
                     }
+                ));
+            }
+        }
+    }
+
+    fn handle_mouse_command(&mut self, arg: &str) {
+        match arg {
+            "on" => {
+                self.mouse_capture = true;
+                self.log.push(
+                    "Mouse mode: ON (wheel scroll + click-to-open, selection via Shift+drag)"
+                        .to_string(),
+                );
+            }
+            "off" => {
+                self.mouse_capture = false;
+                self.log.push(
+                    "Mouse mode: OFF (native select/copy always works, scroll with PgUp/PgDn)"
+                        .to_string(),
+                );
+            }
+            _ => {
+                self.log.push(format!(
+                    "Mouse mode: {} · Usage: /mouse on|off",
+                    if self.mouse_capture { "ON" } else { "OFF" }
                 ));
             }
         }
