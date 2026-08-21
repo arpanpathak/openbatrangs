@@ -1,10 +1,18 @@
+//! Safe filesystem tools available to the coding agent.
+//!
+//! All tools operate on paths relative to the workspace root. Absolute paths
+//! and `..` traversal are rejected so the model cannot escape the project.
+
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
 
+/// Maximum number of characters returned by any tool to protect context memory.
 pub const MAX_TOOL_OUTPUT: usize = 20_000;
+
+/// Directories skipped during recursive walks (build caches, VCS, dependencies).
 const HEAVY_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -22,24 +30,55 @@ const HEAVY_DIRS: &[&str] = &[
     ".agent",
 ];
 
+/// Default depth for `list_files` in the agent's initial context.
+pub const DEFAULT_LIST_DEPTH: usize = 5;
+
+/// Depth used by `grep_files` when scanning the workspace.
+const GREP_MAX_DEPTH: usize = 12;
+
+/// Maximum number of files listed before truncating.
+const MAX_LISTED_FILES: usize = 5_000;
+
+/// Number of leading bytes inspected to detect binary files.
+const BINARY_SNIFF_BYTES: usize = 8_192;
+
+/// Minimum shell timeout in seconds (avoids instant timeout bugs).
+const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
+
+/// Returns true when a directory name should be skipped by recursive walks.
 fn is_heavy_dir(name: &str) -> bool {
     HEAVY_DIRS.contains(&name)
 }
 
-/// Resolve a model-supplied path safely inside `root`. Only relative paths without `..` are allowed.
+/// Resolve a model-supplied path safely inside `root`.
+///
+/// # Arguments
+/// - `root`: workspace root directory.
+/// - `path`: relative path supplied by the model.
+///
+/// # Returns
+/// The joined `PathBuf`, or an error if the path is absolute or contains `..`.
 pub fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
-    let p = Path::new(path);
-    if p.is_absolute() {
+    let requested = Path::new(path);
+    if requested.is_absolute() {
         bail!("absolute paths are not allowed; use paths relative to the workspace");
     }
-    for comp in p.components() {
-        if matches!(comp, Component::ParentDir) {
+    for component in requested.components() {
+        if matches!(component, Component::ParentDir) {
             bail!("'..' is not allowed in tool paths");
         }
     }
-    Ok(root.join(p))
+    Ok(root.join(requested))
 }
 
+/// Build a recursive directory walker that skips heavy directories.
+///
+/// # Arguments
+/// - `root`: directory to walk.
+/// - `max_depth`: maximum recursion depth.
+///
+/// # Returns
+/// An iterator over directory entries.
 fn walker(
     root: &Path,
     max_depth: usize,
@@ -48,64 +87,91 @@ fn walker(
         .max_depth(max_depth)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            if e.depth() == 0 {
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
                 return true;
             }
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_string_lossy();
+            if entry.file_type().is_dir() {
+                let name = entry.file_name().to_string_lossy();
                 return !is_heavy_dir(&name);
             }
             true
         })
 }
 
+/// List files in a directory as a human-readable string.
+///
+/// # Arguments
+/// - `root`: workspace root used for path safety.
+/// - `path`: relative directory to list.
+/// - `max_depth`: maximum recursion depth.
+///
+/// # Returns
+/// One line per file: relative path and byte size.
 pub fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<String> {
-    let dir = resolve_in_root(root, path)?;
-    if !dir.is_dir() {
-        bail!("not a directory: {}", dir.display());
+    let directory = resolve_in_root(root, path)?;
+    if !directory.is_dir() {
+        bail!("not a directory: {}", directory.display());
     }
 
-    let mut out = String::new();
+    let mut output = String::new();
     let mut count = 0usize;
-    for entry in walker(&dir, max_depth) {
+    for entry in walker(&directory, max_depth) {
         let entry = entry.context("walkdir error")?;
         if entry.file_type().is_file() {
-            let rel = entry
+            let relative = entry
                 .path()
                 .strip_prefix(root)
                 .unwrap_or(entry.path())
                 .to_string_lossy()
                 .to_string();
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push_str(&format!("{} ({} bytes)\n", rel, size));
+            let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            output.push_str(&format!("{relative} ({size} bytes)\n"));
             count += 1;
-            if count >= 5000 {
-                out.push_str("... (truncated at 5000 files)\n");
+            if count >= MAX_LISTED_FILES {
+                output.push_str(&format!("... (truncated at {MAX_LISTED_FILES} files)\n"));
                 break;
             }
         }
     }
     if count == 0 {
-        out.push_str("(no files found)\n");
+        output.push_str("(no files found)\n");
     }
-    Ok(truncate(out))
+    Ok(truncate(output))
 }
 
+/// Read a text file with a size cap.
+///
+/// # Arguments
+/// - `root`: workspace root used for path safety.
+/// - `path`: relative file path.
+/// - `max_chars`: maximum characters to include.
+///
+/// # Returns
+/// A header line plus the (possibly truncated) file contents.
 pub fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<String> {
     let file = resolve_in_root(root, path)?;
     if !file.is_file() {
         bail!("not a file: {}", file.display());
     }
     let content = std::fs::read_to_string(&file).context("failed to read file (may be binary)")?;
-    let content = truncate_to(content, max_chars);
+    let truncated = truncate_to(content, max_chars);
     Ok(format!(
         "--- {} ---\n{}",
         file.strip_prefix(root).unwrap_or(&file).display(),
-        content
+        truncated
     ))
 }
 
+/// Write (or overwrite) a file, creating parent directories as needed.
+///
+/// # Arguments
+/// - `root`: workspace root used for path safety.
+/// - `path`: relative file path.
+/// - `content`: full file contents.
+///
+/// # Returns
+/// A confirmation string with the absolute path and byte count.
 pub fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     let file = resolve_in_root(root, path)?;
     if let Some(parent) = file.parent() {
@@ -121,56 +187,76 @@ pub fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     ))
 }
 
+/// Regex-search file contents in a directory.
+///
+/// # Arguments
+/// - `root`: workspace root used for path safety.
+/// - `pattern`: regular expression to search for.
+/// - `path`: relative directory to search.
+/// - `max_results`: maximum number of matches to return.
+///
+/// # Returns
+/// Lines of the form `file:line: matched text`.
 pub fn grep_files(root: &Path, pattern: &str, path: &str, max_results: usize) -> Result<String> {
-    let dir = resolve_in_root(root, path)?;
-    if !dir.is_dir() {
-        bail!("not a directory: {}", dir.display());
+    let directory = resolve_in_root(root, path)?;
+    if !directory.is_dir() {
+        bail!("not a directory: {}", directory.display());
     }
-    let re = Regex::new(pattern).context("invalid regex pattern")?;
-    let mut out = String::new();
+    let regex = Regex::new(pattern).context("invalid regex pattern")?;
+    let mut output = String::new();
     let mut count = 0usize;
 
-    for entry in walker(&dir, 12) {
+    for entry in walker(&directory, GREP_MAX_DEPTH) {
         let entry = entry.context("walkdir error")?;
         if !entry.file_type().is_file() {
             continue;
         }
-        // Skip obvious binary files.
+        // Skip obvious binary files by sniffing for NUL bytes.
         if let Ok(data) = std::fs::read(entry.path()) {
-            if data.iter().take(8192).any(|&b| b == 0) {
+            if data.iter().take(BINARY_SNIFF_BYTES).any(|&byte| byte == 0) {
                 continue;
             }
         }
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let rel = entry
+        let relative = entry
             .path()
             .strip_prefix(root)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .to_string();
-        for (idx, line) in content.lines().enumerate() {
-            if re.is_match(line) {
-                let line = line.trim();
-                out.push_str(&format!("{}:{}: {}\n", rel, idx + 1, line));
+        for (line_index, line) in content.lines().enumerate() {
+            if regex.is_match(line) {
+                let trimmed = line.trim();
+                output.push_str(&format!("{relative}:{}: {trimmed}\n", line_index + 1));
                 count += 1;
                 if count >= max_results {
-                    out.push_str(&format!("... (truncated at {max_results} matches)\n"));
-                    return Ok(truncate(out));
+                    output.push_str(&format!("... (truncated at {max_results} matches)\n"));
+                    return Ok(truncate(output));
                 }
             }
         }
     }
     if count == 0 {
-        out.push_str("(no matches)\n");
+        output.push_str("(no matches)\n");
     }
-    Ok(truncate(out))
+    Ok(truncate(output))
 }
 
+/// Run a shell command in the workspace and capture combined output.
+///
+/// # Arguments
+/// - `root`: working directory for the command.
+/// - `command`: shell command line.
+/// - `timeout_secs`: maximum allowed runtime.
+///
+/// # Returns
+/// Captured stdout/stderr plus exit status, truncated to `MAX_TOOL_OUTPUT`.
 pub async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
+    let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
     let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs.max(1)),
+        timeout,
         tokio::process::Command::new("bash")
             .arg("-lc")
             .arg(command)
@@ -187,31 +273,29 @@ pub async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Resul
         text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
 
-    let status = output.status;
-    let exit = status
+    let exit_code = output
+        .status
         .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal".into());
-    if !status.success() {
-        text.push_str(&format!("\n[exit code {exit}]\n"));
-    } else {
-        text.push_str(&format!("\n[exit code 0]\n"));
-    }
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    text.push_str(&format!("\n[exit code {exit_code}]\n"));
     Ok(truncate(text))
 }
 
-pub fn truncate(s: String) -> String {
-    truncate_to(s, MAX_TOOL_OUTPUT)
+/// Truncate a string to `MAX_TOOL_OUTPUT` characters.
+pub fn truncate(text: String) -> String {
+    truncate_to(text, MAX_TOOL_OUTPUT)
 }
 
-fn truncate_to(s: String, max: usize) -> String {
-    if s.len() <= max {
-        return s;
+/// Truncate a string to at most `max` characters, appending an omission note.
+fn truncate_to(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
     }
-    let mut result = s.chars().take(max).collect::<String>();
+    let mut result = text.chars().take(max).collect::<String>();
     result.push_str(&format!(
         "\n... (truncated, {} chars omitted)",
-        s.chars().count().saturating_sub(max)
+        text.chars().count().saturating_sub(max)
     ));
     result
 }

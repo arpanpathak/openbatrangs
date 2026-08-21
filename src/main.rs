@@ -1,3 +1,11 @@
+//! openBatarangs CLI entry point.
+//!
+//! Responsibilities:
+//! - Parse command-line arguments and subcommands.
+//! - Ensure Ollama is available (auto-start or one-time setup).
+//! - Dispatch to the interactive TUI, one-shot agent, model listing, doctor,
+//!   or setup flows.
+
 mod agent;
 mod banner;
 mod models;
@@ -14,6 +22,37 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+/// Default Ollama server address.
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+
+/// Default maximum agent iterations.
+const DEFAULT_MAX_STEPS: usize = 12;
+
+/// Default minimum acceptable context window for auto model selection.
+const DEFAULT_MIN_CONTEXT: usize = 8_192;
+
+/// Fraction of total system memory treated as the model memory budget.
+const MEMORY_BUDGET_NUMERATOR: u64 = 3;
+const MEMORY_BUDGET_DENOMINATOR: u64 = 4;
+
+/// How many times to poll Ollama while waiting for it to start.
+const OLLAMA_START_POLL_ATTEMPTS: u32 = 20;
+const SETUP_START_POLL_ATTEMPTS: u32 = 40;
+const OLLAMA_POLL_INTERVAL_MILLIS: u64 = 500;
+
+/// Maximum number of auto-pull retries while selecting a model.
+const MODEL_SELECT_MAX_ATTEMPTS: u32 = 3;
+
+/// Models scoring below this are considered unsuitable for agentic coding.
+const GOOD_MODEL_SCORE_THRESHOLD: f64 = 60.0;
+
+/// Fallback context length when Ollama metadata is missing.
+const FALLBACK_CONTEXT_LENGTH: u64 = 8_192;
+
+/// Suffix of Ollama metadata keys that contain the context length.
+const CONTEXT_LENGTH_KEY_SUFFIX: &str = ".context_length";
+
+/// Command-line interface definition.
 #[derive(Parser)]
 #[command(
     name = "openbatrangs",
@@ -22,77 +61,72 @@ use std::time::Duration;
 )]
 struct Cli {
     /// Task for the coding agent, e.g. "fix the Rust build errors".
-    /// With no task, openBatarangs starts an interactive REPL.
+    /// With no task, openBatarangs starts an interactive TUI.
     #[arg(value_name = "TASK")]
     task: Vec<String>,
 
-    /// Ollama server URL
-    #[arg(long, global = true, default_value = "http://localhost:11434")]
+    /// Ollama server URL.
+    #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
     ollama_url: String,
 
-    /// Model to use; auto-discovered when omitted
+    /// Model to use; auto-discovered when omitted.
     #[arg(short, long, global = true)]
     model: Option<String>,
 
-    /// Working directory for the agent
+    /// Working directory for the agent.
     #[arg(long, global = true, default_value = ".")]
     cwd: PathBuf,
 
-    /// Maximum agent steps
-    #[arg(long, global = true, default_value_t = 12)]
+    /// Maximum agent steps.
+    #[arg(long, global = true, default_value_t = DEFAULT_MAX_STEPS)]
     max_steps: usize,
 
-    /// Read-only mode: no file writes or shell commands
+    /// Read-only mode: no file writes or shell commands.
     #[arg(long, global = true)]
     read_only: bool,
 
-    /// Ask before each file write or shell command
+    /// Ask before each file write or shell command.
     #[arg(long, global = true)]
     confirm: bool,
 
-    /// Do not auto-pull a recommended model when none is suitable
+    /// Do not auto-pull a recommended model when none is suitable.
     #[arg(long, global = true)]
     no_auto_pull: bool,
 
-    /// Minimum context window for auto model selection
-    #[arg(long, global = true, default_value_t = 8192)]
+    /// Minimum context window for auto model selection.
+    #[arg(long, global = true, default_value_t = DEFAULT_MIN_CONTEXT)]
     min_context: usize,
 
     #[command(subcommand)]
     command: Option<Commands>,
 }
 
+/// Available subcommands.
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the coding agent (same as passing a task directly)
+    /// Run the coding agent (same as passing a task directly).
     Agent {
-        /// Task description
+        /// Task description.
         #[arg(value_name = "TASK")]
         task: Vec<String>,
     },
-    /// List locally installed Ollama models with agent scores
+    /// List locally installed Ollama models with agent scores.
     ListModels,
-    /// Check Ollama connectivity and recommend the best model
+    /// Check Ollama connectivity and recommend the best model.
     Doctor,
-    /// Install/start Ollama and pull a recommended coding model
+    /// Install/start Ollama and pull a recommended coding model.
     Setup,
 }
 
+/// Preferences used for automatic model selection.
 #[derive(Clone)]
 pub(crate) struct ModelPrefs {
+    /// Explicit model tag; `None` means auto-select.
     pub(crate) model: Option<String>,
+    /// If `true`, never auto-pull a model.
     pub(crate) no_auto_pull: bool,
+    /// Minimum acceptable context window.
     pub(crate) min_context: u64,
-}
-
-struct ReplState {
-    model: Option<String>,
-    read_only: bool,
-    confirm: bool,
-    max_steps: usize,
-    cwd: PathBuf,
-    min_context: u64,
-    no_auto_pull: bool,
 }
 
 #[tokio::main]
@@ -119,11 +153,7 @@ async fn main() -> Result<()> {
             if task.is_empty() {
                 tui::run(&cli, &client).await?;
             } else {
-                let prefs = ModelPrefs {
-                    model: cli.model.clone(),
-                    no_auto_pull: cli.no_auto_pull,
-                    min_context: cli.min_context as u64,
-                };
+                let prefs = model_prefs_from_cli(&cli);
                 run_agent_task(
                     &client,
                     &cli.cwd,
@@ -141,11 +171,7 @@ async fn main() -> Result<()> {
             if cli.task.is_empty() {
                 tui::run(&cli, &client).await?;
             } else {
-                let prefs = ModelPrefs {
-                    model: cli.model.clone(),
-                    no_auto_pull: cli.no_auto_pull,
-                    min_context: cli.min_context as u64,
-                };
+                let prefs = model_prefs_from_cli(&cli);
                 run_agent_task(
                     &client,
                     &cli.cwd,
@@ -164,21 +190,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Make sure Ollama is reachable. If the binary exists but the server is not
-/// running, start `ollama serve` automatically.
+/// Build model-selection preferences from parsed CLI arguments.
+fn model_prefs_from_cli(cli: &Cli) -> ModelPrefs {
+    ModelPrefs {
+        model: cli.model.clone(),
+        no_auto_pull: cli.no_auto_pull,
+        min_context: cli.min_context as u64,
+    }
+}
+
+/// Make sure Ollama is reachable.
+///
+/// If the `ollama` binary exists but the server is not running, this starts
+/// `ollama serve` automatically and polls until it responds.
+///
+/// # Arguments
+/// - `client`: Ollama HTTP client.
+///
+/// # Returns
+/// `Ok(())` when the server is reachable; otherwise a helpful error.
 async fn ensure_ollama(client: &OllamaClient) -> Result<()> {
     if client.is_available().await {
         return Ok(());
     }
 
-    let has_ollama = std::process::Command::new("sh")
-        .arg("-lc")
-        .arg("command -v ollama")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let has_ollama = ollama_binary_exists();
 
     if has_ollama {
         println!("🔄 Ollama server is not running — starting `ollama serve`...");
@@ -188,8 +224,8 @@ async fn ensure_ollama(client: &OllamaClient) -> Result<()> {
             .stderr(Stdio::null())
             .spawn();
 
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..OLLAMA_START_POLL_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(OLLAMA_POLL_INTERVAL_MILLIS)).await;
             if client.is_available().await {
                 println!("✅ Ollama started at {}", client.base_url);
                 return Ok(());
@@ -204,59 +240,36 @@ async fn ensure_ollama(client: &OllamaClient) -> Result<()> {
     )
 }
 
+/// Check whether the `ollama` executable is present on `PATH`.
+fn ollama_binary_exists() -> bool {
+    std::process::Command::new("sh")
+        .arg("-lc")
+        .arg("command -v ollama")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// One-command onboarding: install/start Ollama and pull a recommended model.
+///
+/// # Arguments
+/// - `client`: Ollama HTTP client.
+///
+/// # Returns
+/// `Ok(())` once Ollama is running and a default coding model is installed.
 async fn setup(client: &OllamaClient) -> Result<()> {
     if client.is_available().await {
         println!("✅ Ollama already running at {}", client.base_url);
     } else {
-        let has_ollama = std::process::Command::new("sh")
-            .arg("-lc")
-            .arg("command -v ollama")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if !has_ollama {
-            println!(
-                "⬇️  Ollama not found. Installing with the official script (may ask for sudo)..."
-            );
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("curl -fsSL https://ollama.com/install.sh | sh")
-                .status()
-                .context("failed to run Ollama installer")?;
-            if !status.success() {
-                bail!("Ollama install failed. Install manually from https://ollama.com/download/linux");
-            }
-        }
-
-        println!("🔄 Starting Ollama...");
-        let _child = std::process::Command::new("ollama")
-            .arg("serve")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        let mut ok = false;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if client.is_available().await {
-                ok = true;
-                break;
-            }
-        }
-        if !ok {
-            bail!("Ollama was installed but did not start. Try `ollama serve` manually.");
-        }
-        println!("✅ Ollama started at {}", client.base_url);
+        install_and_start_ollama(client).await?;
     }
 
-    let mem_budget = models::total_system_memory_bytes() * 3 / 4;
+    let mem_budget = memory_budget();
     let fallback = models::recommended_fallback_model(mem_budget);
     let tags = client.tags().await?;
-    if !tags.iter().any(|m| m.name == fallback) {
+    if !tags.iter().any(|model| model.name == fallback) {
         client.pull(fallback).await?;
     }
     println!("✅ Setup complete. Default coding model: {fallback}");
@@ -264,149 +277,52 @@ async fn setup(client: &OllamaClient) -> Result<()> {
     Ok(())
 }
 
-/// Interactive DeepCode-style REPL (legacy, replaced by ratatui TUI).
-#[allow(dead_code)]
-async fn run_repl(cli: &Cli, client: &OllamaClient) -> Result<()> {
-    use rustyline::error::ReadlineError;
-    use rustyline::DefaultEditor;
-
-    let mut rl = DefaultEditor::new().context("failed to initialize line editor")?;
-    let mut state = ReplState {
-        model: cli.model.clone(),
-        read_only: cli.read_only,
-        confirm: cli.confirm,
-        max_steps: cli.max_steps,
-        cwd: cli.cwd.clone(),
-        min_context: cli.min_context as u64,
-        no_auto_pull: cli.no_auto_pull,
-    };
-
-    println!("Type a task, or /help for commands.\n");
-
-    loop {
-        match rl.readline("openBatarangs> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(cmd) = line.strip_prefix('/') {
-                    if handle_slash_command(&mut state, client, cmd).await? {
-                        break;
-                    }
-                    continue;
-                }
-                let prefs = ModelPrefs {
-                    model: state.model.clone(),
-                    no_auto_pull: state.no_auto_pull,
-                    min_context: state.min_context,
-                };
-                run_agent_task(
-                    client,
-                    &state.cwd,
-                    state.max_steps,
-                    state.read_only,
-                    state.confirm,
-                    &mut state.model,
-                    &prefs,
-                    &line,
-                )
-                .await?;
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("\n👋 Bye!");
-                break;
-            }
-            Err(ReadlineError::Eof) => {
-                println!("\n👋 Bye!");
-                break;
-            }
-            Err(err) => return Err(err.into()),
+/// Install Ollama if missing, then start `ollama serve` and wait for it.
+async fn install_and_start_ollama(client: &OllamaClient) -> Result<()> {
+    if !ollama_binary_exists() {
+        println!("⬇️  Ollama not found. Installing with the official script (may ask for sudo)...");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("curl -fsSL https://ollama.com/install.sh | sh")
+            .status()
+            .context("failed to run Ollama installer")?;
+        if !status.success() {
+            bail!("Ollama install failed. Install manually from https://ollama.com/download/linux");
         }
     }
-    Ok(())
-}
 
-/// Returns `true` if the REPL should exit.
-async fn handle_slash_command(
-    state: &mut ReplState,
-    client: &OllamaClient,
-    cmd: &str,
-) -> Result<bool> {
-    let mut parts = cmd.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("");
-    let arg = parts.next().unwrap_or("").trim();
+    println!("🔄 Starting Ollama...");
+    let _child = std::process::Command::new("ollama")
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 
-    match name {
-        "help" | "h" => {
-            println!(
-                "Commands:\n\
-                 \x20 /help          show this help\n\
-                 \x20 /exit, /quit   leave the REPL\n\
-                 \x20 /setup         install/start Ollama + pull a model\n\
-                 \x20 /models        list installed models + scores\n\
-                 \x20 /model <tag>   switch model (e.g. /model qwen2.5-coder:7b)\n\
-                 \x20 /read-only     toggle read-only mode\n\
-                 \x20 /confirm       toggle confirm-before-write/command\n\
-                 \x20 /steps <n>     set max agent steps\n\
-                 \x20 /cwd <path>    change workspace\n\
-                 \x20 /doctor        check Ollama + best model\n\
-                 \nAnything else is sent to the coding agent as a task."
-            );
+    for _ in 0..SETUP_START_POLL_ATTEMPTS {
+        tokio::time::sleep(Duration::from_millis(OLLAMA_POLL_INTERVAL_MILLIS)).await;
+        if client.is_available().await {
+            println!("✅ Ollama started at {}", client.base_url);
+            return Ok(());
         }
-        "exit" | "quit" => return Ok(true),
-        "models" => list_models(client, state.min_context).await?,
-        "model" => {
-            if arg.is_empty() {
-                match &state.model {
-                    Some(m) => println!("Current model: {m}"),
-                    None => println!("Auto mode — best model will be selected on first task."),
-                }
-            } else {
-                let tags = client.tags().await?;
-                if tags.iter().any(|m| m.name == arg) {
-                    state.model = Some(arg.to_string());
-                    println!("✅ Model set to {arg}");
-                } else {
-                    println!("❌ Model '{arg}' is not installed. Try /models or /setup.");
-                }
-            }
-        }
-        "read-only" => {
-            state.read_only = !state.read_only;
-            println!(
-                "Read-only mode: {}",
-                if state.read_only { "ON" } else { "OFF" }
-            );
-        }
-        "confirm" => {
-            state.confirm = !state.confirm;
-            println!("Confirm mode: {}", if state.confirm { "ON" } else { "OFF" });
-        }
-        "steps" => match arg.parse::<usize>() {
-            Ok(n) if n > 0 => {
-                state.max_steps = n;
-                println!("Max steps set to {n}");
-            }
-            _ => println!("Usage: /steps <positive number>"),
-        },
-        "cwd" => {
-            if arg.is_empty() {
-                println!("Workspace: {}", state.cwd.display());
-            } else {
-                state.cwd = PathBuf::from(arg);
-                println!("Workspace set to {}", state.cwd.display());
-            }
-        }
-        "doctor" => doctor(client, state.min_context).await?,
-        "setup" => setup(client).await?,
-        "clear" => print!("\x1b[2J\x1b[H"),
-        _ => println!("Unknown command: /{name}. Try /help"),
     }
-    Ok(false)
+
+    bail!("Ollama was installed but did not start. Try `ollama serve` manually.")
 }
 
+/// Run the agent once for a single task using stdout output.
+///
+/// # Arguments
+/// - `client`: Ollama HTTP client.
+/// - `cwd`: workspace directory.
+/// - `max_steps`: maximum agent iterations.
+/// - `read_only`: disable writes and shell commands.
+/// - `confirm`: ask before mutating actions.
+/// - `model_slot`: current model; updated after selection.
+/// - `prefs`: model selection preferences.
+/// - `task`: task text.
+///
+/// # Returns
+/// `Ok(())` when the agent finishes.
 async fn run_agent_task(
     client: &OllamaClient,
     cwd: &std::path::Path,
@@ -422,7 +338,7 @@ async fn run_agent_task(
         bail!("empty task");
     }
 
-    let mem_budget = models::total_system_memory_bytes() * 3 / 4;
+    let mem_budget = memory_budget();
     let selected = match model_slot {
         Some(name) => {
             let explicit = ModelPrefs {
@@ -463,37 +379,29 @@ async fn run_agent_task(
     .await
 }
 
+/// Select the best model, auto-pulling a fallback when needed.
+///
+/// # Arguments
+/// - `client`: Ollama HTTP client.
+/// - `prefs`: model selection preferences.
+/// - `mem_budget`: usable memory in bytes.
+///
+/// # Returns
+/// The chosen model score.
 pub(crate) async fn select_model(
     client: &OllamaClient,
     prefs: &ModelPrefs,
     mem_budget: u64,
 ) -> Result<ModelScore> {
-    let mut attempts = 0usize;
+    let mut attempts = 0u32;
     loop {
         attempts += 1;
-        if attempts > 3 {
+        if attempts > MODEL_SELECT_MAX_ATTEMPTS {
             bail!("could not find a suitable model after auto-pulling");
         }
 
         if let Some(explicit) = &prefs.model {
-            if models::looks_like_path(explicit) {
-                bail!(
-                    "'{explicit}' looks like a file path. openBatarangs now uses Ollama model tags.\n\
-                     Just run `openbatrangs setup` and it will pull a coding model for you."
-                );
-            }
-            let tags = client.tags().await?;
-            if !tags.iter().any(|m| m.name == *explicit) {
-                bail!(
-                    "Model '{explicit}' is not installed. Run `openbatrangs setup` to auto-install a model."
-                );
-            }
-            return models::score_model(
-                &tags.iter().find(|m| m.name == *explicit).unwrap(),
-                mem_budget,
-                prefs.min_context,
-            )
-            .ok_or_else(|| anyhow!("model '{explicit}' has context below --min-context"));
+            return select_explicit_model(client, explicit, prefs.min_context, mem_budget).await;
         }
 
         let tags = client.tags().await?;
@@ -501,21 +409,18 @@ pub(crate) async fn select_model(
             if prefs.no_auto_pull {
                 bail!("no models installed and --no-auto-pull is set");
             }
-            let fallback = models::recommended_fallback_model(mem_budget);
-            client.pull(fallback).await?;
+            pull_fallback(client, mem_budget).await?;
             continue;
         }
 
         let scored = models::score_models(&tags, mem_budget, prefs.min_context);
         if let Some(best) = scored.first() {
-            if best.score < 60.0 && !prefs.no_auto_pull {
+            if best.score < GOOD_MODEL_SCORE_THRESHOLD && !prefs.no_auto_pull {
                 println!(
                     "⚠️  Best local model '{}' scores {:.0}/100 for agentic coding.",
                     best.name, best.score
                 );
-                let fallback = models::recommended_fallback_model(mem_budget);
-                println!("⬇️  Pulling a better default: {fallback}");
-                client.pull(fallback).await?;
+                pull_fallback(client, mem_budget).await?;
                 continue;
             }
             return Ok(best.clone());
@@ -527,21 +432,58 @@ pub(crate) async fn select_model(
                 prefs.min_context
             );
         }
-        let fallback = models::recommended_fallback_model(mem_budget);
-        println!("⬇️  No suitable model found. Pulling {fallback}");
-        client.pull(fallback).await?;
+        pull_fallback(client, mem_budget).await?;
     }
 }
 
+/// Validate and score an explicitly requested model tag.
+async fn select_explicit_model(
+    client: &OllamaClient,
+    explicit: &str,
+    min_context: u64,
+    mem_budget: u64,
+) -> Result<ModelScore> {
+    if models::looks_like_path(explicit) {
+        bail!(
+            "'{explicit}' looks like a file path. openBatarangs now uses Ollama model tags.\n\
+             Just run `openbatrangs setup` and it will pull a coding model for you."
+        );
+    }
+    let tags = client.tags().await?;
+    if !tags.iter().any(|model| model.name == explicit) {
+        bail!(
+            "Model '{explicit}' is not installed. Run `openbatrangs setup` to auto-install a model."
+        );
+    }
+    let model = tags.iter().find(|model| model.name == explicit).unwrap();
+    models::score_model(model, mem_budget, min_context)
+        .ok_or_else(|| anyhow!("model '{explicit}' has context below --min-context"))
+}
+
+/// Pull the recommended fallback model and print progress.
+async fn pull_fallback(client: &OllamaClient, mem_budget: u64) -> Result<()> {
+    let fallback = models::recommended_fallback_model(mem_budget);
+    println!("⬇️  Pulling a better default: {fallback}");
+    client.pull(fallback).await
+}
+
+/// Resolve the context length of a model from Ollama metadata.
+///
+/// # Arguments
+/// - `client`: Ollama HTTP client.
+/// - `model`: model tag.
+///
+/// # Returns
+/// Context length in tokens, or `FALLBACK_CONTEXT_LENGTH` if unknown.
 pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
     let show = client.show(model).await?;
     let context = show
         .get("model_info")
-        .and_then(|m| m.as_object())
-        .and_then(|obj| {
-            obj.iter().find_map(|(k, v)| {
-                if k.ends_with(".context_length") {
-                    v.as_u64()
+        .and_then(|info| info.as_object())
+        .and_then(|object| {
+            object.iter().find_map(|(key, value)| {
+                if key.ends_with(CONTEXT_LENGTH_KEY_SUFFIX) {
+                    value.as_u64()
                 } else {
                     None
                 }
@@ -549,13 +491,19 @@ pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) ->
         })
         .or_else(|| {
             show.get("details")
-                .and_then(|d| d.get("context_length"))
-                .and_then(|v| v.as_u64())
+                .and_then(|details| details.get("context_length"))
+                .and_then(|value| value.as_u64())
         })
-        .unwrap_or(8192);
+        .unwrap_or(FALLBACK_CONTEXT_LENGTH);
     Ok(context)
 }
 
+/// Compute the usable model memory budget from total system memory.
+fn memory_budget() -> u64 {
+    models::total_system_memory_bytes() * MEMORY_BUDGET_NUMERATOR / MEMORY_BUDGET_DENOMINATOR
+}
+
+/// Print the model table to stdout.
 async fn list_models(client: &OllamaClient, min_context: u64) -> Result<()> {
     for line in list_models_lines(client, min_context).await? {
         println!("{line}");
@@ -563,6 +511,7 @@ async fn list_models(client: &OllamaClient, min_context: u64) -> Result<()> {
     Ok(())
 }
 
+/// Build the model table as lines, used by both stdout and the TUI.
 async fn list_models_lines(client: &OllamaClient, min_context: u64) -> Result<Vec<String>> {
     let tags = client.tags().await?;
     if tags.is_empty() {
@@ -570,27 +519,28 @@ async fn list_models_lines(client: &OllamaClient, min_context: u64) -> Result<Ve
             "No models installed. Run `openbatrangs setup` to auto-pull one.".to_string(),
         ]);
     }
-    let mem_budget = models::total_system_memory_bytes() * 3 / 4;
+    let mem_budget = memory_budget();
     let scored = models::score_models(&tags, mem_budget, min_context);
     let mut lines = vec![format!(
         "{:<28} {:>9} {:>8} {:>8} {:>8} {:>6}  Notes",
         "MODEL", "SIZE", "PARAMS", "CTX", "QUANT", "SCORE"
     )];
-    for m in scored {
+    for model in scored {
         lines.push(format!(
             "{:<28} {:>7.1}G {:>8} {:>7}K {:>8} {:>6.0}  {}",
-            m.name,
-            m.size_bytes as f64 / 1e9,
-            m.parameter_size,
-            m.context_length / 1000,
-            m.quantization,
-            m.score,
-            m.reasons.join("; ")
+            model.name,
+            model.size_bytes as f64 / 1e9,
+            model.parameter_size,
+            model.context_length / 1000,
+            model.quantization,
+            model.score,
+            model.reasons.join("; ")
         ));
     }
     Ok(lines)
 }
 
+/// Print the doctor report to stdout.
 async fn doctor(client: &OllamaClient, min_context: u64) -> Result<()> {
     for line in doctor_lines(client, min_context).await? {
         println!("{line}");
@@ -598,11 +548,12 @@ async fn doctor(client: &OllamaClient, min_context: u64) -> Result<()> {
     Ok(())
 }
 
+/// Build the doctor report as lines, used by both stdout and the TUI.
 async fn doctor_lines(client: &OllamaClient, min_context: u64) -> Result<Vec<String>> {
     let mut lines = vec![format!("✅ Ollama reachable at {}", client.base_url)];
     let tags = client.tags().await?;
     lines.push(format!("Installed models: {}", tags.len()));
-    let mem_budget = models::total_system_memory_bytes() * 3 / 4;
+    let mem_budget = memory_budget();
     let scored = models::score_models(&tags, mem_budget, min_context);
     match scored.first() {
         Some(best) => {
@@ -628,7 +579,10 @@ async fn doctor_lines(client: &OllamaClient, min_context: u64) -> Result<Vec<Str
     lines.push(String::new());
     lines.push("⚡ Performance per watt per dollar:".to_string());
     lines.push("   - Local GPU inference on unified memory, no cloud API fees".to_string());
-    lines.push("   - Auto-picker deliberately chooses models that fit memory (Q4_K_M 3B-8B on 16GB Jetson)".to_string());
+    lines.push(
+        "   - Auto-picker deliberately chooses models that fit memory (Q4_K_M 3B-8B on 16GB Jetson)"
+            .to_string(),
+    );
     lines.push(
         "   - Keeps latency and power low while preserving a 32K+ context window".to_string(),
     );

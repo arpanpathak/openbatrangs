@@ -274,7 +274,7 @@ fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
 }
 
 fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
-    let initial_listing = tools::list_files(cwd, ".", 5)
+    let initial_listing = tools::list_files(cwd, ".", tools::DEFAULT_LIST_DEPTH)
         .unwrap_or_else(|error| format!("(could not list files: {error})"));
     let user_content = format!(
         "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
@@ -403,7 +403,7 @@ async fn execute_tool(
     changed_files: &mut Vec<String>,
 ) -> Result<String> {
     match tool {
-        Tool::ListFiles { path } => tools::list_files(cwd, path, 5),
+        Tool::ListFiles { path } => tools::list_files(cwd, path, tools::DEFAULT_LIST_DEPTH),
         Tool::ReadFile { path, max_chars } => {
             let max_chars = (*max_chars).min(tools::MAX_TOOL_OUTPUT);
             tools::read_file(cwd, path, max_chars)

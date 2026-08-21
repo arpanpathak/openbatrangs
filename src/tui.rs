@@ -1,3 +1,13 @@
+//! Ratatui-based interactive terminal UI.
+//!
+//! The TUI provides:
+//! - a chat scrollback area with wrapping,
+//! - a fixed bottom input box,
+//! - slash-command suggestions,
+//! - a model picker,
+//! - a live spinner and current agent action,
+//! - background agent workers with a task queue.
+
 use crate::agent::{AgentConfig, Reporter};
 use crate::ollama::OllamaClient;
 use crate::{resolve_model_context, select_model, Cli, ModelPrefs};
@@ -19,6 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Slash commands recognized by the TUI.
 const COMMANDS: &[&str] = &[
     "help",
     "exit",
@@ -34,15 +45,24 @@ const COMMANDS: &[&str] = &[
     "clear",
 ];
 
+/// Spinner frames shown while the agent is working.
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Maximum visible lines in the multi-line input box.
 const MAX_INPUT_LINES: usize = 5;
+/// Extra lines for the input box border.
 const INPUT_BOX_PADDING: usize = 2;
+/// Minimum input box height (border + one line).
 const MIN_INPUT_BOX_HEIGHT: usize = 3;
+/// Cap for the streaming live line to avoid unbounded memory.
 const MAX_LIVE_CHARS: usize = 50_000;
+/// Redraw interval in milliseconds (drives the spinner).
 const TICK_MILLIS: u64 = 80;
+/// Height of the suggestions list when visible.
 const SUGGESTIONS_HEIGHT: u16 = 4;
+/// Width of the model picker popup as a percentage of the screen.
 const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;
+/// Height of the model picker popup as a percentage of the screen.
 const MODEL_PICKER_HEIGHT_PERCENT: u16 = 40;
 
 enum UiEvent {
