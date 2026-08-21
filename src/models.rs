@@ -338,4 +338,63 @@ mod tests {
         assert_eq!(coding_bonus("deepseek-coder:6.7b"), 1.0);
         assert!(coding_bonus("llama3.2:3b") < 1.0);
     }
+
+    fn model(name: &str, context: u64, params: &str, quant: &str, size: u64) -> OllamaModel {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "size": size,
+            "details": {
+                "parameter_size": params,
+                "quantization_level": quant,
+                "context_length": context,
+            },
+        }))
+        .expect("valid model JSON")
+    }
+
+    #[test]
+    fn score_model_returns_none_below_min_context() {
+        let model = model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000);
+        assert!(score_model(&model, 8_000_000_000, 8_192).is_none());
+    }
+
+    #[test]
+    fn score_model_returns_some_when_context_meets_minimum() {
+        let model = model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000);
+        let scored = score_model(&model, 16_000_000_000, 8_192).unwrap();
+        assert_eq!(scored.name, "qwen2.5-coder:7b");
+        assert!(scored.score > 0.0);
+        assert!(scored.score <= 100.0);
+    }
+
+    #[test]
+    fn score_models_sorts_best_first() {
+        let good = model("good:7b", 32_768, "7B", "Q4_K_M", 4_000_000_000);
+        let meh = model("meh:3b", 8_192, "3B", "Q4_0", 2_000_000_000);
+        let scored = score_models(&[meh.clone(), good.clone()], 16_000_000_000, 8_192);
+        assert_eq!(scored[0].name, "good:7b");
+        assert_eq!(scored[1].name, "meh:3b");
+    }
+
+    #[test]
+    fn looks_like_path_detects_paths() {
+        assert!(looks_like_path("./model.gguf"));
+        assert!(looks_like_path("models/foo"));
+        assert!(looks_like_path("C:\\models\\foo"));
+        assert!(!looks_like_path("qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn recommended_fallback_model_chooses_bigger_model_on_large_memory() {
+        let small = recommended_fallback_model(8 * 1024 * 1024 * 1024);
+        let large = recommended_fallback_model(24 * 1024 * 1024 * 1024);
+        assert_eq!(small, "qwen2.5-coder:3b");
+        assert_eq!(large, "qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn quant_bonus_prefers_q4_k_m() {
+        assert!(quant_bonus("Q4_K_M") > quant_bonus("Q8_0"));
+        assert!(quant_bonus("Q5_K_S") > quant_bonus("F16"));
+    }
 }

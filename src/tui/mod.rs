@@ -125,10 +125,9 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
-    match chars.clone().next() {
+    match chars.next() {
         // OSC: ESC ] ... BEL / ST
         Some(']') => {
-            chars.next();
             for n in chars.by_ref() {
                 match n {
                     '\x07' => break,
@@ -141,14 +140,16 @@ fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
                 }
             }
         }
-        // CSI / other: ESC [ ... final byte in 0x40..=0x7E
-        _ => {
+        // CSI: ESC [ params... final byte in 0x40..=0x7E
+        Some('[') => {
             for n in chars.by_ref() {
                 if n.is_ascii() && ('\u{40}'..='\u{7e}').contains(&n) {
                     break;
                 }
             }
         }
+        // Other single-character escape sequences need no further bytes.
+        Some(_) | None => {}
     }
 }
 
@@ -566,5 +567,28 @@ mod tests {
     #[test]
     fn visual_line_indices_map_wrapped_rows_to_sources() {
         assert_eq!(chat_visual_line_indices("aaaaaa\nbb", 3), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_hyperlinks() {
+        let input = "\x1b]8;;file:///tmp/a\x1b\\/tmp/a\x1b]8;;\x1b\\";
+        assert_eq!(strip_ansi(input), "/tmp/a");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_with_bel_terminator() {
+        let input = "\x1b]0;title\x07visible";
+        assert_eq!(strip_ansi(input), "visible");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_plain_text() {
+        assert_eq!(strip_ansi("plain text 🦇"), "plain text 🦇");
     }
 }

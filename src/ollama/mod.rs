@@ -6,9 +6,13 @@
 //! - `POST /api/chat`    — chat completion (streaming and non-streaming)
 //! - `POST /api/pull`    — download a model from the Ollama registry
 
+mod stream;
+mod types;
+
+pub(crate) use types::{ChatMessage, ChatRequest, OllamaModel, PullRequest, TagsResponse};
+
 use anyhow::{anyhow, Context, Result};
 use futures_util::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -25,83 +29,6 @@ pub struct OllamaClient {
     pub base_url: String,
     /// Reusable HTTP client with sensible timeouts.
     http: reqwest::Client,
-}
-
-/// Response body of `GET /api/tags`.
-#[derive(Deserialize, Clone, Debug)]
-pub struct TagsResponse {
-    /// All models currently installed on the Ollama server.
-    pub models: Vec<OllamaModel>,
-}
-
-/// A single installed model as returned by `/api/tags`.
-#[derive(Deserialize, Clone, Debug)]
-pub struct OllamaModel {
-    /// Model tag, e.g. `qwen2.5-coder:7b`.
-    pub name: String,
-    /// Size of the model file on disk, in bytes.
-    #[serde(default)]
-    pub size: u64,
-    /// Optional human-readable metadata about the model.
-    #[serde(default)]
-    pub details: Option<ModelDetails>,
-}
-
-/// Optional metadata for an installed model.
-#[derive(Deserialize, Clone, Debug, Default)]
-pub struct ModelDetails {
-    /// Parameter count label, e.g. `7.6B` or `873.44M`.
-    #[serde(default)]
-    pub parameter_size: Option<String>,
-    /// Quantization level, e.g. `Q4_K_M`.
-    #[serde(default)]
-    pub quantization_level: Option<String>,
-    /// Maximum context length the model supports.
-    #[serde(default)]
-    pub context_length: Option<u64>,
-}
-
-/// A single chat message sent to the model.
-#[derive(Serialize, Clone, Debug)]
-pub struct ChatMessage {
-    /// One of `system`, `user`, `assistant`, or `tool`.
-    pub role: String,
-    /// Message body.
-    pub content: String,
-}
-
-/// Payload for `POST /api/chat`.
-#[derive(Serialize, Debug)]
-pub struct ChatRequest {
-    /// Model tag to use.
-    pub model: String,
-    /// Ordered conversation history.
-    pub messages: Vec<ChatMessage>,
-    /// Whether to stream the response as NDJSON.
-    pub stream: bool,
-    /// Optional response format hint (e.g. `json`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<Value>,
-    /// Optional sampling options (`temperature`, `num_ctx`, ...).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<Value>,
-}
-
-/// Payload for `POST /api/pull`.
-#[derive(Serialize, Debug)]
-struct PullRequest {
-    /// Model tag to download, e.g. `qwen2.5-coder:3b`.
-    name: String,
-    /// Whether to stream pull progress. We use `false` for simplicity.
-    stream: bool,
-}
-
-/// A meaningful event extracted from one Ollama NDJSON stream line.
-enum StreamLine {
-    /// Assistant content delta.
-    Content(String),
-    /// Terminal `done: true` marker.
-    Done,
 }
 
 impl OllamaClient {
@@ -226,12 +153,12 @@ impl OllamaClient {
             (byte_stream, String::new()),
             |(mut byte_stream, mut buffer)| async move {
                 loop {
-                    match drain_complete_lines(&mut buffer) {
-                        LineDrain::Content(content) => {
+                    match stream::drain_complete_lines(&mut buffer) {
+                        stream::LineDrain::Content(content) => {
                             return Some((Ok(content), (byte_stream, buffer)));
                         }
-                        LineDrain::Done => return None,
-                        LineDrain::NeedMore => {}
+                        stream::LineDrain::Done => return None,
+                        stream::LineDrain::NeedMore => {}
                     }
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
@@ -293,75 +220,58 @@ impl OllamaClient {
     }
 }
 
-/// Result of draining complete NDJSON lines from the stream buffer.
-enum LineDrain {
-    /// A content delta is ready to emit.
-    Content(String),
-    /// The stream's terminal `done` marker was seen.
-    Done,
-    /// No complete payload line is available yet.
-    NeedMore,
-}
-
-/// Consume complete lines from `buffer`, returning the first meaningful event.
-fn drain_complete_lines(buffer: &mut String) -> LineDrain {
-    while let Some(newline_pos) = buffer.find('\n') {
-        let line = buffer[..newline_pos].trim().to_string();
-        *buffer = buffer[newline_pos + 1..].to_string();
-        if line.is_empty() {
-            continue;
-        }
-        match parse_stream_line(&line) {
-            Some(StreamLine::Content(content)) => return LineDrain::Content(content),
-            Some(StreamLine::Done) => return LineDrain::Done,
-            None => {}
-        }
-    }
-    LineDrain::NeedMore
-}
-
-/// Parse one NDJSON line from an Ollama chat stream.
-///
-/// Returns `None` for non-payload lines (progress, keep-alive, malformed JSON).
-fn parse_stream_line(line: &str) -> Option<StreamLine> {
-    let value = serde_json::from_str::<Value>(line).ok()?;
-    if let Some(content) = value
-        .pointer("/message/content")
-        .and_then(|content| content.as_str())
-    {
-        return Some(StreamLine::Content(content.to_string()));
-    }
-    if value
-        .get("done")
-        .and_then(|done| done.as_bool())
-        .unwrap_or(false)
-    {
-        return Some(StreamLine::Done);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_content_delta_from_stream_line() {
-        let line = r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#;
-        match parse_stream_line(line) {
-            Some(StreamLine::Content(content)) => assert_eq!(content, "hello"),
-            _ => panic!("expected content delta"),
-        }
+    fn client_strips_trailing_slashes_from_base_url() {
+        let client = OllamaClient::new("http://localhost:11434///").unwrap();
+        assert_eq!(client.base_url, "http://localhost:11434");
     }
 
     #[test]
-    fn parses_done_marker_from_stream_line() {
-        let line = r#"{"done":true}"#;
-        assert!(matches!(parse_stream_line(line), Some(StreamLine::Done)));
+    fn client_accepts_plain_url() {
+        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
+        assert_eq!(client.base_url, "http://127.0.0.1:11434");
     }
 
     #[test]
-    fn ignores_malformed_stream_line() {
-        assert!(parse_stream_line("not json").is_none());
+    fn chat_request_serializes_expected_shape() {
+        let request = ChatRequest {
+            model: "qwen2.5-coder:3b".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            stream: true,
+            format: None,
+            options: Some(serde_json::json!({"temperature": 0.7})),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["model"], "qwen2.5-coder:3b");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["options"]["temperature"], 0.7);
+    }
+
+    #[test]
+    fn tags_response_deserializes_with_missing_details() {
+        let json = r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#;
+        let response: TagsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.models.len(), 1);
+        assert_eq!(response.models[0].name, "qwen2.5-coder:3b");
+        assert_eq!(response.models[0].size, 123);
+        assert!(response.models[0].details.is_none());
+    }
+
+    #[test]
+    fn tags_response_deserializes_with_details() {
+        let json = r#"{"models":[{"name":"qwen2.5-coder:7b","size":1,"details":{"parameter_size":"7.6B","quantization_level":"Q4_K_M","context_length":32768}}]}"#;
+        let response: TagsResponse = serde_json::from_str(json).unwrap();
+        let details = response.models[0].details.as_ref().unwrap();
+        assert_eq!(details.parameter_size.as_deref(), Some("7.6B"));
+        assert_eq!(details.quantization_level.as_deref(), Some("Q4_K_M"));
+        assert_eq!(details.context_length, Some(32_768));
     }
 }

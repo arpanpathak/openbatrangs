@@ -721,4 +721,113 @@ mod tests {
         let args = serde_json::json!({"path": 42});
         assert!(string_arg(&args, "path").is_err());
     }
+
+    #[test]
+    fn tool_from_call_parses_known_tools() {
+        let call = ToolCall {
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "a.txt", "content": "x"}),
+        };
+        let tool = Tool::from_call(call).unwrap();
+        assert!(
+            matches!(tool, Tool::WriteFile { path, content } if path == "a.txt" && content == "x")
+        );
+    }
+
+    #[test]
+    fn tool_from_call_rejects_unknown_tool() {
+        let call = ToolCall {
+            name: "rm_rf".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        assert!(Tool::from_call(call).is_err());
+    }
+
+    #[test]
+    fn tool_describe_is_human_readable() {
+        let tool = Tool::ListFiles {
+            path: "src".to_string(),
+        };
+        assert_eq!(tool.describe(), "list_files → src");
+    }
+
+    #[test]
+    fn clickable_path_encodes_special_characters() {
+        let path = std::path::Path::new("/tmp/a b#c");
+        let link = clickable_path(path, "x");
+        assert!(link.contains("a%20b%23c"));
+        assert!(link.contains("/tmp/a b#c"));
+    }
+
+    #[test]
+    fn stream_state_skips_when_disabled() {
+        let mut state = StreamState::new("thought", false);
+        assert!(state.is_skipped);
+        state
+            .feed(&mut StdoutReporter, r#"{"thought":"secret"}"#)
+            .unwrap();
+        assert!(!state.did_print());
+    }
+
+    #[test]
+    fn stream_state_streams_incrementally() {
+        struct Sink(Vec<String>);
+        impl Reporter for Sink {
+            fn line(&mut self, msg: String) {
+                self.0.push(msg);
+            }
+            fn chunk(&mut self, msg: &str) {
+                self.0.push(msg.to_string());
+            }
+        }
+        let mut state = StreamState::new("answer", true);
+        let mut sink = Sink(Vec::new());
+        state.feed(&mut sink, r#"{"answer":"hel"#).unwrap();
+        state.feed(&mut sink, r#"{"answer":"hello"}"#).unwrap();
+        assert!(sink.0.iter().any(|part| part.contains("hel")));
+        assert!(sink.0.iter().any(|part| part.contains("lo")));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_reads_what_it_writes() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openbatrangs-agent-test-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = AgentConfig {
+            cwd: root.clone(),
+            max_steps: 1,
+            is_read_only: false,
+            should_confirm: false,
+            show_thinking: true,
+        };
+        let mut changed = Vec::new();
+        execute_tool(
+            &config,
+            &root,
+            &Tool::WriteFile {
+                path: "src/lib.rs".to_string(),
+                content: "pub fn f() {}".to_string(),
+            },
+            &mut changed,
+        )
+        .await
+        .unwrap();
+        let output = execute_tool(
+            &config,
+            &root,
+            &Tool::ReadFile {
+                path: "src/lib.rs".to_string(),
+                max_chars: 100,
+            },
+            &mut changed,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("pub fn f() {}"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

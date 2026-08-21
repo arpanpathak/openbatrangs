@@ -266,3 +266,38 @@ fn read_cpu_times() -> Option<(u64, u64)> {
     let total = user + nice + system + idle + iowait + irq + softirq + steal;
     Some((idle_total, total))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kibibytes_value() {
+        assert_eq!(parse_kibibytes("12345 kB"), 12_345);
+        assert_eq!(parse_kibibytes("0 kB"), 0);
+        assert_eq!(parse_kibibytes("garbage"), 0);
+    }
+
+    #[test]
+    fn reads_memory_from_proc_meminfo() {
+        let memory = read_memory_mb();
+        assert!(memory.total_mb > 0);
+        assert!(memory.free_mb <= memory.total_mb);
+        assert!(memory.used_mb <= memory.total_mb);
+    }
+
+    #[test]
+    fn reads_cpu_times_from_proc_stat() {
+        let times = read_cpu_times();
+        assert!(times.is_some());
+        let (idle, total) = times.unwrap();
+        assert!(idle <= total);
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn cpu_sampler_primes_without_panicking() {
+        let mut sampler = CpuSampler::new();
+        assert!(sampler.sample().is_none() || sampler.sample().is_some());
+    }
+}

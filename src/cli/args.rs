@@ -1,4 +1,4 @@
-//! Command-line interface definitions and shared agent configuration.
+//! Clap argument definitions and default values.
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -78,62 +78,65 @@ pub(crate) enum Commands {
     Setup,
 }
 
-/// Preferences used for automatic model selection.
-#[derive(Clone)]
-pub(crate) struct ModelPrefs {
-    /// Explicit model tag; `None` means auto-select.
-    pub(crate) model: Option<String>,
-    /// If `true`, never auto-pull a model.
-    pub(crate) is_auto_pull_disabled: bool,
-    /// Minimum acceptable context window.
-    pub(crate) min_context: u64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Agent execution mode selected in the TUI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AgentMode {
-    /// Full agentic loop with tools.
-    Agent,
-    /// Planning-only: read-only, no writes or shell commands.
-    Plan,
-    /// Plain chat: no tools, just conversation and code.
-    Chat,
-}
-
-/// Runtime settings shared by the one-shot agent and the TUI worker.
-#[derive(Clone)]
-pub(crate) struct AgentRunConfig {
-    /// Workspace directory for the agent.
-    pub(crate) cwd: PathBuf,
-    /// Maximum agent iterations.
-    pub(crate) max_steps: usize,
-    /// Disable file writes and shell commands.
-    pub(crate) is_read_only: bool,
-    /// Ask before mutating actions.
-    pub(crate) should_confirm: bool,
-    /// Agent vs planning vs chat mode.
-    pub(crate) mode: AgentMode,
-    /// Stream the model's internal reasoning in agent mode.
-    pub(crate) show_thinking: bool,
-}
-
-/// Build model-selection preferences from parsed CLI arguments.
-pub(crate) fn model_prefs_from_cli(cli: &Cli) -> ModelPrefs {
-    ModelPrefs {
-        model: cli.model.clone(),
-        is_auto_pull_disabled: cli.is_auto_pull_disabled,
-        min_context: cli.min_context as u64,
+    #[test]
+    fn parses_defaults_without_arguments() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        assert!(cli.task.is_empty());
+        assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
+        assert_eq!(cli.cwd, PathBuf::from("."));
+        assert!(!cli.is_read_only);
+        assert!(!cli.should_confirm);
+        assert!(!cli.is_auto_pull_disabled);
+        assert!(cli.command.is_none());
     }
-}
 
-/// Build the shared agent runtime configuration from parsed CLI arguments.
-pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
-    AgentRunConfig {
-        cwd: cli.cwd.clone(),
-        max_steps: cli.max_steps,
-        is_read_only: cli.is_read_only,
-        should_confirm: cli.should_confirm,
-        mode: AgentMode::Agent,
-        show_thinking: true,
+    #[test]
+    fn parses_positional_task() {
+        let cli = Cli::parse_from(["openbatrangs", "fix", "the", "bug"]);
+        assert_eq!(cli.task, vec!["fix", "the", "bug"]);
+    }
+
+    #[test]
+    fn parses_global_options_before_subcommand() {
+        let cli = Cli::parse_from([
+            "openbatrangs",
+            "--model",
+            "qwen2.5-coder:7b",
+            "--max-steps",
+            "5",
+            "--read-only",
+            "list-models",
+        ]);
+        assert_eq!(cli.model.as_deref(), Some("qwen2.5-coder:7b"));
+        assert_eq!(cli.max_steps, 5);
+        assert!(cli.is_read_only);
+        assert!(matches!(cli.command, Some(Commands::ListModels)));
+    }
+
+    #[test]
+    fn parses_agent_subcommand_with_task() {
+        let cli = Cli::parse_from(["openbatrangs", "agent", "write", "tests"]);
+        match cli.command {
+            Some(Commands::Agent { task }) => assert_eq!(task, vec!["write", "tests"]),
+            _ => panic!("expected agent subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_subcommand() {
+        let cli = Cli::parse_from(["openbatrangs", "setup"]);
+        assert!(matches!(cli.command, Some(Commands::Setup)));
+    }
+
+    #[test]
+    fn parses_doctor_subcommand() {
+        let cli = Cli::parse_from(["openbatrangs", "doctor"]);
+        assert!(matches!(cli.command, Some(Commands::Doctor)));
     }
 }

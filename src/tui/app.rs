@@ -988,4 +988,94 @@ mod tests {
             .draw(|frame| super::super::ui::ui(frame, &mut app))
             .expect("draw with pasted multiline input should not panic");
     }
+
+    fn test_app() -> App {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        App::new(&cli, Arc::new(Mutex::new(None)))
+    }
+
+    #[test]
+    fn suggestions_return_slash_commands() {
+        let mut app = test_app();
+        app.input = "/h".to_string();
+        let suggestions = app.suggestions();
+        assert!(!suggestions.is_empty());
+        assert!(suggestions
+            .iter()
+            .all(|suggestion| suggestion.starts_with("/h")));
+    }
+
+    #[test]
+    fn mode_suggestions_are_filtered() {
+        let mut app = test_app();
+        app.input = "/mode p".to_string();
+        assert_eq!(app.suggestions(), vec!["/mode plan"]);
+        app.input = "/mode ".to_string();
+        assert_eq!(
+            app.suggestions(),
+            vec!["/mode agent", "/mode plan", "/mode chat"]
+        );
+    }
+
+    #[test]
+    fn scroll_chat_never_goes_below_zero() {
+        let mut app = test_app();
+        app.scroll_chat(-100);
+        assert_eq!(app.chat_scroll_offset, 0);
+        app.scroll_chat(10);
+        assert_eq!(app.chat_scroll_offset, 10);
+    }
+
+    #[test]
+    fn done_event_appends_assistant_to_chat_history() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.run_config.mode = AgentMode::Chat;
+        app.chat_history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        });
+        app.live.push_str("world");
+        app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
+        assert_eq!(app.chat_history.len(), 2);
+        assert_eq!(app.chat_history[1].role, "assistant");
+        assert_eq!(app.chat_history[1].content, "world");
+    }
+
+    #[test]
+    fn clear_chat_resets_history_and_prompt() {
+        let mut app = test_app();
+        app.current_prompt = Some("task".to_string());
+        app.chat_history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "task".to_string(),
+        });
+        app.clear_chat();
+        assert!(app.chat_history.is_empty());
+        assert!(app.current_prompt.is_none());
+        assert!(app.log.is_empty());
+    }
+
+    #[test]
+    fn cancel_task_removes_pending_chat_user_message() {
+        let mut app = test_app();
+        app.run_config.mode = AgentMode::Chat;
+        app.chat_history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "question".to_string(),
+        });
+        app.cancel_task();
+        assert!(app.chat_history.is_empty());
+        assert!(app.log.iter().any(|line| line.contains("Cancelled")));
+    }
+
+    #[test]
+    fn accept_suggestion_clamps_out_of_range_selection() {
+        let mut app = test_app();
+        app.input = "/mode ".to_string();
+        app.selected = 99;
+        app.accept_suggestion();
+        assert_eq!(app.input, "/mode chat");
+    }
 }

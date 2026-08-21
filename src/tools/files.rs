@@ -1,16 +1,11 @@
-//! Safe filesystem tools available to the coding agent.
-//!
-//! All tools operate on paths relative to the workspace root. Absolute paths
-//! and `..` traversal are rejected so the model cannot escape the project.
+//! Filesystem tools: list, read, write, grep.
 
-use anyhow::{anyhow, bail, Context, Result};
+use super::path::resolve_in_root;
+use super::text::{truncate, truncate_to};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
-use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
 use walkdir::WalkDir;
-
-/// Maximum number of characters returned by any tool to protect context memory.
-pub const MAX_TOOL_OUTPUT: usize = 20_000;
 
 /// Directories skipped during recursive walks (build caches, VCS, dependencies).
 const HEAVY_DIRS: &[&str] = &[
@@ -31,7 +26,7 @@ const HEAVY_DIRS: &[&str] = &[
 ];
 
 /// Default depth for `list_files` in the agent's initial context.
-pub const DEFAULT_LIST_DEPTH: usize = 5;
+pub(crate) const DEFAULT_LIST_DEPTH: usize = 5;
 
 /// Depth used by `grep_files` when scanning the workspace.
 const GREP_MAX_DEPTH: usize = 12;
@@ -42,33 +37,9 @@ const MAX_LISTED_FILES: usize = 5_000;
 /// Number of leading bytes inspected to detect binary files.
 const BINARY_SNIFF_BYTES: usize = 8_192;
 
-/// Minimum shell timeout in seconds (avoids instant timeout bugs).
-const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
-
 /// Returns true when a directory name should be skipped by recursive walks.
 fn is_heavy_dir(name: &str) -> bool {
     HEAVY_DIRS.contains(&name)
-}
-
-/// Resolve a model-supplied path safely inside `root`.
-///
-/// # Arguments
-/// - `root`: workspace root directory.
-/// - `path`: relative path supplied by the model.
-///
-/// # Returns
-/// The joined `PathBuf`, or an error if the path is absolute or contains `..`.
-pub fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
-    let requested = Path::new(path);
-    if requested.is_absolute() {
-        bail!("absolute paths are not allowed; use paths relative to the workspace");
-    }
-    for component in requested.components() {
-        if matches!(component, Component::ParentDir) {
-            bail!("'..' is not allowed in tool paths");
-        }
-    }
-    Ok(root.join(requested))
 }
 
 /// Build a recursive directory walker that skips heavy directories.
@@ -108,7 +79,7 @@ fn walker(
 ///
 /// # Returns
 /// One line per file: relative path and byte size.
-pub fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<String> {
+pub(crate) fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<String> {
     let directory = resolve_in_root(root, path)?;
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
@@ -149,7 +120,7 @@ pub fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<String> {
 ///
 /// # Returns
 /// A header line plus the (possibly truncated) file contents.
-pub fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<String> {
+pub(crate) fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<String> {
     let file = resolve_in_root(root, path)?;
     if !file.is_file() {
         bail!("not a file: {}", file.display());
@@ -172,7 +143,7 @@ pub fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<String> {
 ///
 /// # Returns
 /// A confirmation string with the absolute path and byte count.
-pub fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
+pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     let file = resolve_in_root(root, path)?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
@@ -197,7 +168,12 @@ pub fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
 ///
 /// # Returns
 /// Lines of the form `file:line: matched text`.
-pub fn grep_files(root: &Path, pattern: &str, path: &str, max_results: usize) -> Result<String> {
+pub(crate) fn grep_files(
+    root: &Path,
+    pattern: &str,
+    path: &str,
+    max_results: usize,
+) -> Result<String> {
     let directory = resolve_in_root(root, path)?;
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
@@ -244,92 +220,120 @@ pub fn grep_files(root: &Path, pattern: &str, path: &str, max_results: usize) ->
     Ok(truncate(output))
 }
 
-/// Run a shell command in the workspace and capture combined output.
-///
-/// # Arguments
-/// - `root`: working directory for the command.
-/// - `command`: shell command line.
-/// - `timeout_secs`: maximum allowed runtime.
-///
-/// # Returns
-/// Captured stdout/stderr plus exit status, truncated to `MAX_TOOL_OUTPUT`.
-pub async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
-    let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
-    let output = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new("bash")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(root)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))?
-    .context("failed to spawn shell")?;
-
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.stderr.is_empty() {
-        text.push_str("\n[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-
-    let exit_code = output
-        .status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "signal".to_string());
-    text.push_str(&format!("\n[exit code {exit_code}]\n"));
-    Ok(truncate(text))
-}
-
-/// Truncate a string to `MAX_TOOL_OUTPUT` characters.
-pub fn truncate(text: String) -> String {
-    truncate_to(text, MAX_TOOL_OUTPUT)
-}
-
-/// Truncate a string to at most `max` characters, appending an omission note.
-fn truncate_to(text: String, max: usize) -> String {
-    if text.len() <= max {
-        return text;
-    }
-    let mut result = text.chars().take(max).collect::<String>();
-    result.push_str(&format!(
-        "\n... (truncated, {} chars omitted)",
-        text.chars().count().saturating_sub(max)
-    ));
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn resolve_in_root_rejects_absolute_paths() {
-        let root = Path::new("/tmp/project");
-        assert!(resolve_in_root(root, "/etc/passwd").is_err());
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openbatrangs-tools-test-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
 
     #[test]
-    fn resolve_in_root_rejects_parent_dir_traversal() {
-        let root = Path::new("/tmp/project");
-        assert!(resolve_in_root(root, "../secret").is_err());
+    fn list_files_returns_relative_paths_and_sizes() {
+        let root = temp_dir();
+        fs::write(root.join("a.txt"), "hello").unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/b.txt"), "world").unwrap();
+
+        let output = list_files(&root, ".", 5).unwrap();
+        assert!(output.contains("a.txt (5 bytes)"));
+        assert!(output.contains("sub/b.txt (5 bytes)"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn resolve_in_root_accepts_relative_paths() {
-        let root = Path::new("/tmp/project");
-        assert_eq!(
-            resolve_in_root(root, "src/main.rs").expect("relative path should resolve"),
-            Path::new("/tmp/project/src/main.rs")
-        );
+    fn list_files_rejects_missing_directory() {
+        let root = temp_dir();
+        assert!(list_files(&root, "missing", 5).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn truncate_appends_omission_note() {
-        let text = "x".repeat(MAX_TOOL_OUTPUT + 100);
-        let result = truncate(text);
-        assert!(result.len() < MAX_TOOL_OUTPUT + 200);
-        assert!(result.contains("truncated"));
+    fn list_files_skips_heavy_dirs() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/ignored.txt"), "x").unwrap();
+        fs::write(root.join("keep.txt"), "y").unwrap();
+
+        let output = list_files(&root, ".", 5).unwrap();
+        assert!(output.contains("keep.txt"));
+        assert!(!output.contains("target/ignored.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_returns_header_and_content() {
+        let root = temp_dir();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        let output = read_file(&root, "main.rs", 100).unwrap();
+        assert!(output.contains("--- main.rs ---"));
+        assert!(output.contains("fn main() {}"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_rejects_missing_file() {
+        let root = temp_dir();
+        assert!(read_file(&root, "nope.rs", 100).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_creates_parent_dirs() {
+        let root = temp_dir();
+        let result = write_file(&root, "src/deep/lib.rs", "pub fn f() {}").unwrap();
+        assert!(result.contains("lib.rs"));
+        assert!(root.join("src/deep/lib.rs").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_finds_matches_and_reports_missing() {
+        let root = temp_dir();
+        fs::write(root.join("a.txt"), "hello world\nfoo bar\n").unwrap();
+        fs::write(root.join("b.rs"), "fn hello() {}\n").unwrap();
+
+        let output = grep_files(&root, "hello", ".", 10).unwrap();
+        assert!(output.contains("a.txt:1: hello world"));
+        assert!(output.contains("b.rs:1: fn hello() {}"));
+
+        let none = grep_files(&root, "zzz", ".", 10).unwrap();
+        assert!(none.contains("(no matches)"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_rejects_invalid_regex() {
+        let root = temp_dir();
+        assert!(grep_files(&root, "(", ".", 10).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_honors_max_results() {
+        let root = temp_dir();
+        let content = "match\n".repeat(100);
+        fs::write(root.join("many.txt"), content).unwrap();
+        let output = grep_files(&root, "match", ".", 3).unwrap();
+        assert!(output.contains("truncated at 3 matches"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_skips_binary_files() {
+        let root = temp_dir();
+        fs::write(root.join("bin.dat"), b"\x00\x01\x02match").unwrap();
+        let output = grep_files(&root, "match", ".", 10).unwrap();
+        assert!(output.contains("(no matches)"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

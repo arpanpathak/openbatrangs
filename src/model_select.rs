@@ -144,8 +144,12 @@ async fn pull_fallback(
 /// Context length in tokens, or `FALLBACK_CONTEXT_LENGTH` if unknown.
 pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
     let show = client.show(model).await?;
-    let context = show
-        .get("model_info")
+    Ok(context_length_from_show(&show))
+}
+
+/// Extract the model context length from a raw `/api/show` JSON body.
+fn context_length_from_show(show: &serde_json::Value) -> u64 {
+    show.get("model_info")
         .and_then(|info| info.as_object())
         .and_then(|object| {
             object.iter().find_map(|(key, value)| {
@@ -161,11 +165,59 @@ pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) ->
                 .and_then(|details| details.get("context_length"))
                 .and_then(|value| value.as_u64())
         })
-        .unwrap_or(FALLBACK_CONTEXT_LENGTH);
-    Ok(context)
+        .unwrap_or(FALLBACK_CONTEXT_LENGTH)
 }
 
 /// Compute the usable model memory budget from total system memory.
 pub(crate) fn calculate_memory_budget() -> u64 {
     models::total_system_memory_bytes() * MEMORY_BUDGET_NUMERATOR / MEMORY_BUDGET_DENOMINATOR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_context_from_model_info_key() {
+        let show = json!({
+            "model_info": {
+                "llama.context_length": 32768,
+                "other": 1,
+            }
+        });
+        assert_eq!(context_length_from_show(&show), 32_768);
+    }
+
+    #[test]
+    fn extracts_context_from_details_fallback() {
+        let show = json!({"details": {"context_length": 8192}});
+        assert_eq!(context_length_from_show(&show), 8_192);
+    }
+
+    #[test]
+    fn falls_back_when_context_unknown() {
+        assert_eq!(
+            context_length_from_show(&json!({})),
+            FALLBACK_CONTEXT_LENGTH
+        );
+        assert_eq!(
+            context_length_from_show(&json!({"model_info": {}})),
+            FALLBACK_CONTEXT_LENGTH
+        );
+    }
+
+    #[test]
+    fn model_info_takes_precedence_over_details() {
+        let show = json!({
+            "model_info": {"llama.context_length": 16384},
+            "details": {"context_length": 4096},
+        });
+        assert_eq!(context_length_from_show(&show), 16_384);
+    }
+
+    #[test]
+    fn memory_budget_is_positive_on_linux() {
+        assert!(calculate_memory_budget() > 0);
+    }
 }

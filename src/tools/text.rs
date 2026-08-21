@@ -1,0 +1,57 @@
+//! Output truncation helpers.
+
+/// Maximum number of characters returned by any tool to protect context memory.
+pub(crate) const MAX_TOOL_OUTPUT: usize = 20_000;
+
+/// Truncate a string to `MAX_TOOL_OUTPUT` characters.
+pub(crate) fn truncate(text: String) -> String {
+    truncate_to(text, MAX_TOOL_OUTPUT)
+}
+
+/// Truncate a string to at most `max` characters, appending an omission note.
+pub(super) fn truncate_to(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut result = text.chars().take(max).collect::<String>();
+    result.push_str(&format!(
+        "\n... (truncated, {} chars omitted)",
+        text.chars().count().saturating_sub(max)
+    ));
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_appends_omission_note() {
+        let text = "x".repeat(MAX_TOOL_OUTPUT + 100);
+        let result = truncate(text);
+        assert!(result.len() < MAX_TOOL_OUTPUT + 200);
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn short_text_is_unchanged() {
+        let text = "hello".to_string();
+        assert_eq!(truncate(text), "hello");
+    }
+
+    #[test]
+    fn truncate_to_respects_custom_limit() {
+        let text = "abcdefgh".to_string();
+        let result = truncate_to(text, 4);
+        assert!(result.starts_with("abcd"));
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_handles_unicode_char_boundaries() {
+        let text = "😀😀😀😀".to_string();
+        let result = truncate_to(text, 2);
+        assert_eq!(result.chars().next(), Some('😀'));
+        assert!(result.contains("truncated"));
+    }
+}
