@@ -9,11 +9,13 @@
 mod agent;
 mod doctor;
 mod models;
+mod pull;
 mod setup;
 
 pub(crate) use agent::run_agent_or_tui;
 pub(crate) use doctor::{doctor, doctor_lines};
 pub(crate) use models::list_models;
+pub(crate) use pull::pull;
 pub(crate) use setup::{setup, setup_with_status};
 
 use crate::constants::commands::{

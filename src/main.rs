@@ -39,6 +39,10 @@ async fn main() -> Result<()> {
             commands::ensure_ollama(&client).await?;
             commands::run_agent_or_tui(&cli, &client, task).await?;
         }
+        Some(Commands::Pull { model }) => {
+            commands::ensure_ollama(&client).await?;
+            commands::pull(&client, model).await?;
+        }
         None => {
             commands::ensure_ollama(&client).await?;
             commands::run_agent_or_tui(&cli, &client, &cli.task).await?;

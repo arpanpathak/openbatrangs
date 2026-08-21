@@ -10,22 +10,9 @@ use crate::cli::AgentMode;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
 
-/// What `/model <name>` should do after checking installed tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelCommandAction {
-    /// The model is already installed; just switch to it.
-    Activate,
-    /// The model is missing; pull it before switching.
-    Pull,
-}
-
-/// Decide whether to activate or pull a requested model (pure and testable).
-fn model_action(tags: &[OllamaModel], requested: &str) -> ModelCommandAction {
-    if tags.iter().any(|model| model.name == requested) {
-        ModelCommandAction::Activate
-    } else {
-        ModelCommandAction::Pull
-    }
+/// True when a model tag is already installed locally (pure and testable).
+fn model_installed(tags: &[OllamaModel], requested: &str) -> bool {
+    tags.iter().any(|model| model.name == requested)
 }
 
 impl App {
@@ -40,6 +27,7 @@ impl App {
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
             "model" => self.handle_model_command(client, arg).await?,
+            "pull" => self.handle_pull_command(client, arg).await?,
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
             "steps" => self.handle_steps_command(arg),
@@ -61,9 +49,8 @@ impl App {
         self.log.push("Commands:".to_string());
         self.log
             .push("  /help, /exit, /quit, /setup, /models".to_string());
-        self.log.push(
-            "  /model <tag> (auto-pulls if missing), /read-only, /confirm, /perf".to_string(),
-        );
+        self.log
+            .push("  /pull <tag>, /model <tag>, /read-only, /confirm, /perf".to_string());
         self.log
             .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log.push(
@@ -106,9 +93,12 @@ impl App {
         }
 
         let tags = client.tags().await?;
-        match model_action(&tags, arg) {
-            ModelCommandAction::Activate => self.activate_model(client, arg).await,
-            ModelCommandAction::Pull => self.pull_and_activate_model(client, arg).await,
+        if model_installed(&tags, arg) {
+            self.activate_model(client, arg).await;
+        } else {
+            self.log.push(format!(
+                "❌ Model '{arg}' is not installed. Pull it first with /pull {arg}."
+            ));
         }
         Ok(())
     }
@@ -128,7 +118,17 @@ impl App {
         self.refresh_model_info(client).await;
     }
 
-    async fn pull_and_activate_model(&mut self, client: &OllamaClient, name: &str) {
+    async fn handle_pull_command(
+        &mut self,
+        client: &OllamaClient,
+        arg: &str,
+    ) -> anyhow::Result<()> {
+        let name = arg.trim();
+        if name.is_empty() {
+            self.log.push("Usage: /pull <model-tag>".to_string());
+            return Ok(());
+        }
+
         self.log.push(format!("⬇️  Pulling model '{name}'..."));
         let messages = std::sync::Mutex::new(Vec::new());
         let result = client
@@ -144,12 +144,13 @@ impl App {
         match result {
             Ok(()) => {
                 self.log.push(format!("✅ Model ready: {name}"));
-                self.activate_model(client, name).await;
+                self.log.push(format!("Now select it with /model {name}"));
             }
             Err(error) => self
                 .log
                 .push(format!("❌ Failed to pull model '{name}': {error:#}")),
         }
+        Ok(())
     }
 
     fn toggle_read_only(&mut self) {
@@ -327,25 +328,19 @@ mod tests {
     }
 
     #[test]
-    fn model_action_activates_installed_models() {
+    fn model_installed_detects_existing_tags() {
         let tags = vec![installed_model("qwen2.5-coder:7b")];
-        assert_eq!(
-            model_action(&tags, "qwen2.5-coder:7b"),
-            ModelCommandAction::Activate
-        );
+        assert!(model_installed(&tags, "qwen2.5-coder:7b"));
     }
 
     #[test]
-    fn model_action_pulls_missing_models() {
+    fn model_installed_false_for_missing_tags() {
         let tags = vec![installed_model("qwen2.5-coder:7b")];
-        assert_eq!(model_action(&tags, "llama3.2:3b"), ModelCommandAction::Pull);
+        assert!(!model_installed(&tags, "llama3.2:3b"));
     }
 
     #[test]
-    fn model_action_pulls_when_no_models_installed() {
-        assert_eq!(
-            model_action(&[], "qwen2.5-coder:7b"),
-            ModelCommandAction::Pull
-        );
+    fn model_installed_false_with_no_models() {
+        assert!(!model_installed(&[], "qwen2.5-coder:7b"));
     }
 }

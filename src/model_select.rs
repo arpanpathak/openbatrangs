@@ -111,7 +111,7 @@ async fn select_explicit_model(
         .iter()
         .find(|model| model.name == explicit)
         .ok_or_else(|| {
-            anyhow!("Model '{explicit}' is not installed. Run `openbatrangs setup` to auto-install a model.")
+            anyhow!("Model '{explicit}' is not installed. Run `openbatrangs pull {explicit}` to download it.")
         })?;
     models::score_model(model, mem_budget, min_context)
         .ok_or_else(|| anyhow!("model '{explicit}' has context below --min-context"))

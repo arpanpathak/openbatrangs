@@ -8,6 +8,7 @@ pub const COMMANDS: &[&str] = &[
     "setup",
     "models",
     "model",
+    "pull",
     "read-only",
     "confirm",
     "steps",

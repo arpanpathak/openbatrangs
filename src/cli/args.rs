@@ -68,6 +68,12 @@ pub(crate) enum Commands {
     Doctor,
     /// Install/start Ollama and pull a recommended coding model.
     Setup,
+    /// Pull a model tag from the Ollama registry.
+    Pull {
+        /// Model tag, e.g. `samantha-mistral:7b`.
+        #[arg(value_name = "MODEL")]
+        model: String,
+    },
 }
 
 #[cfg(test)]
@@ -131,5 +137,14 @@ mod tests {
     fn parses_doctor_subcommand() {
         let cli = Cli::parse_from(["openbatrangs", "doctor"]);
         assert!(matches!(cli.command, Some(Commands::Doctor)));
+    }
+
+    #[test]
+    fn parses_pull_subcommand_with_model() {
+        let cli = Cli::parse_from(["openbatrangs", "pull", "samantha-mistral:7b"]);
+        match cli.command {
+            Some(Commands::Pull { model }) => assert_eq!(model, "samantha-mistral:7b"),
+            _ => panic!("expected pull subcommand"),
+        }
     }
 }
