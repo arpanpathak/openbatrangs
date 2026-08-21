@@ -193,7 +193,7 @@ impl OllamaClient {
             .post(format!("{}{API_PULL_PATH}", self.base_url))
             .json(&PullRequest {
                 name: name.to_string(),
-                stream: false,
+                stream: true,
             })
             .send()
             .await
@@ -205,16 +205,28 @@ impl OllamaClient {
             return Err(anyhow!("Ollama /api/pull returned HTTP {status}: {text}"));
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .context("failed to parse Ollama /api/pull response")?;
-        let status = body
-            .get("status")
-            .and_then(|value| value.as_str())
-            .unwrap_or("done");
-        on_status(&format!("✅ Pull finished: {status}"));
-        Ok(())
+        let mut byte_stream = Box::pin(response.bytes_stream());
+        let mut buffer = String::new();
+        while let Some(bytes) = byte_stream.next().await {
+            let bytes = bytes.context("failed to read Ollama /api/pull stream")?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(event) = stream::drain_pull_line(&mut buffer) {
+                match event {
+                    stream::PullLine::Status(status) => on_status(&status),
+                    stream::PullLine::Error(error) => {
+                        return Err(anyhow!("Ollama /api/pull failed: {error}"));
+                    }
+                    stream::PullLine::Done => {
+                        on_status("✅ Pull finished");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "Ollama /api/pull stream ended before reporting success"
+        ))
     }
 }
 

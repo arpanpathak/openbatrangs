@@ -68,7 +68,7 @@ pub struct ChatRequest {
 pub struct PullRequest {
     /// Model tag to download, e.g. `qwen2.5-coder:3b`.
     pub name: String,
-    /// Whether to stream pull progress. We use `false` for simplicity.
+    /// Whether to stream pull progress as NDJSON status events.
     pub stream: bool,
 }
 

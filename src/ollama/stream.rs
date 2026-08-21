@@ -1,4 +1,4 @@
-//! NDJSON stream parsing for `POST /api/chat`.
+//! NDJSON stream parsing for Ollama chat and model pull endpoints.
 
 use super::types::StreamLine;
 use serde_json::Value;
@@ -49,6 +49,56 @@ fn parse_stream_line(line: &str) -> Option<StreamLine> {
         return Some(StreamLine::Done);
     }
     None
+}
+
+/// A meaningful event from an Ollama `/api/pull` NDJSON stream.
+pub(super) enum PullLine {
+    /// Human-readable status, possibly including download percentage.
+    Status(String),
+    /// The pull finished successfully.
+    Done,
+    /// The pull failed with a server-provided error message.
+    Error(String),
+}
+
+/// Consume complete lines from a pull stream buffer, returning the first event.
+pub(super) fn drain_pull_line(buffer: &mut String) -> Option<PullLine> {
+    while let Some(newline_pos) = buffer.find('\n') {
+        let line = buffer[..newline_pos].trim().to_string();
+        *buffer = buffer[newline_pos + 1..].to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(event) = parse_pull_line(&line) {
+            return Some(event);
+        }
+    }
+    None
+}
+
+/// Parse one NDJSON line from an Ollama pull stream.
+fn parse_pull_line(line: &str) -> Option<PullLine> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+
+    if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
+        return Some(PullLine::Error(error.to_string()));
+    }
+
+    let status = value.get("status").and_then(|value| value.as_str())?;
+    if status == "success" {
+        return Some(PullLine::Done);
+    }
+
+    let progress = match (
+        value.get("completed").and_then(|value| value.as_u64()),
+        value.get("total").and_then(|value| value.as_u64()),
+    ) {
+        (Some(completed), Some(total)) if total > 0 => {
+            format!(" {:.0}%", completed as f64 * 100.0 / total as f64)
+        }
+        _ => String::new(),
+    };
+    Some(PullLine::Status(format!("{status}{progress}")))
 }
 
 #[cfg(test)]
@@ -120,5 +170,58 @@ mod tests {
             drain_complete_lines(&mut buffer),
             LineDrain::NeedMore
         ));
+    }
+
+    #[test]
+    fn parses_pull_status_with_progress_percentage() {
+        let line = r#"{"status":"downloading","digest":"abc","total":100,"completed":25}"#;
+        match parse_pull_line(line) {
+            Some(PullLine::Status(status)) => {
+                assert!(status.starts_with("downloading"));
+                assert!(status.contains("25%"));
+            }
+            _ => panic!("expected pull status with progress"),
+        }
+    }
+
+    #[test]
+    fn parses_pull_success_as_done() {
+        let line = r#"{"status":"success"}"#;
+        assert!(matches!(parse_pull_line(line), Some(PullLine::Done)));
+    }
+
+    #[test]
+    fn parses_pull_error() {
+        let line = r#"{"error":"model not found"}"#;
+        match parse_pull_line(line) {
+            Some(PullLine::Error(error)) => assert_eq!(error, "model not found"),
+            _ => panic!("expected pull error"),
+        }
+    }
+
+    #[test]
+    fn parses_pull_status_without_progress_fields() {
+        let line = r#"{"status":"pulling manifest"}"#;
+        match parse_pull_line(line) {
+            Some(PullLine::Status(status)) => assert_eq!(status, "pulling manifest"),
+            _ => panic!("expected pull status"),
+        }
+    }
+
+    #[test]
+    fn drains_pull_lines_in_order_and_skips_garbage() {
+        let mut buffer = String::from(
+            "not json\n{\"status\":\"pulling manifest\"}\n{\"status\":\"downloading\",\"total\":10,\"completed\":5}\n{\"status\":\"success\"}\n",
+        );
+        assert!(matches!(
+            drain_pull_line(&mut buffer),
+            Some(PullLine::Status(status)) if status == "pulling manifest"
+        ));
+        assert!(matches!(
+            drain_pull_line(&mut buffer),
+            Some(PullLine::Status(status)) if status.starts_with("downloading") && status.contains("50%")
+        ));
+        assert!(matches!(drain_pull_line(&mut buffer), Some(PullLine::Done)));
+        assert!(drain_pull_line(&mut buffer).is_none());
     }
 }
