@@ -324,6 +324,9 @@ impl App {
             {
                 self.cancel_task();
             }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_newline();
+            }
             KeyCode::Char(character) if character != '\r' => self.insert_char(character),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),

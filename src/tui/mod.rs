@@ -18,7 +18,10 @@ use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -80,7 +83,7 @@ const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 const CHAT_SCROLL_STEP: usize = 5;
 /// Banner height: wordmark + Batman art + quote + model info + prompt.
-const COMPACT_BANNER_HEIGHT: u16 = 22;
+const COMPACT_BANNER_HEIGHT: u16 = 23;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 const CHAT_SYSTEM_PROMPT: &str =
@@ -266,7 +269,16 @@ pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
     terminal.hide_cursor()?;
@@ -277,6 +289,7 @@ fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>)
     terminal.show_cursor()?;
     execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
