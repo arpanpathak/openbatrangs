@@ -843,7 +843,11 @@ async fn run_agent_worker(
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     let mem_budget = crate::calculate_memory_budget();
-    let selected = resolve_model(&client, &model_slot, &prefs, mem_budget).await?;
+    let progress_tx = tx.clone();
+    let on_status = move |msg: &str| {
+        let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
+    };
+    let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
     let model_context = resolve_model_context(&client, &selected.name).await?;
     let agent_config = AgentConfig {
         cwd: config.cwd,

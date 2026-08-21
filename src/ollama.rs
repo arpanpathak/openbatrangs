@@ -255,11 +255,14 @@ impl OllamaClient {
     ///
     /// # Arguments
     /// - `name`: model tag to pull, e.g. `qwen2.5-coder:3b`.
+    /// - `on_status`: callback invoked with progress messages.
     ///
     /// # Returns
     /// `Ok(())` once the pull finishes successfully.
-    pub async fn pull(&self, name: &str) -> Result<()> {
-        println!("⬇️  Pulling model '{name}' from Ollama registry...");
+    pub async fn pull(&self, name: &str, on_status: &(dyn Fn(&str) + Sync)) -> Result<()> {
+        on_status(&format!(
+            "⬇️  Pulling model '{name}' from Ollama registry..."
+        ));
         let response = self
             .http
             .post(format!("{}/api/pull", self.base_url))
@@ -285,7 +288,7 @@ impl OllamaClient {
             .get("status")
             .and_then(|value| value.as_str())
             .unwrap_or("done");
-        println!("✅ Pull finished: {status}");
+        on_status(&format!("✅ Pull finished: {status}"));
         Ok(())
     }
 }

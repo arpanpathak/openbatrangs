@@ -294,18 +294,17 @@ fn read_memory_mb() -> MemoryStats {
     let mut reclaimable_kb = 0u64;
     let mut shared_kb = 0u64;
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total_kb = parse_kibibytes(rest);
-        } else if let Some(rest) = line.strip_prefix("MemFree:") {
-            free_kb = parse_kibibytes(rest);
-        } else if let Some(rest) = line.strip_prefix("Buffers:") {
-            buffers_kb = parse_kibibytes(rest);
-        } else if let Some(rest) = line.strip_prefix("Cached:") {
-            cached_kb = parse_kibibytes(rest);
-        } else if let Some(rest) = line.strip_prefix("SReclaimable:") {
-            reclaimable_kb = parse_kibibytes(rest);
-        } else if let Some(rest) = line.strip_prefix("NvMapMemUsed:") {
-            shared_kb = parse_kibibytes(rest);
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "MemTotal" => total_kb = parse_kibibytes(value),
+            "MemFree" => free_kb = parse_kibibytes(value),
+            "Buffers" => buffers_kb = parse_kibibytes(value),
+            "Cached" => cached_kb = parse_kibibytes(value),
+            "SReclaimable" => reclaimable_kb = parse_kibibytes(value),
+            "NvMapMemUsed" => shared_kb = parse_kibibytes(value),
+            _ => {}
         }
     }
     let total_mb = total_kb / 1024;

@@ -283,7 +283,7 @@ async fn setup(client: &OllamaClient) -> Result<()> {
     let fallback = models::recommended_fallback_model(mem_budget);
     let tags = client.tags().await?;
     if !tags.iter().any(|model| model.name == fallback) {
-        client.pull(fallback).await?;
+        client.pull(fallback, &|msg| println!("{msg}")).await?;
     }
     println!("✅ Setup complete. Default coding model: {fallback}");
     println!("   Start chatting: openbatrangs");
@@ -346,7 +346,10 @@ async fn run_agent_task(
     }
 
     let mem_budget = calculate_memory_budget();
-    let selected = resolve_model(client, model_slot, prefs, mem_budget).await?;
+    let selected = resolve_model(client, model_slot, prefs, mem_budget, &|msg| {
+        println!("{msg}")
+    })
+    .await?;
     *model_slot = Some(selected.name.clone());
 
     let model_context = resolve_model_context(client, &selected.name).await?;
@@ -392,6 +395,7 @@ pub(crate) async fn resolve_model(
     model_slot: &Option<String>,
     prefs: &ModelPrefs,
     mem_budget: u64,
+    on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<ModelScore> {
     match model_slot {
         Some(name) => {
@@ -399,9 +403,9 @@ pub(crate) async fn resolve_model(
                 model: Some(name.clone()),
                 ..prefs.clone()
             };
-            select_model(client, &explicit, mem_budget).await
+            select_model(client, &explicit, mem_budget, on_status).await
         }
-        None => select_model(client, prefs, mem_budget).await,
+        None => select_model(client, prefs, mem_budget, on_status).await,
     }
 }
 
@@ -418,6 +422,7 @@ async fn select_model(
     client: &OllamaClient,
     prefs: &ModelPrefs,
     mem_budget: u64,
+    on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<ModelScore> {
     let mut attempts = 0u32;
     loop {
@@ -432,33 +437,34 @@ async fn select_model(
 
         let tags = client.tags().await?;
         if tags.is_empty() {
-            if prefs.is_auto_pull_disabled {
-                bail!("no models installed and --no-auto-pull is set");
+            match prefs.is_auto_pull_disabled {
+                true => bail!("no models installed and --no-auto-pull is set"),
+                false => pull_fallback(client, mem_budget, on_status).await?,
             }
-            pull_fallback(client, mem_budget).await?;
             continue;
         }
 
         let scored = models::score_models(&tags, mem_budget, prefs.min_context);
-        if let Some(best) = scored.first() {
-            if best.score < GOOD_MODEL_SCORE_THRESHOLD && !prefs.is_auto_pull_disabled {
-                println!(
+        match scored.first() {
+            Some(best)
+                if best.score < GOOD_MODEL_SCORE_THRESHOLD && !prefs.is_auto_pull_disabled =>
+            {
+                on_status(&format!(
                     "⚠️  Best local model '{}' scores {:.0}/100 for agentic coding.",
                     best.name, best.score
-                );
-                pull_fallback(client, mem_budget).await?;
+                ));
+                pull_fallback(client, mem_budget, on_status).await?;
                 continue;
             }
-            return Ok(best.clone());
+            Some(best) => return Ok(best.clone()),
+            None if prefs.is_auto_pull_disabled => {
+                bail!(
+                    "no installed model meets --min-context={}",
+                    prefs.min_context
+                );
+            }
+            None => pull_fallback(client, mem_budget, on_status).await?,
         }
-
-        if prefs.is_auto_pull_disabled {
-            bail!(
-                "no installed model meets --min-context={}",
-                prefs.min_context
-            );
-        }
-        pull_fallback(client, mem_budget).await?;
     }
 }
 
@@ -486,11 +492,15 @@ async fn select_explicit_model(
         .ok_or_else(|| anyhow!("model '{explicit}' has context below --min-context"))
 }
 
-/// Pull the recommended fallback model and print progress.
-async fn pull_fallback(client: &OllamaClient, mem_budget: u64) -> Result<()> {
+/// Pull the recommended fallback model and report progress.
+async fn pull_fallback(
+    client: &OllamaClient,
+    mem_budget: u64,
+    on_status: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
     let fallback = models::recommended_fallback_model(mem_budget);
-    println!("⬇️  Pulling a better default: {fallback}");
-    client.pull(fallback).await
+    on_status(&format!("⬇️  Pulling a better default: {fallback}"));
+    client.pull(fallback, on_status).await
 }
 
 /// Resolve the context length of a model from Ollama metadata.
