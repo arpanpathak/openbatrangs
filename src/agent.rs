@@ -7,11 +7,27 @@ use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const CYAN: &str = "\x1b[36m";
-const MAGENTA: &str = "\x1b[35m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+/// Colors used by the stdout reporter. The TUI reporter strips these before rendering.
+const COLOR_CYAN: &str = "\x1b[36m";
+const COLOR_MAGENTA: &str = "\x1b[35m";
+const COLOR_BOLD: &str = "\x1b[1m";
+const COLOR_DIM: &str = "\x1b[2m";
+const COLOR_RESET: &str = "\x1b[0m";
+
+/// Model context window caps.
+const MAX_CONTEXT_TOKENS: u64 = 32_768;
+const MIN_CONTEXT_TOKENS: u64 = 4_096;
+
+/// Tool argument defaults.
+const DEFAULT_READ_CHARS: usize = 8_000;
+const DEFAULT_GREP_MAX_RESULTS: usize = 200;
+const COMMAND_TIMEOUT_SECONDS: u64 = 120;
+
+/// Conversation trimming keeps the system message, the initial task, and this many recent exchanges.
+const MAX_HISTORY_MESSAGES: usize = 40;
+
+/// Sampling temperature for agentic tool-calling determinism.
+const AGENT_TEMPERATURE: f64 = 0.2;
 
 /// Receives agent output. `line` is a complete line; `chunk` is streaming text
 /// that should be appended to the current live line.
@@ -50,6 +66,79 @@ pub struct AgentConfig {
 struct ToolCall {
     name: String,
     arguments: Value,
+}
+
+/// Typed, exhaustively-matched representation of every tool the agent can invoke.
+#[derive(Debug)]
+enum Tool {
+    ListFiles {
+        path: String,
+    },
+    ReadFile {
+        path: String,
+        max_chars: usize,
+    },
+    GrepFiles {
+        pattern: String,
+        path: String,
+        max_results: usize,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    RunCommand {
+        command: String,
+    },
+    Finish {
+        summary: String,
+    },
+}
+
+impl Tool {
+    fn from_call(call: ToolCall) -> Result<Self> {
+        let args = &call.arguments;
+        match call.name.as_str() {
+            "list_files" => Ok(Self::ListFiles {
+                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
+            }),
+            "read_file" => Ok(Self::ReadFile {
+                path: required_string_arg(args, "path", "read_file")?.to_string(),
+                max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
+                    as usize,
+            }),
+            "grep_files" => Ok(Self::GrepFiles {
+                pattern: required_string_arg(args, "pattern", "grep_files")?.to_string(),
+                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
+                max_results: optional_u64_arg(args, "max_results")?
+                    .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
+                    as usize,
+            }),
+            "write_file" => Ok(Self::WriteFile {
+                path: required_string_arg(args, "path", "write_file")?.to_string(),
+                content: required_string_arg(args, "content", "write_file")?.to_string(),
+            }),
+            "run_command" => Ok(Self::RunCommand {
+                command: required_string_arg(args, "command", "run_command")?.to_string(),
+            }),
+            "finish" => Ok(Self::Finish {
+                summary: string_arg(args, "summary")?.unwrap_or("done").to_string(),
+            }),
+            other => bail!("unknown tool: {other}"),
+        }
+    }
+
+    /// Human-readable one-line description shown before the tool executes.
+    fn describe(&self) -> String {
+        match self {
+            Self::ListFiles { path } => format!("list_files → {path}"),
+            Self::ReadFile { path, .. } => format!("read_file → {path}"),
+            Self::GrepFiles { pattern, path, .. } => format!("grep_files → {pattern:?} in {path}"),
+            Self::WriteFile { path, .. } => format!("write_file → {path}"),
+            Self::RunCommand { command } => format!("run_command → {command}"),
+            Self::Finish { .. } => "finish".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,179 +188,70 @@ pub async fn run_agent<R: Reporter>(
     task: &str,
     reporter: &mut R,
 ) -> Result<()> {
-    let cwd = config.cwd.clone();
-    if !cwd.is_dir() {
-        bail!("working directory does not exist: {}", cwd.display());
-    }
+    ensure_workspace_exists(&config.cwd)?;
 
-    let num_ctx = model_context.min(32768).max(4096) as u64;
-    let initial_listing =
-        tools::list_files(&cwd, ".", 5).unwrap_or_else(|e| format!("(could not list files: {e})"));
-
-    let user_content = format!(
-        "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
-        cwd.display(),
-        initial_listing,
-        task
-    );
-
-    let mut messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: SYSTEM_PROMPT.to_string(),
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: user_content,
-        },
-    ];
-
+    let num_ctx = model_context.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
+    let mut messages = initial_messages(&config.cwd, task);
     let mut changed_files: Vec<String> = Vec::new();
 
     for step in 1..=config.max_steps {
         reporter.line(format!(
-            "\n{BOLD}{CYAN}🦇 Step {step}/{max}{RESET} — model: {BOLD}{model}{RESET}",
-            BOLD = BOLD,
-            CYAN = CYAN,
-            RESET = RESET,
-            step = step,
-            max = config.max_steps,
-            model = model
+            "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}",
+            max = config.max_steps
         ));
 
-        let req = ChatRequest {
-            model: model.to_string(),
-            messages: messages.clone(),
-            stream: false,
-            format: Some(Value::String("json".to_string())),
-            options: Some(serde_json::json!({
-                "temperature": 0.2,
-                "num_ctx": num_ctx,
-            })),
-        };
+        let request = chat_request(model, &messages, num_ctx);
+        let (content, answer_was_streamed) = stream_model_response(client, request, reporter)
+            .await
+            .with_context(|| format!("model call failed at step {step}"))?;
 
-        let mut stream = Box::pin(
-            client
-                .chat_stream(req)
-                .await
-                .with_context(|| format!("model call failed at step {step}"))?,
-        );
-
-        let mut buffer = String::new();
-        let mut thought_prefix_printed = false;
-        let mut thought_printed_len = 0usize;
-        let mut thought_complete = false;
-        let mut answer_prefix_printed = false;
-        let mut answer_printed_len = 0usize;
-        let mut answer_complete = false;
-        let mut answer_skipped = false;
-
-        while let Some(delta) = stream.next().await {
-            let delta = delta?;
-            buffer.push_str(&delta);
-
-            // If a top-level tool call exists before an answer key, don't try to
-            // stream an "answer" that might be inside tool arguments.
-            if !answer_skipped {
-                if let (Some(a_pos), Some(t_pos)) = (
-                    find_key_pos(&buffer, "answer"),
-                    find_key_pos(&buffer, "tool"),
-                ) {
-                    if t_pos < a_pos {
-                        answer_skipped = true;
-                    }
-                }
-            }
-
-            if !thought_complete {
-                if let Some((text, complete)) = extract_json_string(&buffer, "thought") {
-                    if !thought_prefix_printed && !text.is_empty() {
-                        reporter.chunk(format!("{}🧠 {}", CYAN, RESET));
-                        thought_prefix_printed = true;
-                    }
-                    if text.len() > thought_printed_len {
-                        reporter.chunk(text[thought_printed_len..].to_string());
-                        thought_printed_len = text.len();
-                    }
-                    if complete {
-                        thought_complete = true;
-                        reporter.line(String::new());
-                    }
-                }
-            }
-
-            if !answer_skipped && !answer_complete {
-                if let Some((text, complete)) = extract_json_string(&buffer, "answer") {
-                    if !answer_prefix_printed && !text.is_empty() {
-                        reporter.chunk(format!("\n\x1b[32m✅\x1b[0m "));
-                        answer_prefix_printed = true;
-                    }
-                    if text.len() > answer_printed_len {
-                        reporter.chunk(text[answer_printed_len..].to_string());
-                        answer_printed_len = text.len();
-                    }
-                    if complete {
-                        answer_complete = true;
-                        reporter.line(String::new());
-                    }
-                }
-            }
-        }
-
-        let content = buffer.trim().to_string();
-        let parsed = match parse_agent_response(&content) {
-            Ok(p) => p,
-            Err(e) => {
-                reporter.line(format!("\n⚠️  Could not parse model JSON: {e}"));
+        let response = match parse_agent_response(&content) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                reporter.line(format!("\n⚠️  Could not parse model JSON: {error}"));
                 reporter.line("Showing raw model output as the final response.".to_string());
                 reporter.line(format!("\n{content}"));
                 return Ok(());
             }
         };
 
-        if let Some(answer) = parsed.answer {
-            if !answer_prefix_printed {
+        if let Some(answer) = response.answer {
+            if !answer_was_streamed {
                 reporter.line(format!("\n\x1b[32m✅\x1b[0m {answer}"));
             }
-            print_changed_files(&cwd, &changed_files, reporter);
+            print_changed_files(&config.cwd, &changed_files, reporter);
             return Ok(());
         }
 
-        if let Some(tool_call) = parsed.tool {
-            // finish is a direct final response.
-            if tool_call.name == "finish" {
-                let summary = get_str(&tool_call.arguments, "summary")?.unwrap_or("done");
+        if let Some(tool_call) = response.tool {
+            let tool = Tool::from_call(tool_call)?;
+            if let Tool::Finish { summary } = &tool {
                 reporter.line(format!("\n\x1b[32m✅\x1b[0m {summary}"));
-                print_changed_files(&cwd, &changed_files, reporter);
+                print_changed_files(&config.cwd, &changed_files, reporter);
                 return Ok(());
             }
 
-            // Keep the raw JSON in history so the model sees exactly what it sent.
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: content.clone(),
             });
 
             reporter.line(format!(
-                "\n{}🔧 {}{}",
-                MAGENTA,
-                describe_tool(&tool_call),
-                RESET
+                "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
+                tool.describe()
             ));
-            let result = execute_tool(config, &cwd, &tool_call, &mut changed_files).await;
-            let result_text = match result {
-                Ok(text) => text,
-                Err(e) => format!("Tool error: {e:#}"),
-            };
-            reporter.line(format!("{}{}{}", DIM, result_text, RESET));
+            let result_text =
+                match execute_tool(config, &config.cwd, &tool, &mut changed_files).await {
+                    Ok(text) => text,
+                    Err(error) => format!("Tool error: {error:#}"),
+                };
+            reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: format!("Tool '{}' result:\n{}", tool_call.name, result_text),
+                content: format!("Tool result:\n{result_text}"),
             });
-
-            // Keep context bounded: drop the oldest tool exchange if history grows too large.
-            trim_messages(&mut messages, 40);
+            trim_messages(&mut messages, MAX_HISTORY_MESSAGES);
             continue;
         }
 
@@ -286,107 +266,191 @@ pub async fn run_agent<R: Reporter>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
+    if !cwd.is_dir() {
+        bail!("working directory does not exist: {}", cwd.display());
+    }
+    Ok(())
+}
+
+fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
+    let initial_listing = tools::list_files(cwd, ".", 5)
+        .unwrap_or_else(|error| format!("(could not list files: {error})"));
+    let user_content = format!(
+        "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
+        cwd.display(),
+        initial_listing,
+        task
+    );
+    vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: SYSTEM_PROMPT.to_string(),
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_content,
+        },
+    ]
+}
+
+fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        stream: false,
+        format: Some(Value::String("json".to_string())),
+        options: Some(serde_json::json!({
+            "temperature": AGENT_TEMPERATURE,
+            "num_ctx": num_ctx,
+        })),
+    }
+}
+
+/// Streams a model response, forwarding thought/answer text to the reporter,
+/// and returns the complete raw JSON content plus whether the answer was streamed.
+async fn stream_model_response<R: Reporter>(
+    client: &OllamaClient,
+    request: ChatRequest,
+    reporter: &mut R,
+) -> Result<(String, bool)> {
+    let mut stream = Box::pin(client.chat_stream(request).await?);
+    let mut buffer = String::new();
+    let mut thought = StreamState::new("thought");
+    let mut answer = StreamState::new("answer");
+
+    while let Some(delta) = stream.next().await {
+        let delta = delta?;
+        buffer.push_str(&delta);
+        thought.feed(reporter, &buffer)?;
+        answer.feed(reporter, &buffer)?;
+    }
+
+    let answer_was_streamed = answer.did_print();
+    Ok((buffer.trim().to_string(), answer_was_streamed))
+}
+
+/// Tracks incremental extraction of a JSON string field from a streaming buffer.
+struct StreamState {
+    key: &'static str,
+    prefix_printed: bool,
+    printed_len: usize,
+    complete: bool,
+    skipped: bool,
+}
+
+impl StreamState {
+    fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            prefix_printed: false,
+            printed_len: 0,
+            complete: false,
+            skipped: false,
+        }
+    }
+
+    fn feed<R: Reporter>(&mut self, reporter: &mut R, buffer: &str) -> Result<()> {
+        if self.complete || self.skipped {
+            return Ok(());
+        }
+
+        // If a top-level tool call exists before this field, don't stream it —
+        // it might be text inside tool arguments rather than the real field.
+        if let (Some(field_pos), Some(tool_pos)) =
+            (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
+        {
+            if tool_pos < field_pos {
+                self.skipped = true;
+                return Ok(());
+            }
+        }
+
+        if let Some((text, is_complete)) = extract_json_string(buffer, self.key) {
+            if !self.prefix_printed && !text.is_empty() {
+                reporter.chunk(self.prefix());
+                self.prefix_printed = true;
+            }
+            if text.len() > self.printed_len {
+                reporter.chunk(text[self.printed_len..].to_string());
+                self.printed_len = text.len();
+            }
+            if is_complete {
+                self.complete = true;
+                reporter.line(String::new());
+            }
+        }
+        Ok(())
+    }
+
+    fn prefix(&self) -> String {
+        match self.key {
+            "thought" => format!("{COLOR_CYAN}🧠 {COLOR_RESET}"),
+            "answer" => "\n\x1b[32m✅\x1b[0m ".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn did_print(&self) -> bool {
+        self.prefix_printed
+    }
+}
+
 async fn execute_tool(
     config: &AgentConfig,
     cwd: &Path,
-    tool: &ToolCall,
+    tool: &Tool,
     changed_files: &mut Vec<String>,
 ) -> Result<String> {
-    let name = tool.name.as_str();
-    let args = &tool.arguments;
-
-    match name {
-        "list_files" => {
-            let path = get_str(args, "path")?.unwrap_or(".");
-            tools::list_files(cwd, path, 5)
-        }
-        "read_file" => {
-            let path =
-                get_str(args, "path")?.ok_or_else(|| anyhow!("read_file requires 'path'"))?;
-            let max_chars = get_u64(args, "max_chars")?.unwrap_or(8000) as usize;
-            let max_chars = max_chars.min(tools::MAX_TOOL_OUTPUT);
+    match tool {
+        Tool::ListFiles { path } => tools::list_files(cwd, path, 5),
+        Tool::ReadFile { path, max_chars } => {
+            let max_chars = (*max_chars).min(tools::MAX_TOOL_OUTPUT);
             tools::read_file(cwd, path, max_chars)
         }
-        "grep_files" => {
-            let pattern = get_str(args, "pattern")?
-                .ok_or_else(|| anyhow!("grep_files requires 'pattern'"))?;
-            let path = get_str(args, "path")?.unwrap_or(".");
-            let max_results = get_u64(args, "max_results")?.unwrap_or(200) as usize;
-            tools::grep_files(cwd, pattern, path, max_results)
-        }
-        "write_file" => {
-            let path =
-                get_str(args, "path")?.ok_or_else(|| anyhow!("write_file requires 'path'"))?;
-            let content = get_str(args, "content")?
-                .ok_or_else(|| anyhow!("write_file requires 'content'"))?;
-            if config.read_only {
-                bail!("write_file is disabled in read-only mode");
-            }
+        Tool::GrepFiles {
+            pattern,
+            path,
+            max_results,
+        } => tools::grep_files(cwd, pattern, path, *max_results),
+        Tool::WriteFile { path, content } => {
+            ensure_not_read_only(config)?;
             confirm_or_abort(config, &format!("write file '{path}'?"))?;
             let result = tools::write_file(cwd, path, content)?;
-            changed_files.push(path.to_string());
+            changed_files.push(path.clone());
             Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
         }
-        "run_command" => {
-            let command = get_str(args, "command")?
-                .ok_or_else(|| anyhow!("run_command requires 'command'"))?;
-            if config.read_only {
-                bail!("run_command is disabled in read-only mode");
-            }
+        Tool::RunCommand { command } => {
+            ensure_not_read_only(config)?;
             confirm_or_abort(config, &format!("run command: {command}"))?;
-            tools::run_command(cwd, command, 120).await
+            tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS).await
         }
-        "finish" => {
-            let summary = get_str(args, "summary")?.unwrap_or("done");
-            Ok(format!("✅ {summary}"))
-        }
-        _ => bail!("unknown tool: {name}"),
+        Tool::Finish { summary } => Ok(format!("✅ {summary}")),
     }
 }
 
-/// Human-readable one-line description of what a tool call is about to do.
-fn describe_tool(tool: &ToolCall) -> String {
-    let name = tool.name.as_str();
-    let args = &tool.arguments;
-    match name {
-        "write_file" => {
-            let path = get_str(args, "path").ok().flatten().unwrap_or("?");
-            format!("write_file → {path}")
-        }
-        "read_file" => {
-            let path = get_str(args, "path").ok().flatten().unwrap_or("?");
-            format!("read_file → {path}")
-        }
-        "grep_files" => {
-            let pattern = get_str(args, "pattern").ok().flatten().unwrap_or("?");
-            let path = get_str(args, "path").ok().flatten().unwrap_or(".");
-            format!("grep_files → {pattern:?} in {path}")
-        }
-        "list_files" => {
-            let path = get_str(args, "path").ok().flatten().unwrap_or(".");
-            format!("list_files → {path}")
-        }
-        "run_command" => {
-            let cmd = get_str(args, "command").ok().flatten().unwrap_or("?");
-            format!("run_command → {cmd}")
-        }
-        "finish" => "finish".to_string(),
-        other => other.to_string(),
+fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
+    if config.read_only {
+        bail!("this tool is disabled in read-only mode");
     }
+    Ok(())
 }
 
-fn get_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+fn required_string_arg<'a>(args: &'a Value, key: &str, tool_name: &str) -> Result<&'a str> {
+    string_arg(args, key)?.ok_or_else(|| anyhow!("{tool_name} requires '{key}'"))
+}
+
+fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
     match args.get(key) {
-        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::String(value)) => Ok(Some(value)),
         Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("argument '{key}' must be a string"),
     }
 }
 
-fn get_u64(args: &Value, key: &str) -> Result<Option<u64>> {
+fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
-        Some(Value::Number(n)) => n
+        Some(Value::Number(number)) => number
             .as_u64()
             .map(Some)
             .ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer")),
@@ -418,9 +482,8 @@ fn parse_agent_response(content: &str) -> Result<AgentResponse> {
         .trim();
     let value: Value = serde_json::from_str(cleaned)
         .with_context(|| format!("invalid JSON from model: {content}"))?;
-    let resp: AgentResponse = serde_json::from_value(value)
-        .with_context(|| format!("JSON did not match agent schema: {content}"))?;
-    Ok(resp)
+    serde_json::from_value(value)
+        .with_context(|| format!("JSON did not match agent schema: {content}"))
 }
 
 fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
@@ -438,16 +501,16 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
     messages.extend(tail);
 }
 
-fn find_key_pos(buf: &str, key: &str) -> Option<usize> {
-    buf.find(&format!("\"{key}\""))
+fn find_key_pos(buffer: &str, key: &str) -> Option<usize> {
+    buffer.find(&format!("\"{key}\""))
 }
 
 /// Extract the current value of a JSON string field from a partial JSON buffer.
 /// Returns `(value_so_far, is_complete)`.
-fn extract_json_string(buf: &str, key: &str) -> Option<(String, bool)> {
+fn extract_json_string(buffer: &str, key: &str) -> Option<(String, bool)> {
     let key_pattern = format!("\"{key}\"");
-    let start = buf.find(&key_pattern)?;
-    let after_key = &buf[start + key_pattern.len()..];
+    let start = buffer.find(&key_pattern)?;
+    let after_key = &buffer[start + key_pattern.len()..];
     let after_key = after_key.trim_start();
     let after_key = after_key.strip_prefix(':')?.trim_start();
     let after_key = after_key.strip_prefix('"')?;
@@ -491,7 +554,7 @@ fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut
         return;
     }
     reporter.line("\n\x1b[1;33m📁 Files changed:\x1b[0m".to_string());
-    for f in files {
-        reporter.line(format!("   {}", clickable_path(cwd, f)));
+    for file in files {
+        reporter.line(format!("   {}", clickable_path(cwd, file)));
     }
 }

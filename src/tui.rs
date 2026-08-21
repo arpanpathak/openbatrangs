@@ -36,6 +36,15 @@ const COMMANDS: &[&str] = &[
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+const MAX_INPUT_LINES: usize = 5;
+const INPUT_BOX_PADDING: usize = 2;
+const MIN_INPUT_BOX_HEIGHT: usize = 3;
+const MAX_LIVE_CHARS: usize = 50_000;
+const TICK_MILLIS: u64 = 80;
+const SUGGESTIONS_HEIGHT: u16 = 4;
+const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;
+const MODEL_PICKER_HEIGHT_PERCENT: u16 = 40;
+
 enum UiEvent {
     Log(String),
     Chunk(String),
@@ -218,8 +227,8 @@ impl App {
             }
             UiEvent::Chunk(msg) => {
                 self.live.push_str(&msg);
-                if self.live.len() > 50_000 {
-                    self.live.truncate(50_000);
+                if self.live.len() > MAX_LIVE_CHARS {
+                    self.live.truncate(MAX_LIVE_CHARS);
                 }
             }
             UiEvent::Done(result) => {
@@ -519,7 +528,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(if app.suggestions().is_empty() { 0 } else { 4 }),
+            Constraint::Length(if app.suggestions().is_empty() {
+                0
+            } else {
+                SUGGESTIONS_HEIGHT
+            }),
             Constraint::Length(input_height(app) as u16),
         ])
         .split(f.area());
@@ -611,7 +624,11 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     // Model picker overlay
     if let Some(picker) = &app.picker {
-        let area = centered_rect(60, 40, f.area());
+        let area = centered_rect(
+            MODEL_PICKER_WIDTH_PERCENT,
+            MODEL_PICKER_HEIGHT_PERCENT,
+            f.area(),
+        );
         let items: Vec<ListItem> = picker
             .models
             .iter()
@@ -670,7 +687,7 @@ fn centered_rect(
 
 fn input_height(app: &App) -> usize {
     let lines = app.input.split('\n').count();
-    (lines.min(5) + 2).max(3)
+    (lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT)
 }
 
 pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
@@ -711,7 +728,7 @@ pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {
+            _ = tokio::time::sleep(Duration::from_millis(TICK_MILLIS)) => {
                 app.spinner_frame += 1;
             }
         }
