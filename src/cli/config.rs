@@ -40,6 +40,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) mode: AgentMode,
     /// Stream the model's internal reasoning in agent mode.
     pub(crate) show_thinking: bool,
+    /// Maximum context window sent to the model.
+    pub(crate) max_ctx: u64,
 }
 
 /// Build model-selection preferences from parsed CLI arguments.
@@ -60,6 +62,7 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         should_confirm: cli.should_confirm,
         mode: AgentMode::Agent,
         show_thinking: true,
+        max_ctx: cli.max_ctx,
     }
 }
 
@@ -99,6 +102,7 @@ mod tests {
         assert!(config.is_read_only);
         assert!(config.should_confirm);
         assert_eq!(config.max_steps, 4);
+        assert_eq!(config.max_ctx, 8_192);
     }
 
     #[test]

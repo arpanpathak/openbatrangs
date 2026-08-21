@@ -1,5 +1,6 @@
 //! Clap argument definitions and default values.
 
+use crate::constants::agent::MAX_CONTEXT_TOKENS;
 use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -49,6 +50,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value_t = DEFAULT_MIN_CONTEXT)]
     pub(crate) min_context: usize,
 
+    /// Maximum context window sent to the model (lower uses less memory).
+    #[arg(long = "max-ctx", global = true, default_value_t = MAX_CONTEXT_TOKENS)]
+    pub(crate) max_ctx: u64,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -88,6 +93,7 @@ mod tests {
         assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
         assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
         assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
+        assert_eq!(cli.max_ctx, MAX_CONTEXT_TOKENS);
         assert_eq!(cli.cwd, PathBuf::from("."));
         assert!(!cli.is_read_only);
         assert!(!cli.should_confirm);

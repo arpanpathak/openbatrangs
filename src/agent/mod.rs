@@ -15,7 +15,7 @@ mod stream;
 mod tool;
 
 use crate::constants::agent::{
-    AGENT_TEMPERATURE, MAX_CONTEXT_TOKENS, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
+    AGENT_TEMPERATURE, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
 };
 use crate::constants::ansi::{
     ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
@@ -38,6 +38,7 @@ pub struct AgentConfig {
     pub is_read_only: bool,
     pub should_confirm: bool,
     pub show_thinking: bool,
+    pub max_ctx: u64,
 }
 
 /// The outcome of one agent iteration.
@@ -66,7 +67,8 @@ pub async fn run_agent<R: Reporter>(
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
 
-    let num_ctx = model_context.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
+    let max_ctx = config.max_ctx.max(MIN_CONTEXT_TOKENS);
+    let num_ctx = model_context.clamp(MIN_CONTEXT_TOKENS, max_ctx);
     let mut messages = initial_messages(&config.cwd, task);
     let mut changed_files: Vec<String> = Vec::new();
 

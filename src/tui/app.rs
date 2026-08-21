@@ -106,6 +106,7 @@ impl App {
                 should_confirm: true,
                 mode: AgentMode::Agent,
                 show_thinking: true,
+                max_ctx: cli.max_ctx,
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,

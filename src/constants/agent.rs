@@ -1,7 +1,10 @@
 //! Agent loop tuning constants and the agent system prompt.
 
-/// Maximum context window used for agent requests.
-pub const MAX_CONTEXT_TOKENS: u64 = 16_384;
+/// Default maximum context window used for agent requests.
+///
+/// 8K is a memory-safe default for Jetson-class devices; override with
+/// `--max-ctx` when more context is needed.
+pub const MAX_CONTEXT_TOKENS: u64 = 8_192;
 
 /// Minimum context window used for agent requests.
 pub const MIN_CONTEXT_TOKENS: u64 = 4_096;

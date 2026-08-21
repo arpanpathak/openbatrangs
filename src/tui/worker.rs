@@ -3,7 +3,7 @@
 use super::text::strip_ansi;
 use crate::agent::{AgentConfig, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
-use crate::constants::agent::{MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS};
+use crate::constants::agent::MIN_CONTEXT_TOKENS;
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE, MAX_CHAT_HISTORY_MESSAGES};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
@@ -62,6 +62,7 @@ pub(crate) async fn run_agent_worker(
         is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
         show_thinking: config.show_thinking,
+        max_ctx: config.max_ctx,
     };
     let mut reporter = ChannelReporter { tx };
     crate::agent::run_agent(
@@ -78,7 +79,7 @@ pub(crate) async fn run_agent_worker(
 /// Run a plain chat completion: no tools, just conversation and code.
 async fn run_chat_worker(
     client: OllamaClient,
-    _config: AgentRunConfig,
+    config: AgentRunConfig,
     model_slot: Option<String>,
     prefs: ModelPrefs,
     _task: String,
@@ -91,9 +92,10 @@ async fn run_chat_worker(
         let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
     };
     let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
+    let max_ctx = config.max_ctx.max(MIN_CONTEXT_TOKENS);
     let num_ctx = resolve_model_context(&client, &selected.name)
         .await?
-        .clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
+        .clamp(MIN_CONTEXT_TOKENS, max_ctx);
 
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),

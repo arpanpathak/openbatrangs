@@ -148,6 +148,7 @@ mod tests {
             is_read_only: false,
             should_confirm: false,
             show_thinking: true,
+            max_ctx: 8_192,
         };
         let mut changed = Vec::new();
         execute_tool(
@@ -183,6 +184,7 @@ mod tests {
             is_read_only,
             should_confirm: false,
             show_thinking: true,
+            max_ctx: 8_192,
         }
     }
 
