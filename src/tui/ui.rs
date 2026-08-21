@@ -122,10 +122,10 @@ fn chat_scroll(app: &App, chat_text: &str, area_height: u16) -> u16 {
 }
 
 fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let mode_suffix = if app.run_config.mode == AgentMode::Plan {
-        " · plan"
-    } else {
-        ""
+    let mode_suffix = match app.run_config.mode {
+        AgentMode::Plan => " · plan",
+        AgentMode::Chat => " · chat",
+        AgentMode::Agent => "",
     };
     let status_line = if app.is_running {
         let spin = app.spinner();

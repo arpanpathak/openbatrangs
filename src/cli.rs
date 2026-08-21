@@ -96,6 +96,8 @@ pub(crate) enum AgentMode {
     Agent,
     /// Planning-only: read-only, no writes or shell commands.
     Plan,
+    /// Plain chat: no tools, just conversation and code.
+    Chat,
 }
 
 /// Runtime settings shared by the one-shot agent and the TUI worker.

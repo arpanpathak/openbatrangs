@@ -15,7 +15,7 @@ mod ui;
 use crate::agent::{AgentConfig, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
-use crate::ollama::OllamaClient;
+use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -84,6 +84,10 @@ const COMPACT_BANNER_HEIGHT: u16 = 6;
 const FULL_BANNER_HEIGHT: u16 = 19;
 /// Terminal height threshold for showing the full banner.
 const FULL_BANNER_MIN_HEIGHT: u16 = 30;
+
+/// Chat-mode system prompt: no tools, direct conversation and code.
+const CHAT_SYSTEM_PROMPT: &str =
+    "You are openBatarangs in chat mode. Answer coding questions, explain ideas, and write code when asked. Be concise, practical, and do not mention tools.";
 
 enum UiEvent {
     Log(String),
@@ -179,6 +183,10 @@ async fn run_agent_worker(
     task: String,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
+    if config.mode == AgentMode::Chat {
+        return run_chat_worker(client, config, model_slot, prefs, task, tx).await;
+    }
+
     let mem_budget = calculate_memory_budget();
     let progress_tx = tx.clone();
     let on_status = move |msg: &str| {
@@ -202,6 +210,53 @@ async fn run_agent_worker(
         &mut reporter,
     )
     .await
+}
+
+/// Run a plain chat completion: no tools, just conversation and code.
+async fn run_chat_worker(
+    client: OllamaClient,
+    _config: AgentRunConfig,
+    model_slot: Option<String>,
+    prefs: ModelPrefs,
+    task: String,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) -> Result<()> {
+    let mem_budget = calculate_memory_budget();
+    let progress_tx = tx.clone();
+    let on_status = move |msg: &str| {
+        let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
+    };
+    let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
+    let num_ctx = resolve_model_context(&client, &selected.name)
+        .await?
+        .clamp(4_096, 16_384);
+
+    let request = ChatRequest {
+        model: selected.name.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: CHAT_SYSTEM_PROMPT.to_string(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: task,
+            },
+        ],
+        stream: true,
+        format: None,
+        options: Some(serde_json::json!({
+            "temperature": 0.7,
+            "num_ctx": num_ctx,
+        })),
+    };
+
+    let mut stream = Box::pin(client.chat_stream(request).await?);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let _ = tx.send(UiEvent::Chunk(chunk));
+    }
+    Ok(())
 }
 
 pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {

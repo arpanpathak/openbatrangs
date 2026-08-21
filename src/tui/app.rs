@@ -490,7 +490,7 @@ impl App {
         self.log
             .push("  /model <tag>, /read-only, /confirm, /perf".to_string());
         self.log
-            .push("  /mode agent|plan, /steps <n>, /cwd <path>".to_string());
+            .push("  /mode agent|plan|chat, /steps <n>, /cwd <path>".to_string());
         self.log
             .push("  /doctor, /clear · Ctrl+C cancel · PgUp/PgDn scroll".to_string());
         self.log
@@ -572,9 +572,14 @@ impl App {
             "plan" => {
                 self.run_config.mode = AgentMode::Plan;
                 self.log
-                    .push("Mode: plan (read-only, no writes/commands)".to_string());
+                    .push("Mode: plan (read-only, explores and plans)".to_string());
             }
-            _ => self.log.push("Usage: /mode agent|plan".to_string()),
+            "chat" => {
+                self.run_config.mode = AgentMode::Chat;
+                self.log
+                    .push("Mode: chat (no tools, conversation + code)".to_string());
+            }
+            _ => self.log.push("Usage: /mode agent|plan|chat".to_string()),
         }
     }
 
