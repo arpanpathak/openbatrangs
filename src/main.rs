@@ -1,4 +1,5 @@
 mod agent;
+mod banner;
 mod models;
 mod ollama;
 mod tools;
@@ -106,6 +107,10 @@ async fn main() -> Result<()> {
     }
 
     ensure_ollama(&client).await?;
+
+    if matches!(&cli.command, None) || matches!(&cli.command, Some(Commands::Agent { .. })) {
+        banner::print_banner();
+    }
 
     match &cli.command {
         Some(Commands::ListModels) => list_models(&client, cli.min_context as u64).await?,

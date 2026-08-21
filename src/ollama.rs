@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -51,11 +52,13 @@ pub struct ChatRequest {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct ChatResponse {
     pub message: ChatResponseMessage,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct ChatResponseMessage {
     pub content: String,
 }
@@ -130,6 +133,7 @@ impl OllamaClient {
             .context("failed to parse Ollama /api/show response")?)
     }
 
+    #[allow(dead_code)]
     pub async fn chat(&self, req: ChatRequest) -> Result<ChatResponse> {
         let resp = self
             .http
@@ -150,6 +154,63 @@ impl OllamaClient {
             .await
             .context("failed to parse Ollama /api/chat response")?;
         Ok(body)
+    }
+
+    /// Stream Ollama chat completions as NDJSON content deltas.
+    pub async fn chat_stream(
+        &self,
+        mut req: ChatRequest,
+    ) -> Result<impl Stream<Item = Result<String>> + Send + 'static> {
+        req.stream = true;
+        let resp = self
+            .http
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&req)
+            .send()
+            .await
+            .context("failed to call Ollama /api/chat (stream)")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Ollama /api/chat returned HTTP {status}: {text}"));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = futures_util::stream::unfold(
+            (byte_stream, String::new()),
+            |(mut byte_stream, mut buf)| async move {
+                loop {
+                    match byte_stream.next().await {
+                        Some(Ok(bytes)) => {
+                            buf.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some(pos) = buf.find('\n') {
+                                let line = buf[..pos].trim().to_string();
+                                buf = buf[pos + 1..].to_string();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                                    if let Some(content) =
+                                        v.pointer("/message/content").and_then(|c| c.as_str())
+                                    {
+                                        return Some((Ok(content.to_string()), (byte_stream, buf)));
+                                    }
+                                    if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            return Some((Err(anyhow!("stream error: {e}")), (byte_stream, buf)));
+                        }
+                        None => return None,
+                    }
+                }
+            },
+        );
+        Ok(stream)
     }
 
     pub async fn pull(&self, name: &str) -> Result<()> {

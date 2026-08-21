@@ -1,10 +1,17 @@
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
 use anyhow::{anyhow, bail, Context, Result};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const CYAN: &str = "\x1b[36m";
+const MAGENTA: &str = "\x1b[35m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -23,6 +30,7 @@ struct ToolCall {
 #[derive(Debug, Deserialize)]
 struct AgentResponse {
     #[serde(default)]
+    #[allow(dead_code)]
     thought: Option<String>,
     #[serde(default)]
     tool: Option<ToolCall>,
@@ -92,8 +100,18 @@ pub async fn run_agent(
         },
     ];
 
+    let mut changed_files: Vec<String> = Vec::new();
+
     for step in 1..=config.max_steps {
-        println!("\n🧠 Step {step}/{} — model: {model}", config.max_steps);
+        println!(
+            "\n{BOLD}{CYAN}🦇 Step {step}/{max}{RESET} — model: {BOLD}{model}{RESET}",
+            BOLD = BOLD,
+            CYAN = CYAN,
+            RESET = RESET,
+            step = step,
+            max = config.max_steps,
+            model = model
+        );
 
         let req = ChatRequest {
             model: model.to_string(),
@@ -106,12 +124,77 @@ pub async fn run_agent(
             })),
         };
 
-        let resp = client
-            .chat(req)
-            .await
-            .with_context(|| format!("model call failed at step {step}"))?;
-        let content = resp.message.content.trim().to_string();
+        let mut stream = Box::pin(
+            client
+                .chat_stream(req)
+                .await
+                .with_context(|| format!("model call failed at step {step}"))?,
+        );
 
+        let mut buffer = String::new();
+        let mut thought_prefix_printed = false;
+        let mut thought_printed_len = 0usize;
+        let mut thought_complete = false;
+        let mut answer_prefix_printed = false;
+        let mut answer_printed_len = 0usize;
+        let mut answer_complete = false;
+        let mut answer_skipped = false;
+
+        while let Some(delta) = stream.next().await {
+            let delta = delta?;
+            buffer.push_str(&delta);
+
+            // If a top-level tool call exists before an answer key, don't try to
+            // stream an "answer" that might be inside tool arguments.
+            if !answer_skipped {
+                if let (Some(a_pos), Some(t_pos)) = (
+                    find_key_pos(&buffer, "answer"),
+                    find_key_pos(&buffer, "tool"),
+                ) {
+                    if t_pos < a_pos {
+                        answer_skipped = true;
+                    }
+                }
+            }
+
+            if !thought_complete {
+                if let Some((text, complete)) = extract_json_string(&buffer, "thought") {
+                    if !thought_prefix_printed && !text.is_empty() {
+                        print!("{}🧠 {}", CYAN, RESET);
+                        thought_prefix_printed = true;
+                    }
+                    if text.len() > thought_printed_len {
+                        print!("{}", &text[thought_printed_len..]);
+                        let _ = std::io::stdout().flush();
+                        thought_printed_len = text.len();
+                    }
+                    if complete {
+                        thought_complete = true;
+                        println!();
+                    }
+                }
+            }
+
+            if !answer_skipped && !answer_complete {
+                if let Some((text, complete)) = extract_json_string(&buffer, "answer") {
+                    if !answer_prefix_printed && !text.is_empty() {
+                        print!("\n{GREEN}✅ {RESET}", GREEN = "\x1b[32m");
+                        answer_prefix_printed = true;
+                    }
+                    if text.len() > answer_printed_len {
+                        print!("{}", &text[answer_printed_len..]);
+                        let _ = std::io::stdout().flush();
+                        answer_printed_len = text.len();
+                    }
+                    if complete {
+                        answer_complete = true;
+                        println!();
+                    }
+                }
+            }
+        }
+
+        let content = buffer.trim().to_string();
         let parsed = match parse_agent_response(&content) {
             Ok(p) => p,
             Err(e) => {
@@ -122,12 +205,11 @@ pub async fn run_agent(
             }
         };
 
-        if let Some(thought) = parsed.thought.as_deref() {
-            println!("🧠 {thought}");
-        }
-
         if let Some(answer) = parsed.answer {
-            println!("\n✅ {answer}");
+            if !answer_prefix_printed {
+                println!("\n\x1b[32m✅\x1b[0m {answer}");
+            }
+            print_changed_files(&cwd, &changed_files);
             return Ok(());
         }
 
@@ -135,7 +217,8 @@ pub async fn run_agent(
             // finish is a direct final response.
             if tool_call.name == "finish" {
                 let summary = get_str(&tool_call.arguments, "summary")?.unwrap_or("done");
-                println!("\n✅ {summary}");
+                println!("\n\x1b[32m✅\x1b[0m {summary}");
+                print_changed_files(&cwd, &changed_files);
                 return Ok(());
             }
 
@@ -145,14 +228,13 @@ pub async fn run_agent(
                 content: content.clone(),
             });
 
-            let result = execute_tool(config, &cwd, &tool_call).await;
+            println!("\n{}🔧 {}{}", MAGENTA, tool_call.name, RESET);
+            let result = execute_tool(config, &cwd, &tool_call, &mut changed_files).await;
             let result_text = match result {
                 Ok(text) => text,
                 Err(e) => format!("Tool error: {e:#}"),
             };
-
-            println!("\n🔧 Tool '{}' ->", tool_call.name);
-            println!("{}", result_text);
+            println!("{}{}{}", DIM, result_text, RESET);
 
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -175,10 +257,12 @@ pub async fn run_agent(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool(
     config: &AgentConfig,
-    cwd: &std::path::Path,
+    cwd: &Path,
     tool: &ToolCall,
+    changed_files: &mut Vec<String>,
 ) -> Result<String> {
     let name = tool.name.as_str();
     let args = &tool.arguments;
@@ -211,7 +295,9 @@ async fn execute_tool(
                 bail!("write_file is disabled in read-only mode");
             }
             confirm_or_abort(config, &format!("write file '{path}'?"))?;
-            tools::write_file(cwd, path, content)
+            let result = tools::write_file(cwd, path, content)?;
+            changed_files.push(path.to_string());
+            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
         }
         "run_command" => {
             let command = get_str(args, "command")?
@@ -290,4 +376,61 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
     messages.push(system);
     messages.push(first_user);
     messages.extend(tail);
+}
+
+fn find_key_pos(buf: &str, key: &str) -> Option<usize> {
+    buf.find(&format!("\"{key}\""))
+}
+
+/// Extract the current value of a JSON string field from a partial JSON buffer.
+/// Returns `(value_so_far, is_complete)`.
+fn extract_json_string(buf: &str, key: &str) -> Option<(String, bool)> {
+    let key_pattern = format!("\"{key}\"");
+    let start = buf.find(&key_pattern)?;
+    let after_key = &buf[start + key_pattern.len()..];
+    let after_key = after_key.trim_start();
+    let after_key = after_key.strip_prefix(':')?.trim_start();
+    let after_key = after_key.strip_prefix('"')?;
+
+    let mut out = String::new();
+    let mut complete = false;
+    let mut chars = after_key.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.push('\\');
+                    out.push(n);
+                }
+            }
+            '"' => {
+                complete = true;
+                break;
+            }
+            _ => out.push(c),
+        }
+    }
+    Some((out, complete))
+}
+
+/// Terminal-clickable file path (OSC 8 hyperlink).
+fn clickable_path(cwd: &Path, path: &str) -> String {
+    let full = cwd.join(path);
+    let display = full.to_string_lossy();
+    let encoded = display
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    format!("\x1b]8;;file://{encoded}\x1b\\{display}\x1b]8;;\x1b\\")
+}
+
+fn print_changed_files(cwd: &Path, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
+    println!("\n\x1b[1;33m📁 Files changed:\x1b[0m");
+    for f in files {
+        println!("   {}", clickable_path(cwd, f));
+    }
 }

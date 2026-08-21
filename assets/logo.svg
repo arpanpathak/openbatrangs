@@ -45,17 +45,17 @@
   <!-- Batarang weapon silhouette -->
   <g filter="url(#glow)">
     <path
-      d="M256 120
-         L230 84 L224 140 L96 120 L140 170 L84 210 L140 240 L100 290 L180 280 L256 320
-         L332 280 L412 290 L372 240 L428 210 L372 170 L288 140 L282 84 Z"
+      d="M256 160
+         L244 130 L252 165 L56 190 L120 215 L90 235 L170 240 L256 260
+         L342 240 L422 235 L392 215 L456 190 L260 165 L268 130 Z"
       fill="url(#batarang)"
       stroke="url(#accent)"
       stroke-width="4"
       stroke-linejoin="round"/>
   </g>
 
-  <!-- terminal caret inside the weapon body -->
-  <text x="256" y="272" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="42" font-weight="700" fill="#22d3ee">&gt;_</text>
+  <!-- terminal caret engraved in the blade center -->
+  <text x="256" y="232" text-anchor="middle" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="30" font-weight="700" fill="#22d3ee" opacity="0.9">&gt;_</text>
 
   <!-- wordmark -->
   <text x="256" y="438" text-anchor="middle" font-family="'Inter', system-ui, sans-serif" font-size="44" font-weight="800" letter-spacing="1" fill="#f8fafc">
