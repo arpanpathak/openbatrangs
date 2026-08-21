@@ -171,7 +171,8 @@ Available tools:
 - finish: arguments {"summary": "done"} — same as answer, use to end
 
 Rules:
-- Always use paths relative to the workspace root. Absolute paths and '..' are rejected.
+- Always use paths relative to the workspace root. Absolute paths and '..' are rejected. "." is the workspace root.
+- When asked to analyze the current directory or codebase, start with list_files path "." and then read the key files before concluding.
 - Explore before editing. Read files before rewriting them.
 - Prefer small, focused edits. Run build/test commands to verify when possible.
 - Never invent file contents as done unless you actually wrote them.

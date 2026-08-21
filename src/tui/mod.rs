@@ -68,8 +68,6 @@ const MIN_INPUT_BOX_HEIGHT: usize = 3;
 const MAX_LIVE_CHARS: usize = 50_000;
 /// Redraw interval in milliseconds (drives the spinner).
 const TICK_MILLIS: u64 = 80;
-/// Height of the suggestions list when visible.
-const SUGGESTIONS_HEIGHT: u16 = 4;
 /// Width of the model picker popup as a percentage of the screen.
 const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;
 /// Height of the model picker popup as a percentage of the screen.
@@ -83,7 +81,7 @@ const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 const CHAT_SCROLL_STEP: usize = 5;
 /// Banner height: wordmark + Batman art + quote + model info + prompt.
-const COMPACT_BANNER_HEIGHT: u16 = 23;
+const COMPACT_BANNER_HEIGHT: u16 = 18;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 const CHAT_SYSTEM_PROMPT: &str =

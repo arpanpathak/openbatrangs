@@ -149,10 +149,15 @@ impl App {
     }
 
     pub(super) fn model_info_line(&self) -> String {
+        let mode = match self.run_config.mode {
+            AgentMode::Agent => "agent",
+            AgentMode::Plan => "plan",
+            AgentMode::Chat => "chat",
+        };
         match &self.model_info {
-            Some(info) => format!("{info} · server {}", self.server_url),
+            Some(info) => format!("{info} · mode: {mode} · server {}", self.server_url),
             None => format!(
-                "model: {} · server {}",
+                "model: {} · mode: {mode} · server {}",
                 self.model.as_deref().unwrap_or("auto"),
                 self.server_url
             ),

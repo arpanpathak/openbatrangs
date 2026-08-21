@@ -4,7 +4,7 @@ use super::app::App;
 use super::{
     COMPACT_BANNER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MIN_INPUT_BOX_HEIGHT,
     MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MIN_TERMINAL_HEIGHT,
-    PERF_PANEL_HEIGHT, SUGGESTIONS_HEIGHT,
+    PERF_PANEL_HEIGHT,
 };
 use crate::cli::AgentMode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -41,6 +41,14 @@ fn banner_height(area_height: u16) -> u16 {
     }
 }
 
+fn suggestions_height(app: &App) -> u16 {
+    let count = app.suggestions().len();
+    match count {
+        0 => 0,
+        _ => count.min(6) as u16 + 2,
+    }
+}
+
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
@@ -54,11 +62,7 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
             } else {
                 0
             }),
-            Constraint::Length(if app.suggestions().is_empty() {
-                0
-            } else {
-                SUGGESTIONS_HEIGHT
-            }),
+            Constraint::Length(suggestions_height(app)),
             Constraint::Length(input_height(app, area.width) as u16),
         ])
         .split(area)
