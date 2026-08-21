@@ -263,20 +263,12 @@ async fn setup(client: &OllamaClient) -> Result<()> {
     Ok(())
 }
 
-/// Interactive DeepCode-style TUI REPL with a fixed bottom input box.
+/// Interactive DeepCode-style REPL.
 async fn run_repl(cli: &Cli, client: &OllamaClient) -> Result<()> {
-    use crossterm::cursor::{Hide, MoveTo, Show};
-    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use crossterm::execute;
-    use crossterm::style::{Color, ResetColor, SetForegroundColor};
-    use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-    use std::io::{stdout, Write};
-    use std::time::Duration;
+    use rustyline::error::ReadlineError;
+    use rustyline::DefaultEditor;
 
-    terminal::enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, Hide)?;
-
+    let mut rl = DefaultEditor::new().context("failed to initialize line editor")?;
     let mut state = ReplState {
         model: cli.model.clone(),
         read_only: cli.read_only,
@@ -287,313 +279,54 @@ async fn run_repl(cli: &Cli, client: &OllamaClient) -> Result<()> {
         no_auto_pull: cli.no_auto_pull,
     };
 
-    let mut log: Vec<String> = banner::banner_text()
-        .lines()
-        .map(|s| s.to_string())
-        .collect();
-    log.push(String::new());
-    log.push("🦇 Interactive agent — type a task, or /help".to_string());
+    println!("Type a task, or /help for commands.\n");
 
-    let mut input = String::new();
-    let mut cursor = 0usize;
-    let mut history: Vec<String> = Vec::new();
-    let mut history_idx: Option<usize> = None;
-    let mut selected = 0usize;
-    let mut exit = false;
-
-    let commands = [
-        "help",
-        "exit",
-        "quit",
-        "setup",
-        "models",
-        "model",
-        "read-only",
-        "confirm",
-        "steps",
-        "cwd",
-        "doctor",
-        "clear",
-    ];
-
-    while !exit {
-        let suggestions: Vec<String> = if input.starts_with('/') {
-            let q = &input[1..];
-            commands
-                .iter()
-                .filter(|c| c.starts_with(q))
-                .map(|s| format!("/{s}"))
-                .collect()
-        } else {
-            vec![]
-        };
-        if selected >= suggestions.len() {
-            selected = suggestions.len().saturating_sub(1);
-        }
-
-        // Draw chat area + suggestions + fixed bottom input box.
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        let (term_w, term_h) = terminal::size()?;
-        let max_log = (term_h as usize).saturating_sub(8 + suggestions.len().min(6));
-        let start = log.len().saturating_sub(max_log);
-        for line in &log[start..] {
-            println!("{}", line);
-        }
-        if !suggestions.is_empty() {
-            println!();
-            for (i, s) in suggestions.iter().enumerate() {
-                if i == selected {
-                    println!("{}> {}{}", SetForegroundColor(Color::Cyan), s, ResetColor);
-                } else {
-                    println!("  {s}");
+    loop {
+        match rl.readline("openBatarangs> ") {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
                 }
+                if let Some(cmd) = line.strip_prefix('/') {
+                    if handle_slash_command(&mut state, client, cmd).await? {
+                        break;
+                    }
+                    continue;
+                }
+                let prefs = ModelPrefs {
+                    model: state.model.clone(),
+                    no_auto_pull: state.no_auto_pull,
+                    min_context: state.min_context,
+                };
+                run_agent_task(
+                    client,
+                    &state.cwd,
+                    state.max_steps,
+                    state.read_only,
+                    state.confirm,
+                    &mut state.model,
+                    &prefs,
+                    &line,
+                )
+                .await?;
             }
-        }
-
-        let input_lines: Vec<&str> = input.split('\n').collect();
-        let box_h = (input_lines.len().min(5) + 2) as u16;
-        let box_top = term_h.saturating_sub(box_h);
-        let sep = "─".repeat(term_w.saturating_sub(1) as usize);
-        execute!(stdout, MoveTo(0, box_top))?;
-        println!("{sep}");
-        for line in input_lines.iter().take(5) {
-            println!("│ {}", line);
-        }
-        for _ in input_lines.len()..5 {
-            println!("│");
-        }
-        println!("{sep}");
-
-        // Place cursor inside the input box.
-        let prefix = &input[..cursor];
-        let line_idx = prefix.matches('\n').count() as u16;
-        let col = prefix
-            .rsplit('\n')
-            .next()
-            .map(|s| s.chars().count())
-            .unwrap_or(0) as u16;
-        execute!(stdout, MoveTo(2 + col, box_top + 1 + line_idx))?;
-        stdout.flush()?;
-
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => match k.code {
-                    KeyCode::Char(c) => {
-                        if c != '\r' {
-                            input.insert(cursor, c);
-                            cursor += 1;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if cursor > 0 {
-                            input.remove(cursor - 1);
-                            cursor -= 1;
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if cursor < input.len() {
-                            input.remove(cursor);
-                        }
-                    }
-                    KeyCode::Left => cursor = cursor.saturating_sub(1),
-                    KeyCode::Right => {
-                        if cursor < input.len() {
-                            cursor += 1;
-                        }
-                    }
-                    KeyCode::Home => cursor = 0,
-                    KeyCode::End => cursor = input.len(),
-                    KeyCode::Up => {
-                        if !suggestions.is_empty() {
-                            selected = selected.saturating_sub(1);
-                        } else if !history.is_empty() {
-                            let idx = match history_idx {
-                                Some(i) if i > 0 => i - 1,
-                                Some(_) => 0,
-                                None => history.len().saturating_sub(1),
-                            };
-                            history_idx = Some(idx);
-                            input = history[idx].clone();
-                            cursor = input.len();
-                        }
-                    }
-                    KeyCode::Down => {
-                        if !suggestions.is_empty() {
-                            selected = (selected + 1).min(suggestions.len().saturating_sub(1));
-                        } else if let Some(i) = history_idx {
-                            if i + 1 < history.len() {
-                                history_idx = Some(i + 1);
-                                input = history[i + 1].clone();
-                                cursor = input.len();
-                            } else {
-                                history_idx = None;
-                                input.clear();
-                                cursor = 0;
-                            }
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if !suggestions.is_empty() {
-                            input = suggestions[selected].clone();
-                            cursor = input.len();
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if k.modifiers.contains(KeyModifiers::SHIFT) {
-                            input.insert(cursor, '\n');
-                            cursor += 1;
-                        } else {
-                            let task = input.trim().to_string();
-                            input.clear();
-                            cursor = 0;
-                            history_idx = None;
-                            selected = 0;
-                            if task.is_empty() {
-                                continue;
-                            }
-                            history.push(task.clone());
-                            if task.starts_with('/') {
-                                if handle_slash_tui(&mut state, client, &task, &mut log).await? {
-                                    exit = true;
-                                }
-                            } else {
-                                log.push(format!("🦇 {task}"));
-                                // Run the agent in the normal terminal so streaming output is clean.
-                                execute!(stdout, LeaveAlternateScreen, Show)?;
-                                terminal::disable_raw_mode()?;
-                                println!("\n🚀 Running agent...\n");
-                                let prefs = ModelPrefs {
-                                    model: state.model.clone(),
-                                    no_auto_pull: state.no_auto_pull,
-                                    min_context: state.min_context,
-                                };
-                                run_agent_task(
-                                    client,
-                                    &state.cwd,
-                                    state.max_steps,
-                                    state.read_only,
-                                    state.confirm,
-                                    &mut state.model,
-                                    &prefs,
-                                    &task,
-                                )
-                                .await?;
-                                println!(
-                                    "\n✅ Agent finished. Press Enter to return to openBatarangs."
-                                );
-                                let mut _wait = String::new();
-                                let _ = std::io::stdin().read_line(&mut _wait);
-                                terminal::enable_raw_mode()?;
-                                execute!(stdout, EnterAlternateScreen, Hide)?;
-                            }
-                        }
-                    }
-                    KeyCode::Esc => exit = true,
-                    _ => {}
-                },
-                Event::Resize(_, _) => {}
-                _ => {}
+            Err(ReadlineError::Interrupted) => {
+                println!("\n👋 Bye!");
+                break;
             }
+            Err(ReadlineError::Eof) => {
+                println!("\n👋 Bye!");
+                break;
+            }
+            Err(err) => return Err(err.into()),
         }
     }
-
-    execute!(stdout, LeaveAlternateScreen, Show)?;
-    terminal::disable_raw_mode()?;
-    println!("👋 Bye!");
     Ok(())
 }
 
-/// Slash-command handler for the TUI. Pushes output lines into the chat log.
-async fn handle_slash_tui(
-    state: &mut ReplState,
-    client: &OllamaClient,
-    line: &str,
-    log: &mut Vec<String>,
-) -> Result<bool> {
-    let mut parts = line[1..].splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("");
-    let arg = parts.next().unwrap_or("").trim();
-
-    match name {
-        "help" | "h" => {
-            log.push("Commands:".to_string());
-            log.push("  /help, /exit, /quit, /setup, /models".to_string());
-            log.push("  /model <tag>, /read-only, /confirm".to_string());
-            log.push("  /steps <n>, /cwd <path>, /doctor, /clear".to_string());
-            log.push("  Shift+Enter = new line · Enter = send".to_string());
-        }
-        "exit" | "quit" => return Ok(true),
-        "models" => {
-            for l in list_models_lines(client, state.min_context).await? {
-                log.push(l);
-            }
-        }
-        "model" => {
-            if arg.is_empty() {
-                match &state.model {
-                    Some(m) => log.push(format!("Current model: {m}")),
-                    None => log
-                        .push("Auto mode — best model will be selected on first task.".to_string()),
-                }
-            } else {
-                let tags = client.tags().await?;
-                if tags.iter().any(|m| m.name == arg) {
-                    state.model = Some(arg.to_string());
-                    log.push(format!("✅ Model set to {arg}"));
-                } else {
-                    log.push(format!(
-                        "❌ Model '{arg}' is not installed. Try /models or /setup."
-                    ));
-                }
-            }
-        }
-        "read-only" => {
-            state.read_only = !state.read_only;
-            log.push(format!(
-                "Read-only mode: {}",
-                if state.read_only { "ON" } else { "OFF" }
-            ));
-        }
-        "confirm" => {
-            state.confirm = !state.confirm;
-            log.push(format!(
-                "Confirm mode: {}",
-                if state.confirm { "ON" } else { "OFF" }
-            ));
-        }
-        "steps" => match arg.parse::<usize>() {
-            Ok(n) if n > 0 => {
-                state.max_steps = n;
-                log.push(format!("Max steps set to {n}"));
-            }
-            _ => log.push("Usage: /steps <positive number>".to_string()),
-        },
-        "cwd" => {
-            if arg.is_empty() {
-                log.push(format!("Workspace: {}", state.cwd.display()));
-            } else {
-                state.cwd = PathBuf::from(arg);
-                log.push(format!("Workspace set to {}", state.cwd.display()));
-            }
-        }
-        "doctor" => {
-            for l in doctor_lines(client, state.min_context).await? {
-                log.push(l);
-            }
-        }
-        "setup" => {
-            log.push("Running setup...".to_string());
-            setup(client).await?;
-            log.push("✅ Setup finished.".to_string());
-        }
-        "clear" => log.clear(),
-        _ => log.push(format!("Unknown command: /{name}. Try /help")),
-    }
-    Ok(false)
-}
-
 /// Returns `true` if the REPL should exit.
-#[allow(dead_code)]
 async fn handle_slash_command(
     state: &mut ReplState,
     client: &OllamaClient,
