@@ -60,7 +60,7 @@ const COMMANDS: &[&str] = &[
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Maximum visible lines in the multi-line input box.
-const MAX_INPUT_LINES: usize = 5;
+const MAX_INPUT_LINES: usize = 12;
 /// Extra lines for the input box border.
 const INPUT_BOX_PADDING: usize = 2;
 /// Minimum input box height (border + one line).
@@ -907,7 +907,7 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
             } else {
                 SUGGESTIONS_HEIGHT
             }),
-            Constraint::Length(input_height(app) as u16),
+            Constraint::Length(input_height(app, area.width) as u16),
         ])
         .split(area)
         .to_vec()
@@ -1123,9 +1123,16 @@ fn centered_rect(
         .split(popup[1])[1]
 }
 
-fn input_height(app: &App) -> usize {
-    let lines = app.input.split('\n').count();
-    (lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT)
+fn input_height(app: &App, width: u16) -> usize {
+    let max_text_width = (width as usize)
+        .saturating_sub(INPUT_BOX_PADDING + 2)
+        .max(1);
+    let mut text_lines = 0usize;
+    for line in app.input.split('\n') {
+        let char_count = line.chars().count();
+        text_lines += (char_count / max_text_width).max(1);
+    }
+    (text_lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT)
 }
 
 pub async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
