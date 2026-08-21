@@ -59,16 +59,16 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(banner_height(area.height)),
+            Constraint::Max(banner_height(area.height)),
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(if perf_visible(app, area.height) {
+            Constraint::Max(if perf_visible(app, area.height) {
                 PERF_PANEL_HEIGHT
             } else {
                 0
             }),
-            Constraint::Length(suggestions_height(app)),
-            Constraint::Length(input_height(app, area.width) as u16),
+            Constraint::Max(suggestions_height(app)),
+            Constraint::Max(input_height(app, area.width, area.height) as u16),
         ])
         .split(area)
         .to_vec()
@@ -396,7 +396,7 @@ fn centered_rect(
         .split(popup[1])[1]
 }
 
-fn input_height(app: &App, width: u16) -> usize {
+fn input_height(app: &App, width: u16, area_height: u16) -> usize {
     let max_text_width = (width as usize)
         .saturating_sub(INPUT_BOX_PADDING + 2)
         .max(1);
@@ -405,5 +405,9 @@ fn input_height(app: &App, width: u16) -> usize {
         let char_count = line.chars().count();
         text_lines += (char_count / max_text_width).max(1);
     }
-    (text_lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT)
+    let desired = (text_lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT);
+    let available = (area_height as usize)
+        .saturating_sub(4)
+        .max(MIN_INPUT_BOX_HEIGHT);
+    desired.min(available)
 }

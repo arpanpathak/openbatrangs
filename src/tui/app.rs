@@ -865,3 +865,25 @@ impl App {
             .push(format!("Unknown command: /{name}. Try /help"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn unicode_paste_does_not_panic() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        let text = "NVIDIA — 3% → 😀\n| table |\n```rust\nfn main() {}\n```";
+        for ch in text.chars() {
+            app.insert_char(ch);
+        }
+        assert_eq!(app.input, text);
+        assert!(app.cursor <= app.input.len());
+        app.move_left();
+        app.move_right();
+        app.backspace();
+        app.delete();
+    }
+}

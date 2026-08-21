@@ -469,4 +469,20 @@ mod tests {
             "done event should render"
         );
     }
+
+    #[test]
+    fn small_terminal_large_paste_does_not_panic() {
+        use clap::Parser;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        let shared = Arc::new(Mutex::new(None));
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = app::App::new(&cli, shared);
+        app.input = "NVIDIA — 3% → 😀\n| table |\n```rust\nfn main() {}\n```".repeat(200);
+        terminal
+            .draw(|frame| ui::ui(frame, &mut app))
+            .expect("draw with large pasted input should not panic");
+    }
 }
