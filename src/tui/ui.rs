@@ -14,6 +14,11 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
+use std::sync::OnceLock;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
@@ -114,11 +119,92 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+struct Highlighter {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+}
+
+fn highlighter() -> &'static Highlighter {
+    static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
+    HIGHLIGHTER.get_or_init(|| {
+        let mut theme_set = ThemeSet::load_defaults();
+        Highlighter {
+            syntaxes: SyntaxSet::load_defaults_newlines(),
+            theme: theme_set
+                .themes
+                .remove("base16-ocean.dark")
+                .unwrap_or_default(),
+        }
+    })
+}
+
+fn syn_style_to_ratatui(style: SynStyle) -> Style {
+    let fg = style.foreground;
+    Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
+}
+
+/// Render chat text with syntax highlighting inside ``` code fences.
+fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
+    let h = highlighter();
+    let mut out = Vec::new();
+    let mut in_code = false;
+    let mut lang = String::new();
+
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            if in_code {
+                in_code = false;
+            } else {
+                in_code = true;
+                lang = trimmed.trim_start_matches("```").trim().to_string();
+            }
+            out.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        if in_code {
+            let syntax = h
+                .syntaxes
+                .find_syntax_by_extension(&lang)
+                .or_else(|| h.syntaxes.find_syntax_by_name(&lang))
+                .or_else(|| h.syntaxes.find_syntax_by_token(&lang))
+                .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text());
+            let mut line_highlighter = HighlightLines::new(syntax, &h.theme);
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for line in LinesWithEndings::from(raw) {
+                match line_highlighter.highlight_line(line, &h.syntaxes) {
+                    Ok(regions) => {
+                        for (style, segment) in regions {
+                            spans.push(Span::styled(
+                                segment.to_string(),
+                                syn_style_to_ratatui(style),
+                            ));
+                        }
+                    }
+                    Err(_) => spans.push(Span::raw(raw.to_string())),
+                }
+            }
+            if spans.is_empty() {
+                spans.push(Span::raw(raw.to_string()));
+            }
+            out.push(Line::from(spans));
+        } else {
+            out.push(Line::from(Span::raw(raw.to_string())));
+        }
+    }
+    out
+}
+
 fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
     let scroll_y = chat_scroll(app, &chat_text, area.height);
-    let chat = Paragraph::new(chat_text)
+    let chat_lines = highlighted_chat_lines(&chat_text);
+    let chat = Paragraph::new(chat_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
