@@ -209,7 +209,8 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        self.log.push(format!("🦇 {task}"));
+        self.log.push("─".repeat(60));
+        self.log.push(format!("You: {task}"));
         self.is_running = true;
         self.status = "running".to_string();
         self.last_action.clear();
@@ -615,26 +616,20 @@ impl App {
 
     fn toggle_read_only(&mut self) {
         self.run_config.is_read_only = !self.run_config.is_read_only;
-        self.log.push(format!(
-            "Read-only mode: {}",
-            if self.run_config.is_read_only {
-                "ON"
-            } else {
-                "OFF"
-            }
-        ));
+        let state = match self.run_config.is_read_only {
+            true => "ON",
+            false => "OFF",
+        };
+        self.log.push(format!("Read-only mode: {state}"));
     }
 
     fn toggle_confirm(&mut self) {
         self.run_config.should_confirm = !self.run_config.should_confirm;
-        self.log.push(format!(
-            "Confirm mode: {}",
-            if self.run_config.should_confirm {
-                "ON"
-            } else {
-                "OFF"
-            }
-        ));
+        let state = match self.run_config.should_confirm {
+            true => "ON",
+            false => "OFF",
+        };
+        self.log.push(format!("Confirm mode: {state}"));
     }
 
     fn handle_mode_command(&mut self, arg: &str) {
@@ -692,15 +687,17 @@ impl App {
     }
 
     fn handle_cwd_command(&mut self, arg: &str) {
-        if arg.is_empty() {
-            self.log
-                .push(format!("Workspace: {}", self.run_config.cwd.display()));
-        } else {
-            self.run_config.cwd = PathBuf::from(arg);
-            self.log.push(format!(
-                "Workspace set to {}",
-                self.run_config.cwd.display()
-            ));
+        match arg.is_empty() {
+            true => self
+                .log
+                .push(format!("Workspace: {}", self.run_config.cwd.display())),
+            false => {
+                self.run_config.cwd = PathBuf::from(arg);
+                self.log.push(format!(
+                    "Workspace set to {}",
+                    self.run_config.cwd.display()
+                ));
+            }
         }
     }
 

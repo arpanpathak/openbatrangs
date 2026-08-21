@@ -133,10 +133,9 @@ fn split_command(line: &str) -> (&str, &str) {
 /// Find an existing file path inside a chat line, resolving relative to `cwd`.
 fn extract_path_from_line(line: &str, cwd: &Path) -> Option<PathBuf> {
     line.split_whitespace().find_map(|token| {
-        let candidate = if token.starts_with('/') {
-            PathBuf::from(token)
-        } else {
-            cwd.join(token)
+        let candidate = match token.starts_with('/') {
+            true => PathBuf::from(token),
+            false => cwd.join(token),
         };
         candidate.is_file().then_some(candidate)
     })

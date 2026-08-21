@@ -142,10 +142,9 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 fn chat_scroll(app: &App, chat_text: &str, area_height: u16) -> u16 {
     let content_height = chat_text.lines().count().max(1) as u16;
     let visible_height = area_height.saturating_sub(2);
-    if app.auto_scroll {
-        content_height.saturating_sub(visible_height)
-    } else {
-        app.chat_scroll_offset.min(content_height as usize) as u16
+    match app.auto_scroll {
+        true => content_height.saturating_sub(visible_height),
+        false => app.chat_scroll_offset.min(content_height as usize) as u16,
     }
 }
 
