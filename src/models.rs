@@ -121,18 +121,18 @@ fn quant_bonus(quantization: &str) -> f64 {
 /// `Some(ModelScore)` if the model meets the context requirement,
 /// otherwise `None`.
 pub fn score_model(model: &OllamaModel, mem_budget: u64, min_context: u64) -> Option<ModelScore> {
-    let details = model.details.as_ref()?;
+    // Older Ollama tags can omit `details` entirely. Treat missing metadata as
+    // "unknown" instead of silently dropping the model from scoring/listing.
+    let details = model.details.as_ref();
     let context = details
-        .context_length
+        .and_then(|details| details.context_length)
         .unwrap_or(DEFAULT_CONTEXT_LENGTH)
         .max(MIN_CONTEXT_LENGTH);
     let parameter_label = details
-        .parameter_size
-        .clone()
+        .and_then(|details| details.parameter_size.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let quantization_label = details
-        .quantization_level
-        .clone()
+        .and_then(|details| details.quantization_level.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
     if context < min_context {
@@ -295,6 +295,35 @@ mod tests {
     fn score_model_returns_none_below_min_context() {
         let model = model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000);
         assert!(score_model(&model, 8_000_000_000, 8_192).is_none());
+    }
+
+    #[test]
+    fn score_model_includes_models_without_details() {
+        let model = OllamaModel {
+            name: "legacy:latest".to_string(),
+            size: 1_000_000_000,
+            details: None,
+        };
+        let scored =
+            score_model(&model, 16_000_000_000, 4_096).expect("missing details should score");
+        assert_eq!(scored.name, "legacy:latest");
+        assert_eq!(scored.parameter_size, "unknown");
+        assert_eq!(scored.quantization, "unknown");
+        assert!(scored.score > 0.0);
+    }
+
+    #[test]
+    fn score_models_keeps_models_without_details() {
+        let legacy = OllamaModel {
+            name: "legacy:latest".to_string(),
+            size: 1_000_000_000,
+            details: None,
+        };
+        let modern = model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000);
+        let scored = score_models(&[legacy, modern], 16_000_000_000, 4_096);
+        assert_eq!(scored.len(), 2);
+        assert_eq!(scored[0].name, "qwen2.5-coder:7b");
+        assert_eq!(scored[1].name, "legacy:latest");
     }
 
     #[test]

@@ -157,21 +157,34 @@ fn syn_style_to_ratatui(style: SynStyle) -> Style {
     Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
 }
 
+/// Resolve the syntax definition for a code-fence language hint.
+fn code_syntax<'a>(h: &'a Highlighter, lang: &str) -> &'a syntect::parsing::SyntaxReference {
+    h.syntaxes
+        .find_syntax_by_extension(lang)
+        .or_else(|| h.syntaxes.find_syntax_by_name(lang))
+        .or_else(|| h.syntaxes.find_syntax_by_token(lang))
+        .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text())
+}
+
 /// Render chat text with syntax highlighting inside ``` code fences.
 fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
     let h = highlighter();
     let mut out = Vec::new();
     let mut in_code = false;
-    let mut lang = String::new();
+    // One highlighter per code block so multi-line constructs (comments,
+    // strings, doc blocks) keep their highlighting state across lines.
+    let mut line_highlighter: Option<HighlightLines> = None;
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             if in_code {
                 in_code = false;
+                line_highlighter = None;
             } else {
                 in_code = true;
-                lang = trimmed.trim_start_matches("```").trim().to_string();
+                let lang = trimmed.trim_start_matches("```").trim().to_string();
+                line_highlighter = Some(HighlightLines::new(code_syntax(h, &lang), &h.theme));
             }
             out.push(Line::from(Span::styled(
                 raw.to_string(),
@@ -181,25 +194,20 @@ fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
         }
 
         if in_code {
-            let syntax = h
-                .syntaxes
-                .find_syntax_by_extension(&lang)
-                .or_else(|| h.syntaxes.find_syntax_by_name(&lang))
-                .or_else(|| h.syntaxes.find_syntax_by_token(&lang))
-                .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text());
-            let mut line_highlighter = HighlightLines::new(syntax, &h.theme);
             let mut spans: Vec<Span<'static>> = Vec::new();
-            for line in LinesWithEndings::from(raw) {
-                match line_highlighter.highlight_line(line, &h.syntaxes) {
-                    Ok(regions) => {
-                        for (style, segment) in regions {
-                            spans.push(Span::styled(
-                                segment.to_string(),
-                                syn_style_to_ratatui(style),
-                            ));
+            if let Some(line_highlighter) = &mut line_highlighter {
+                for line in LinesWithEndings::from(raw) {
+                    match line_highlighter.highlight_line(line, &h.syntaxes) {
+                        Ok(regions) => {
+                            for (style, segment) in regions {
+                                spans.push(Span::styled(
+                                    segment.to_string(),
+                                    syn_style_to_ratatui(style),
+                                ));
+                            }
                         }
+                        Err(_) => spans.push(Span::raw(raw.to_string())),
                     }
-                    Err(_) => spans.push(Span::raw(raw.to_string())),
                 }
             }
             if spans.is_empty() {
@@ -610,6 +618,26 @@ mod tests {
         let scroll_y = chat_scroll(&app, &app.chat_text(), area);
         let ratatui_scroll = scroll_y.min(u16::MAX as usize) as u16;
         assert_eq!(ratatui_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn highlighted_chat_lines_preserves_multiline_code_blocks() {
+        let input = "```rust\n// comment\nfn main() {\n    println!(\"hi\");\n}\n```";
+        let lines = highlighted_chat_lines(input);
+        assert_eq!(lines.len(), input.lines().count());
+        let joined: String = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("fn main()"));
+        assert!(joined.contains("println!"));
+        assert!(joined.contains("// comment"));
     }
 
     #[test]

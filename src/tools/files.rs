@@ -1,6 +1,6 @@
 //! Filesystem tools: list, read, write, grep.
 
-use super::path::{ensure_canonical_within_root, resolve_in_root};
+use super::path::{canonical_root, ensure_canonical_within_root, resolve_in_root};
 use super::text::{truncate, truncate_to};
 use crate::constants::tools::{BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, HEAVY_DIRS, MAX_LISTED_FILES};
 use anyhow::{bail, Context, Result};
@@ -11,6 +11,17 @@ use walkdir::WalkDir;
 /// Returns true when a directory name should be skipped by recursive walks.
 fn is_heavy_dir(name: &str) -> bool {
     HEAVY_DIRS.contains(&name)
+}
+
+/// Return `path` relative to the workspace root for display.
+///
+/// `entry.path()` comes from a walk rooted at the canonical directory, so it is
+/// absolute even when the caller supplied a relative `root` like `"."`. Always
+/// strip against the canonical root first, then fall back to the raw root.
+fn relative_to_root<'a>(path: &'a Path, root: &Path, canonical_root: &Path) -> &'a Path {
+    path.strip_prefix(canonical_root)
+        .or_else(|_| path.strip_prefix(root))
+        .unwrap_or(path)
 }
 
 /// Build a recursive directory walker that skips heavy directories.
@@ -55,6 +66,7 @@ pub(crate) fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<St
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
     }
+    let canonical_root = canonical_root(root)?;
     let directory = ensure_canonical_within_root(root, &directory)?;
 
     let mut output = String::new();
@@ -62,10 +74,7 @@ pub(crate) fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<St
     for entry in walker(&directory, max_depth) {
         let entry = entry.context("walkdir error")?;
         if entry.file_type().is_file() {
-            let relative = entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
+            let relative = relative_to_root(entry.path(), root, &canonical_root)
                 .to_string_lossy()
                 .to_string();
             let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
@@ -97,12 +106,13 @@ pub(crate) fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<Str
     if !file.is_file() {
         bail!("not a file: {}", file.display());
     }
+    let canonical_root = canonical_root(root)?;
     let file = ensure_canonical_within_root(root, &file)?;
     let content = std::fs::read_to_string(&file).context("failed to read file (may be binary)")?;
     let truncated = truncate_to(content, max_chars);
     Ok(format!(
         "--- {} ---\n{}",
-        file.strip_prefix(root).unwrap_or(&file).display(),
+        relative_to_root(&file, root, &canonical_root).display(),
         truncated
     ))
 }
@@ -155,8 +165,10 @@ pub(crate) fn grep_files(
     if !directory.is_dir() {
         bail!("not a directory: {}", directory.display());
     }
+    let canonical_root = canonical_root(root)?;
     let directory = ensure_canonical_within_root(root, &directory)?;
     let regex = Regex::new(pattern).context("invalid regex pattern")?;
+    let max_results = max_results.max(1);
     let mut output = String::new();
     let mut count = 0usize;
 
@@ -174,10 +186,7 @@ pub(crate) fn grep_files(
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(entry.path())
+        let relative = relative_to_root(entry.path(), root, &canonical_root)
             .to_string_lossy()
             .to_string();
         for (line_index, line) in content.lines().enumerate() {
@@ -203,16 +212,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openbatrangs-tools-test-{unique}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::test_support::unique_temp_dir("openbatrangs-tools-test")
     }
 
     #[test]
@@ -310,6 +312,16 @@ mod tests {
     }
 
     #[test]
+    fn grep_files_zero_max_results_is_clamped_to_one() {
+        let root = temp_dir();
+        fs::write(root.join("a.txt"), "match\n").unwrap();
+        let output = grep_files(&root, "match", ".", 0).unwrap();
+        assert!(output.contains("a.txt:1: match"));
+        assert!(output.contains("truncated at 1 match"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn grep_files_skips_binary_files() {
         let root = temp_dir();
         fs::write(root.join("bin.dat"), b"\x00\x01\x02match").unwrap();
@@ -349,5 +361,48 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn relative_to_root_prefers_canonical_root() {
+        let root = Path::new(".");
+        let canonical_root = Path::new("/tmp/project");
+        assert_eq!(
+            relative_to_root(Path::new("/tmp/project/src/main.rs"), root, canonical_root),
+            Path::new("src/main.rs")
+        );
+        assert_eq!(
+            relative_to_root(Path::new("/tmp/project"), root, canonical_root),
+            Path::new("")
+        );
+    }
+
+    #[test]
+    fn relative_to_root_falls_back_to_raw_root() {
+        let root = Path::new(".");
+        let canonical_root = Path::new("/tmp/project");
+        // A non-canonical relative entry (rare) still resolves against `root`.
+        assert_eq!(
+            relative_to_root(Path::new("./src/main.rs"), root, canonical_root),
+            Path::new("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn list_files_with_relative_root_returns_relative_paths() {
+        // `cargo test` runs with the crate root as the working directory, so
+        // `"."` is a valid relative workspace root. Regression: the walker uses
+        // the canonical absolute path, which used to leak absolute paths into
+        // the agent's file listing when the root was relative.
+        let output = list_files(Path::new("."), "src", 1).unwrap();
+        let first = output.lines().next().unwrap_or_default();
+        assert!(
+            !first.starts_with('/'),
+            "expected relative path, got: {first}"
+        );
+        assert!(
+            first.starts_with("src/"),
+            "expected src/ prefix, got: {first}"
+        );
     }
 }

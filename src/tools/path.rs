@@ -24,13 +24,19 @@ pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(root.join(requested))
 }
 
+/// Canonicalize the workspace root once so relative roots (`"."`, `"./src"`)
+/// still produce stable absolute paths for containment checks and display.
+pub(super) fn canonical_root(root: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve workspace root: {}", root.display()))
+}
+
 /// Canonicalize `resolved` and verify it still lives under `root`.
 ///
 /// This closes symlink-escape holes: a symlink inside the workspace that points
 /// outside must not let the agent read or write files elsewhere on the system.
 pub(super) fn ensure_canonical_within_root(root: &Path, resolved: &Path) -> Result<PathBuf> {
-    let canonical_root = std::fs::canonicalize(root)
-        .with_context(|| format!("failed to resolve workspace root: {}", root.display()))?;
+    let canonical_root = canonical_root(root)?;
     let canonical_path = std::fs::canonicalize(resolved)
         .with_context(|| format!("failed to resolve path: {}", resolved.display()))?;
     if !canonical_path.starts_with(&canonical_root) {
@@ -79,13 +85,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape_via_canonicalization() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("openbatrangs-path-test-{unique}"));
+        let base = crate::test_support::unique_temp_dir("openbatrangs-path-test");
         let root = base.join("workspace");
         let outside = base.join("outside");
         fs::create_dir_all(&root).unwrap();

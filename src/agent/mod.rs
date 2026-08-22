@@ -303,13 +303,7 @@ mod tests {
 
     #[test]
     fn initial_messages_use_shallow_listing_not_recursive_scan() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("openbatrangs-shallow-test-{unique}"));
+        let root = crate::test_support::unique_temp_dir("openbatrangs-shallow-test");
         std::fs::create_dir_all(root.join("sub/nested")).unwrap();
         std::fs::write(root.join("top.txt"), "top").unwrap();
         std::fs::write(root.join("sub/nested/deep.txt"), "deep").unwrap();

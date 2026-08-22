@@ -15,6 +15,9 @@ mod perf;
 mod tools;
 mod tui;
 
+#[cfg(test)]
+mod test_support;
+
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};

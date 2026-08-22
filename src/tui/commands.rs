@@ -321,6 +321,8 @@ impl App {
         self.live.clear();
         self.current_prompt = None;
         self.chat_history.clear();
+        self.auto_scroll = true;
+        self.chat_scroll_offset = 0;
     }
 
     fn toggle_perf(&mut self) {

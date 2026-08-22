@@ -21,6 +21,7 @@ use std::time::Duration;
 /// Captured stdout/stderr plus exit status, truncated to `MAX_TOOL_OUTPUT`.
 pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
     let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
+    create_sandbox_dirs(root);
     let mut process = tokio::process::Command::new("bash");
     process.arg("-lc").arg(command).current_dir(root);
     for (key, value) in agent_sandbox_env(root) {
@@ -46,6 +47,17 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
     Ok(truncate(text))
 }
 
+/// Create every sandbox directory before a command runs.
+///
+/// Commands that `cd $HOME`, write to `$XDG_CONFIG_HOME`, or use caches expect
+/// the target directories to exist. Creating them eagerly avoids spurious
+/// failures for otherwise valid agent commands.
+fn create_sandbox_dirs(root: &Path) {
+    for (_, path) in agent_sandbox_env(root) {
+        let _ = std::fs::create_dir_all(&path);
+    }
+}
+
 /// Environment overrides that keep agent commands inside the workspace.
 fn agent_sandbox_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
     let agent_dir = root.join(".agent");
@@ -67,16 +79,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("openbatrangs-command-test-{unique}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::test_support::unique_temp_dir("openbatrangs-command-test")
     }
 
     #[tokio::test]
@@ -148,6 +153,19 @@ mod tests {
             .unwrap();
         assert!(output.contains("ok"));
         assert!(root.join(".agent/home/.test").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_dirs_exist_before_command_runs() {
+        let root = temp_dir();
+        run_command(&root, "true", 5).await.unwrap();
+        for name in ["home", "cache", "config", "data", "tmp", "cargo"] {
+            assert!(
+                root.join(".agent").join(name).is_dir(),
+                ".agent/{name} should exist before command execution"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -394,7 +394,7 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         if self.pending_confirmation.is_some() {
-            self.handle_confirmation_key(key);
+            self.handle_confirmation_key(key, client, tx);
             return Ok(false);
         }
 
@@ -407,7 +407,7 @@ impl App {
             KeyCode::Char(character)
                 if character == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.cancel_task();
+                self.cancel_task(client, tx);
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_newline();
@@ -448,7 +448,11 @@ impl App {
         Ok(self.should_quit)
     }
 
-    pub(super) fn cancel_task(&mut self) {
+    pub(super) fn cancel_task(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         if let Some(handle) = self.current_task.take() {
             handle.abort();
         }
@@ -463,12 +467,19 @@ impl App {
         {
             self.chat_history.pop();
         }
-        self.is_running = false;
-        self.status = "ready".to_string();
         self.last_action.clear();
         self.auto_scroll = true;
         self.flush_live();
         self.log.push("⛔ Cancelled.".to_string());
+        // Keep the queue moving: cancelling the active task should not strand
+        // tasks the user already queued behind it.
+        if let Some(next) = self.task_queue.pop_front() {
+            self.log.push("▶️  Starting next queued task.".to_string());
+            self.start_task(next, client, tx);
+        } else {
+            self.is_running = false;
+            self.status = "ready".to_string();
+        }
     }
 
     pub(super) fn scroll_chat(&mut self, delta: i32) {
@@ -571,13 +582,22 @@ impl App {
 
     /// Resolve a pending tool confirmation from a single keypress.
     ///
-    /// `y`/`Y` confirms, anything else that is explicitly a choice (`n`, `N`,
-    /// `Esc`, `Enter`) aborts, and unrelated keys are ignored so the modal stays
-    /// open.
-    fn handle_confirmation_key(&mut self, key: event::KeyEvent) {
+    /// `y`/`Y` confirms, `n`/`N`/`Esc`/`Enter` abort the tool, and unrelated
+    /// keys are ignored so the modal stays open. Ctrl+C cancels the whole task.
+    fn handle_confirmation_key(
+        &mut self,
+        key: event::KeyEvent,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         let Some(pending) = self.pending_confirmation.take() else {
             return;
         };
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let _ = pending.response.send(false);
+            self.cancel_task(client, tx);
+            return;
+        }
         let answer = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => Some(false),
@@ -751,7 +771,11 @@ impl App {
             self.log.push(format!("You: {task}"));
         }
         if task.starts_with('/') {
-            self.run_slash_command(client, &task, tx).await?;
+            // Slash commands can hit the network (models, doctor, pull, ...).
+            // Log failures into the chat instead of tearing down the whole TUI.
+            if let Err(error) = self.run_slash_command(client, &task, tx).await {
+                self.log.push(format!("⚠️ {error:#}"));
+            }
         } else if self.is_running {
             self.task_queue.push_back(task);
             self.log
@@ -969,21 +993,27 @@ mod tests {
             role: "user".to_string(),
             content: "task".to_string(),
         });
+        app.auto_scroll = false;
+        app.chat_scroll_offset = 42;
         app.clear_chat();
         assert!(app.chat_history.is_empty());
         assert!(app.current_prompt.is_none());
         assert!(app.log.is_empty());
+        assert!(app.auto_scroll);
+        assert_eq!(app.chat_scroll_offset, 0);
     }
 
     #[test]
     fn cancel_task_removes_pending_chat_user_message() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.run_config.mode = AgentMode::Chat;
         app.chat_history.push(ChatMessage {
             role: "user".to_string(),
             content: "question".to_string(),
         });
-        app.cancel_task();
+        app.cancel_task(&client, &tx);
         assert!(app.chat_history.is_empty());
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
     }
@@ -1008,26 +1038,38 @@ mod tests {
 
     #[test]
     fn confirmation_key_yes_sends_true() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "write file 'a.txt'?".to_string(),
             response: response_tx,
         });
-        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_confirmation_key(
+            event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &client,
+            &tx,
+        );
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(true));
     }
 
     #[test]
     fn confirmation_key_no_sends_false() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "run command: rm -rf /?".to_string(),
             response: response_tx,
         });
-        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_confirmation_key(
+            event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &client,
+            &tx,
+        );
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(app.log.iter().any(|line| line.contains("aborted")));
@@ -1035,40 +1077,90 @@ mod tests {
 
     #[test]
     fn confirmation_key_esc_aborts() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "run command: make?".to_string(),
             response: response_tx,
         });
-        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_confirmation_key(
+            event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &client,
+            &tx,
+        );
         assert!(response_rx.try_recv() == Ok(false));
     }
 
     #[test]
     fn confirmation_key_ignores_unrelated_keys() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "write file 'a.txt'?".to_string(),
             response: response_tx,
         });
-        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.handle_confirmation_key(
+            event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &client,
+            &tx,
+        );
         assert!(app.pending_confirmation.is_some());
         assert!(response_rx.try_recv().is_err());
     }
 
     #[test]
     fn cancel_task_resolves_pending_confirmation_with_false() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "write file 'a.txt'?".to_string(),
             response: response_tx,
         });
-        app.cancel_task();
+        app.cancel_task(&client, &tx);
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
+    }
+
+    #[tokio::test]
+    async fn cancel_task_starts_next_queued_task() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.task_queue.push_back("next task".to_string());
+        app.cancel_task(&client, &tx);
+        assert!(app.task_queue.is_empty());
+        assert!(app.is_running, "queued task should start immediately");
+        assert!(app.current_task.is_some());
+        assert!(app
+            .log
+            .iter()
+            .any(|line| line.contains("Starting next queued task")));
+    }
+
+    #[test]
+    fn confirmation_ctrl_c_cancels_task_and_resolves_false() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "write file 'a.txt'?".to_string(),
+            response: response_tx,
+        });
+        let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_confirmation_key(key, &client, &tx);
+        assert!(app.pending_confirmation.is_none());
+        assert!(response_rx.try_recv() == Ok(false));
+        assert!(!app.is_running);
+        assert!(app.log.iter().any(|line| line.contains("Cancelled")));
     }
 
     #[test]
@@ -1131,5 +1223,20 @@ mod tests {
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
         assert!(app.log.iter().any(|line| line.contains("Setup finished")));
+    }
+
+    #[tokio::test]
+    async fn slash_command_network_error_is_logged_not_fatal() {
+        // Point at a port that refuses connections so the command fails fast.
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.input = "/model missing-model".to_string();
+        let result = app.submit_input(&client, &tx).await;
+        assert!(result.is_ok(), "TUI must survive slash-command failures");
+        assert!(
+            app.log.iter().any(|line| line.contains('⚠')),
+            "expected an error logged to chat"
+        );
     }
 }

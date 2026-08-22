@@ -108,6 +108,9 @@ pub(crate) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec
 }
 
 pub(crate) fn split_command(line: &str) -> (&str, &str) {
+    if !line.starts_with('/') {
+        return ("", "");
+    }
     let mut parts = line[1..].splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
     let arg = parts.next().unwrap_or_default().trim();
@@ -184,5 +187,16 @@ mod tests {
     #[test]
     fn visual_line_indices_map_wrapped_rows_to_sources() {
         assert_eq!(chat_visual_line_indices("aaaaaa\nbb", 3), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn split_command_handles_empty_and_non_slash_input() {
+        assert_eq!(split_command(""), ("", ""));
+        assert_eq!(split_command("plain text"), ("", ""));
+        assert_eq!(split_command("/"), ("", ""));
+        assert_eq!(
+            split_command("/model qwen2.5-coder:7b"),
+            ("model", "qwen2.5-coder:7b")
+        );
     }
 }

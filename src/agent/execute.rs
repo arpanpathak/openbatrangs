@@ -118,7 +118,6 @@ mod tests {
     use crate::agent::tool::Tool;
     use crate::agent::{AgentConfig, StdioConfirmer};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn clickable_path_encodes_special_characters() {
@@ -138,12 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_tool_reads_what_it_writes() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("openbatrangs-agent-test-{unique}"));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::unique_temp_dir("openbatrangs-agent-test");
         let config = AgentConfig {
             cwd: root.clone(),
             max_steps: 1,
@@ -194,13 +188,7 @@ mod tests {
     }
 
     fn temp_root() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("openbatrangs-execute-test-{unique}"));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+        crate::test_support::unique_temp_dir("openbatrangs-execute-test")
     }
 
     struct TestConfirmer {

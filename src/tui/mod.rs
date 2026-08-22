@@ -260,4 +260,19 @@ mod tests {
             .draw(|frame| ui::ui(frame, &mut app))
             .expect("draw with large pasted input should not panic");
     }
+
+    #[test]
+    fn tiny_terminal_does_not_panic() {
+        use clap::Parser;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        let shared = Arc::new(Mutex::new(None));
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = app::App::new(&cli, shared);
+        terminal
+            .draw(|frame| ui::ui(frame, &mut app))
+            .expect("draw on a tiny terminal should not panic");
+    }
 }
