@@ -16,11 +16,6 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
-use std::sync::OnceLock;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -133,98 +128,11 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-struct Highlighter {
-    syntaxes: SyntaxSet,
-    theme: Theme,
-}
-
-fn highlighter() -> &'static Highlighter {
-    static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
-    HIGHLIGHTER.get_or_init(|| {
-        let mut theme_set = ThemeSet::load_defaults();
-        Highlighter {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
-            theme: theme_set
-                .themes
-                .remove("base16-ocean.dark")
-                .unwrap_or_default(),
-        }
-    })
-}
-
-fn syn_style_to_ratatui(style: SynStyle) -> Style {
-    let fg = style.foreground;
-    Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
-}
-
-/// Resolve the syntax definition for a code-fence language hint.
-fn code_syntax<'a>(h: &'a Highlighter, lang: &str) -> &'a syntect::parsing::SyntaxReference {
-    h.syntaxes
-        .find_syntax_by_extension(lang)
-        .or_else(|| h.syntaxes.find_syntax_by_name(lang))
-        .or_else(|| h.syntaxes.find_syntax_by_token(lang))
-        .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text())
-}
-
-/// Render chat text with syntax highlighting inside ``` code fences.
-fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
-    let h = highlighter();
-    let mut out = Vec::new();
-    let mut in_code = false;
-    // One highlighter per code block so multi-line constructs (comments,
-    // strings, doc blocks) keep their highlighting state across lines.
-    let mut line_highlighter: Option<HighlightLines> = None;
-
-    for raw in text.lines() {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            if in_code {
-                in_code = false;
-                line_highlighter = None;
-            } else {
-                in_code = true;
-                let lang = trimmed.trim_start_matches("```").trim().to_string();
-                line_highlighter = Some(HighlightLines::new(code_syntax(h, &lang), &h.theme));
-            }
-            out.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-            continue;
-        }
-
-        if in_code {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            if let Some(line_highlighter) = &mut line_highlighter {
-                for line in LinesWithEndings::from(raw) {
-                    match line_highlighter.highlight_line(line, &h.syntaxes) {
-                        Ok(regions) => {
-                            for (style, segment) in regions {
-                                spans.push(Span::styled(
-                                    segment.to_string(),
-                                    syn_style_to_ratatui(style),
-                                ));
-                            }
-                        }
-                        Err(_) => spans.push(Span::raw(raw.to_string())),
-                    }
-                }
-            }
-            if spans.is_empty() {
-                spans.push(Span::raw(raw.to_string()));
-            }
-            out.push(Line::from(spans));
-        } else {
-            out.push(Line::from(Span::raw(raw.to_string())));
-        }
-    }
-    out
-}
-
 fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
-    let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
+    let inner_width = chat_inner_width(area.width);
+    let content_height = text_wrapped_height(&chat_text, inner_width);
     let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content_height.saturating_sub(visible_height);
     // Re-stick to the bottom when the user scrolls down to the latest line, but
@@ -236,9 +144,9 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     } else {
         app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll);
     }
-    let scroll_y = chat_scroll(app, &chat_text, area);
-    let chat_lines = highlighted_chat_lines(&chat_text);
-    let chat = Paragraph::new(chat_lines)
+    let scroll_y = chat_scroll(app, area, content_height);
+    let chat_lines = app.chat_render.lines(&chat_text);
+    let chat = Paragraph::new(chat_lines.to_vec())
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -278,8 +186,7 @@ fn chat_inner_width(area_width: u16) -> usize {
 /// prevents the previous `as u16` truncation that made scrolling stop/glitch
 /// once the chat grew past 65,535 rows. Ratatui only accepts `u16` offsets, so
 /// callers cap the final value before passing it to `Paragraph::scroll`.
-fn chat_scroll(app: &App, chat_text: &str, area: Rect) -> usize {
-    let content_height = text_wrapped_height(chat_text, chat_inner_width(area.width));
+fn chat_scroll(app: &App, area: Rect, content_height: usize) -> usize {
     let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content_height.saturating_sub(visible_height);
     match app.auto_scroll {
@@ -589,9 +496,11 @@ mod tests {
             width: 80,
             height: 20,
         };
+        let chat_text = app.chat_text();
+        let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
 
         app.auto_scroll = true;
-        let bottom = chat_scroll(&app, &app.chat_text(), area);
+        let bottom = chat_scroll(&app, area, content_height);
         assert!(
             bottom > u16::MAX as usize,
             "true bottom scroll must stay in usize space, got {bottom}"
@@ -599,7 +508,7 @@ mod tests {
 
         app.auto_scroll = false;
         app.chat_scroll_offset = 10_000;
-        assert_eq!(chat_scroll(&app, &app.chat_text(), area), 10_000);
+        assert_eq!(chat_scroll(&app, area, content_height), 10_000);
     }
 
     #[test]
@@ -614,30 +523,12 @@ mod tests {
             width: 80,
             height: 20,
         };
+        let chat_text = app.chat_text();
+        let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
         app.auto_scroll = true;
-        let scroll_y = chat_scroll(&app, &app.chat_text(), area);
+        let scroll_y = chat_scroll(&app, area, content_height);
         let ratatui_scroll = scroll_y.min(u16::MAX as usize) as u16;
         assert_eq!(ratatui_scroll, u16::MAX);
-    }
-
-    #[test]
-    fn highlighted_chat_lines_preserves_multiline_code_blocks() {
-        let input = "```rust\n// comment\nfn main() {\n    println!(\"hi\");\n}\n```";
-        let lines = highlighted_chat_lines(input);
-        assert_eq!(lines.len(), input.lines().count());
-        let joined: String = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("fn main()"));
-        assert!(joined.contains("println!"));
-        assert!(joined.contains("// comment"));
     }
 
     #[test]

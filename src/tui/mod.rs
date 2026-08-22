@@ -17,7 +17,10 @@
 //! - `ui`: ratatui rendering.
 
 mod app;
+mod chat;
 mod commands;
+mod input;
+mod scroll;
 mod session;
 mod text;
 mod ui;

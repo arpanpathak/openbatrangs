@@ -6,7 +6,9 @@
 
 mod gpu;
 
-use crate::constants::perf::{KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS};
+use crate::constants::perf::{
+    GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
+};
 use gpu::{parse_nvidia_smi, parse_tegrastats, GpuStats};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -84,6 +86,7 @@ pub struct PerfMonitor {
     tegrastats: Arc<Mutex<Option<String>>>,
     cpu: CpuSampler,
     last_sample: Option<Instant>,
+    gpu_cache: Option<(Instant, GpuStats)>,
 }
 
 impl PerfMonitor {
@@ -92,6 +95,7 @@ impl PerfMonitor {
             tegrastats,
             cpu: CpuSampler::new(),
             last_sample: None,
+            gpu_cache: None,
         }
     }
 
@@ -126,7 +130,7 @@ impl PerfMonitor {
                 power_watts: stats.power_watts,
                 temp_c: stats.temp_c,
             },
-            None => parse_nvidia_smi().unwrap_or_default(),
+            None => self.cached_nvidia_smi(),
         };
         // Match jtop: green used = (Total - Free - Buffers - Cached) - shared.
         let memory = read_memory_mb();
@@ -149,6 +153,19 @@ impl PerfMonitor {
             memory_cached_mb: memory.cached_mb,
             memory_free_mb: memory.free_mb,
         }
+    }
+
+    /// Query `nvidia-smi`, reusing the last result within `GPU_CACHE_TTL`.
+    fn cached_nvidia_smi(&mut self) -> GpuStats {
+        let now = Instant::now();
+        if let Some((cached_at, cached)) = &self.gpu_cache {
+            if now.duration_since(*cached_at) < GPU_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+        let fresh = parse_nvidia_smi().unwrap_or_default();
+        self.gpu_cache = Some((now, fresh.clone()));
+        fresh
     }
 }
 

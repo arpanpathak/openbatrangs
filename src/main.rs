@@ -8,6 +8,7 @@ mod banner;
 mod cli;
 mod commands;
 mod constants;
+mod hardware;
 mod model_select;
 mod models;
 mod ollama;

@@ -5,6 +5,12 @@ use std::time::Duration;
 /// How often the TUI refreshes the performance panel.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a cached `nvidia-smi` result is reused before re-querying.
+///
+/// `nvidia-smi` is a subprocess spawn; on non-Jetson systems with no
+/// `tegrastats`, sampling it every frame would be wasteful.
+pub const GPU_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// `tegrastats` sampling interval in milliseconds.
 pub const TEGRASTATS_INTERVAL_MILLIS: &str = "1000";
 

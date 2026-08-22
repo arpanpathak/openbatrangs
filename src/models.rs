@@ -5,15 +5,14 @@
 //! parameter count, context window, and quantization quality.
 
 use crate::constants::models::{
-    BYTES_PER_GIGABYTE, BYTES_PER_KIB, CODING_FALLBACK_BONUS, CODING_KEYWORDS,
-    DEFAULT_CONTEXT_LENGTH, FALLBACK_7B_MEMORY_THRESHOLD_BYTES, FALLBACK_MODEL_3B,
-    FALLBACK_MODEL_7B, FALLBACK_SYSTEM_MEMORY_BYTES, IDEAL_CONTEXT_LENGTH, MAX_LARGE_MODEL_B,
-    MAX_MEDIUM_MODEL_B, MAX_SMALL_MODEL_B, MEMORY_COMFORT_DIVISOR, MEMORY_FACTOR_COMFORTABLE,
-    MEMORY_FACTOR_OVERFLOW, MEMORY_FACTOR_TIGHT, MEMORY_FACTOR_UNKNOWN, MIN_CONTEXT_LENGTH,
-    MIN_SMALL_MODEL_B, PARAMETERS_MILLION_DIVISOR, QUANT_FALLBACK_BONUS, QUANT_KEYWORDS,
-    SCORE_SCALE, SIZE_FACTOR_HUGE, SIZE_FACTOR_LARGE, SIZE_FACTOR_MEDIUM, SIZE_FACTOR_SMALL,
-    SIZE_FACTOR_UNKNOWN, STRONG_CODING_SCORE, WEIGHT_CODING, WEIGHT_CONTEXT, WEIGHT_MEMORY,
-    WEIGHT_QUANTIZATION, WEIGHT_SIZE,
+    BYTES_PER_GIGABYTE, CODING_FALLBACK_BONUS, CODING_KEYWORDS, DEFAULT_CONTEXT_LENGTH,
+    FALLBACK_7B_MEMORY_THRESHOLD_BYTES, FALLBACK_MODEL_3B, FALLBACK_MODEL_7B, IDEAL_CONTEXT_LENGTH,
+    MAX_LARGE_MODEL_B, MAX_MEDIUM_MODEL_B, MAX_SMALL_MODEL_B, MEMORY_COMFORT_DIVISOR,
+    MEMORY_FACTOR_COMFORTABLE, MEMORY_FACTOR_OVERFLOW, MEMORY_FACTOR_TIGHT, MEMORY_FACTOR_UNKNOWN,
+    MIN_CONTEXT_LENGTH, MIN_SMALL_MODEL_B, PARAMETERS_MILLION_DIVISOR, QUANT_FALLBACK_BONUS,
+    QUANT_KEYWORDS, SCORE_SCALE, SIZE_FACTOR_HUGE, SIZE_FACTOR_LARGE, SIZE_FACTOR_MEDIUM,
+    SIZE_FACTOR_SMALL, SIZE_FACTOR_UNKNOWN, STRONG_CODING_SCORE, WEIGHT_CODING, WEIGHT_CONTEXT,
+    WEIGHT_MEMORY, WEIGHT_QUANTIZATION, WEIGHT_SIZE,
 };
 use crate::ollama::OllamaModel;
 use std::path::Path;
@@ -37,23 +36,12 @@ pub struct ModelScore {
     pub reasons: Vec<String>,
 }
 
-/// Read total system memory from `/proc/meminfo` (Linux).
+/// Read total system memory from the hardware probe (defaults to `/proc`).
 ///
 /// # Returns
 /// Total physical memory in bytes, or `8 GiB` if the file cannot be read.
 pub fn total_system_memory_bytes() -> u64 {
-    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kilobytes: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES / BYTES_PER_KIB);
-            return kilobytes * BYTES_PER_KIB;
-        }
-    }
-    FALLBACK_SYSTEM_MEMORY_BYTES
+    crate::hardware::total_system_memory_bytes()
 }
 
 /// Parse a parameter-size label like `"7.6B"` or `"873.44M"` into billions.

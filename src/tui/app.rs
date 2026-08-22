@@ -1,17 +1,14 @@
 //! TUI application state and event handling.
 
+use super::chat::ChatRenderCache;
 use super::session::SessionLog;
-use super::{
-    chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, text_wrapped_height,
-    UiEvent,
-};
+use super::{chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, UiEvent};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
-    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, COMMANDS, LOG_LOAD_CHUNK,
-    MAX_CHAT_HISTORY_MESSAGES, MAX_LIVE_CHARS, MAX_LOG_LINES, PREFIXED_COMMANDS, SPINNER,
-    TOKEN_RATE_MIN_ELAPSED,
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
+    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, TOKEN_RATE_MIN_ELAPSED,
 };
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
@@ -71,6 +68,7 @@ pub(super) struct App {
     pub(super) rate_window_chars: u64,
     pub(super) rate_window_start: Option<Instant>,
     pub(super) pending_confirmation: Option<PendingConfirmation>,
+    pub(super) chat_render: ChatRenderCache,
 }
 
 impl App {
@@ -129,34 +127,8 @@ impl App {
             rate_window_chars: 0,
             rate_window_start: None,
             pending_confirmation: None,
+            chat_render: ChatRenderCache::new(),
         }
-    }
-
-    pub(super) fn suggestions(&self) -> Vec<String> {
-        if !self.input.starts_with('/') {
-            return vec![];
-        }
-        let query = &self.input[1..];
-        for (prefix, options) in PREFIXED_COMMANDS {
-            if query == prefix.trim_end() {
-                return options
-                    .iter()
-                    .map(|option| format!("/{prefix}{option}"))
-                    .collect();
-            }
-            if let Some(arg) = query.strip_prefix(prefix) {
-                return options
-                    .iter()
-                    .filter(|option| option.starts_with(arg))
-                    .map(|option| format!("/{prefix}{option}"))
-                    .collect();
-            }
-        }
-        COMMANDS
-            .iter()
-            .filter(|command| command.starts_with(query))
-            .map(|command| format!("/{command}"))
-            .collect()
     }
 
     pub(super) fn model_info_line(&self) -> String {
@@ -491,17 +463,6 @@ impl App {
         }
     }
 
-    pub(super) fn scroll_chat(&mut self, delta: i32) {
-        self.auto_scroll = false;
-        let next = self.chat_scroll_offset as i32 + delta;
-        if next <= 0 && delta < 0 && self.log.has_more_history() {
-            self.log.load_more(LOG_LOAD_CHUNK);
-            self.chat_scroll_offset = 0;
-        } else {
-            self.chat_scroll_offset = next.max(0) as usize;
-        }
-    }
-
     pub(super) fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
         if self.pending_confirmation.is_some() {
             return;
@@ -519,29 +480,6 @@ impl App {
             }
             _ => {}
         }
-    }
-
-    /// Handle clicks/drags on the chat scrollbar. Returns `true` when consumed.
-    fn handle_scrollbar_click(&mut self, column: u16, row: u16) -> bool {
-        let Some(area) = self.last_chat_area else {
-            return false;
-        };
-        if column != area.x + area.width.saturating_sub(2) {
-            return false;
-        }
-        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
-            return false;
-        }
-        let visible_height = area.height.saturating_sub(2).max(1) as usize;
-        let max_text_width = (area.width as usize).saturating_sub(2).max(1);
-        let content_height = text_wrapped_height(&self.chat_text(), max_text_width);
-        let max_scroll = content_height.saturating_sub(visible_height);
-        let relative = (row - area.y - 1) as usize;
-        let ratio = relative as f64 / visible_height.saturating_sub(1).max(1) as f64;
-        let offset = (max_scroll as f64 * ratio).round() as usize;
-        self.auto_scroll = offset >= max_scroll;
-        self.chat_scroll_offset = offset.min(max_scroll);
-        true
     }
 
     pub(super) fn open_clicked_file(&mut self, column: u16, row: u16) {
@@ -644,121 +582,6 @@ impl App {
                 self.picker = None
             }
             _ => {}
-        }
-    }
-
-    /// Keep the byte cursor on a valid UTF-8 boundary and within bounds.
-    fn clamp_cursor_to_boundary(&mut self) {
-        self.cursor = self.cursor.min(self.input.len());
-        while self.cursor > 0 && !self.input.is_char_boundary(self.cursor) {
-            self.cursor -= 1;
-        }
-    }
-
-    fn insert_char(&mut self, character: char) {
-        self.clamp_cursor_to_boundary();
-        self.input.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
-    }
-
-    pub(super) fn insert_text(&mut self, text: &str) {
-        if self.pending_confirmation.is_some() {
-            return;
-        }
-        self.clamp_cursor_to_boundary();
-        // Normalize CRLF/CR pastes to plain newlines so multiline paste behaves
-        // identically across terminals and never leaves stray control chars.
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.input.insert_str(self.cursor, &text);
-        self.cursor += text.len();
-    }
-
-    fn insert_newline(&mut self) {
-        self.clamp_cursor_to_boundary();
-        self.input.insert(self.cursor, '\n');
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        self.clamp_cursor_to_boundary();
-        if self.cursor > 0 {
-            let mut index = self.cursor;
-            while index > 0 && !self.input.is_char_boundary(index - 1) {
-                index -= 1;
-            }
-            self.input.remove(index - 1);
-            self.cursor = index - 1;
-        }
-    }
-
-    fn delete(&mut self) {
-        self.clamp_cursor_to_boundary();
-        if self.cursor < self.input.len() {
-            self.input.remove(self.cursor);
-        }
-    }
-
-    fn move_left(&mut self) {
-        self.clamp_cursor_to_boundary();
-        if self.cursor > 0 {
-            let mut index = self.cursor;
-            while index > 0 && !self.input.is_char_boundary(index - 1) {
-                index -= 1;
-            }
-            self.cursor = index - 1;
-        }
-    }
-
-    fn move_right(&mut self) {
-        self.clamp_cursor_to_boundary();
-        if self.cursor < self.input.len() {
-            let character = self.input[self.cursor..].chars().next().unwrap_or_default();
-            self.cursor += character.len_utf8();
-        }
-    }
-
-    fn move_up(&mut self) {
-        let suggestions = self.suggestions();
-        if !suggestions.is_empty() {
-            self.selected = self
-                .selected
-                .min(suggestions.len().saturating_sub(1))
-                .saturating_sub(1);
-        } else if !self.history.is_empty() {
-            let idx = match self.history_idx {
-                Some(i) if i > 0 => i - 1,
-                Some(_) => 0,
-                None => self.history.len().saturating_sub(1),
-            };
-            self.history_idx = Some(idx);
-            self.input = self.history[idx].clone();
-            self.cursor = self.input.len();
-        }
-    }
-
-    fn move_down(&mut self) {
-        let suggestions = self.suggestions();
-        if !suggestions.is_empty() {
-            self.selected = (self.selected + 1).min(suggestions.len().saturating_sub(1));
-        } else if let Some(idx) = self.history_idx {
-            if idx + 1 < self.history.len() {
-                self.history_idx = Some(idx + 1);
-                self.input = self.history[idx + 1].clone();
-                self.cursor = self.input.len();
-            } else {
-                self.history_idx = None;
-                self.input.clear();
-                self.cursor = 0;
-            }
-        }
-    }
-
-    fn accept_suggestion(&mut self) {
-        let suggestions = self.suggestions();
-        let selected = self.selected.min(suggestions.len().saturating_sub(1));
-        if let Some(suggestion) = suggestions.get(selected) {
-            self.input = suggestion.clone();
-            self.cursor = self.input.len();
         }
     }
 
