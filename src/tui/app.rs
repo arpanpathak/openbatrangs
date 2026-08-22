@@ -10,6 +10,7 @@ use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
     MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, TOKEN_RATE_MIN_ELAPSED,
 };
+use crate::engine::InferenceBackend;
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
 use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
@@ -151,8 +152,8 @@ impl App {
         self.current_prompt.clone()
     }
 
-    pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
-        let Ok(tags) = client.tags().await else {
+    pub(super) async fn refresh_model_info(&mut self, backend: &dyn InferenceBackend) {
+        let Ok(tags) = backend.tags().await else {
             return;
         };
         let Some(model) = tags.iter().find(|model| {
@@ -200,7 +201,7 @@ impl App {
     pub(super) fn start_task(
         &mut self,
         task: String,
-        client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         self.is_running = true;
@@ -221,7 +222,7 @@ impl App {
         }
         let chat_history = self.chat_history.clone();
         let tx2 = tx.clone();
-        let client2 = client.clone();
+        let backend2 = backend.clone();
         let run_config = self.run_config.clone();
         let model = self.model.clone();
         let prefs = ModelPrefs {
@@ -231,7 +232,7 @@ impl App {
         };
         let handle = tokio::spawn(async move {
             let result = run_agent_worker(
-                client2,
+                backend2,
                 run_config,
                 model,
                 prefs,
@@ -248,7 +249,7 @@ impl App {
     pub(super) fn handle_event(
         &mut self,
         event: UiEvent,
-        client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         match event {
@@ -315,7 +316,7 @@ impl App {
                 self.last_action.clear();
                 if let Some(next) = self.task_queue.pop_front() {
                     self.log.push("▶️  Starting next queued task.".to_string());
-                    self.start_task(next, client, tx);
+                    self.start_task(next, backend.clone(), tx);
                 } else {
                     self.status = "ready".to_string();
                 }
@@ -363,15 +364,16 @@ impl App {
         &mut self,
         key: event::KeyEvent,
         client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         if self.pending_confirmation.is_some() {
-            self.handle_confirmation_key(key, client, tx);
+            self.handle_confirmation_key(key, backend, tx);
             return Ok(false);
         }
 
         if self.picker.is_some() {
-            self.handle_picker_key(key, client).await;
+            self.handle_picker_key(key, backend.as_ref()).await;
             return Ok(false);
         }
 
@@ -383,7 +385,7 @@ impl App {
                     || self.pending_confirmation.is_some()
                     || !self.task_queue.is_empty()
                 {
-                    self.cancel_task(client, tx);
+                    self.cancel_task(backend, tx);
                 } else {
                     // Nothing to cancel: behave like a normal line-clear.
                     self.input.clear();
@@ -413,7 +415,7 @@ impl App {
                 {
                     self.insert_newline();
                 } else {
-                    return self.submit_input(client, tx).await;
+                    return self.submit_input(client, backend.clone(), tx).await;
                 }
             }
             KeyCode::Esc => {
@@ -431,7 +433,7 @@ impl App {
 
     pub(super) fn cancel_task(
         &mut self,
-        client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         if let Some(handle) = self.current_task.take() {
@@ -456,7 +458,7 @@ impl App {
         // tasks the user already queued behind it.
         if let Some(next) = self.task_queue.pop_front() {
             self.log.push("▶️  Starting next queued task.".to_string());
-            self.start_task(next, client, tx);
+            self.start_task(next, backend, tx);
         } else {
             self.is_running = false;
             self.status = "ready".to_string();
@@ -534,7 +536,7 @@ impl App {
     fn handle_confirmation_key(
         &mut self,
         key: event::KeyEvent,
-        client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(pending) = self.pending_confirmation.take() else {
@@ -542,7 +544,7 @@ impl App {
         };
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             let _ = pending.response.send(false);
-            self.cancel_task(client, tx);
+            self.cancel_task(backend, tx);
             return;
         }
         let answer = match key.code {
@@ -560,7 +562,7 @@ impl App {
         let _ = pending.response.send(answer);
     }
 
-    async fn handle_picker_key(&mut self, key: event::KeyEvent, client: &OllamaClient) {
+    async fn handle_picker_key(&mut self, key: event::KeyEvent, backend: &dyn InferenceBackend) {
         let Some(picker) = &mut self.picker else {
             return;
         };
@@ -573,7 +575,7 @@ impl App {
                 if let Some(name) = picker.models.get(picker.selected) {
                     self.model = Some(name.clone());
                     self.log.push(format!("✅ Model set to {name}"));
-                    self.refresh_model_info(client).await;
+                    self.refresh_model_info(backend).await;
                 }
                 self.picker = None;
             }
@@ -588,6 +590,7 @@ impl App {
     async fn submit_input(
         &mut self,
         client: &OllamaClient,
+        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         let task = self.input.trim().to_string();
@@ -608,7 +611,10 @@ impl App {
         if task.starts_with('/') {
             // Slash commands can hit the network (models, doctor, pull, ...).
             // Log failures into the chat instead of tearing down the whole TUI.
-            if let Err(error) = self.run_slash_command(client, &task, tx).await {
+            if let Err(error) = self
+                .run_slash_command(client, backend.as_ref(), &task, tx)
+                .await
+            {
                 self.log.push(format!("⚠️ {error:#}"));
             }
         } else if self.is_running {
@@ -616,7 +622,7 @@ impl App {
             self.log
                 .push("⏳ Queued — will run after the current task.".to_string());
         } else {
-            self.start_task(task, client, tx);
+            self.start_task(task, backend, tx);
         }
         Ok(self.should_quit)
     }
@@ -670,6 +676,10 @@ impl App {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn backend_for(client: &OllamaClient) -> Arc<dyn InferenceBackend> {
+        Arc::new(crate::engine::OllamaBackend::new(client.clone()))
+    }
 
     #[test]
     fn unicode_paste_does_not_panic() {
@@ -795,9 +805,9 @@ mod tests {
         let part_a = "A".repeat(30_000);
         let part_b = "B".repeat(30_000);
         let part_c = "C".repeat(30_000);
-        app.handle_event(UiEvent::Chunk(part_a.clone()), &client, &tx);
-        app.handle_event(UiEvent::Chunk(part_b.clone()), &client, &tx);
-        app.handle_event(UiEvent::Chunk(part_c.clone()), &client, &tx);
+        app.handle_event(UiEvent::Chunk(part_a.clone()), backend_for(&client), &tx);
+        app.handle_event(UiEvent::Chunk(part_b.clone()), backend_for(&client), &tx);
+        app.handle_event(UiEvent::Chunk(part_c.clone()), backend_for(&client), &tx);
         assert!(app.log.text().contains(&part_a));
         assert!(app.log.text().contains(&part_b));
         assert_eq!(app.live, part_c);
@@ -814,7 +824,7 @@ mod tests {
             content: "hello".to_string(),
         });
         app.live.push_str("world");
-        app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
+        app.handle_event(UiEvent::Done(Ok(())), backend_for(&client), &tx);
         assert_eq!(app.chat_history.len(), 2);
         assert_eq!(app.chat_history[1].role, "assistant");
         assert_eq!(app.chat_history[1].content, "world");
@@ -848,7 +858,7 @@ mod tests {
             role: "user".to_string(),
             content: "question".to_string(),
         });
-        app.cancel_task(&client, &tx);
+        app.cancel_task(backend_for(&client), &tx);
         assert!(app.chat_history.is_empty());
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
     }
@@ -864,7 +874,7 @@ mod tests {
                 prompt: "write file 'a.txt'?".to_string(),
                 response: response_tx,
             },
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_some());
@@ -883,7 +893,7 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_none());
@@ -902,7 +912,7 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_none());
@@ -922,7 +932,7 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(response_rx.try_recv() == Ok(false));
@@ -940,7 +950,7 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_some());
@@ -957,7 +967,7 @@ mod tests {
             prompt: "write file 'a.txt'?".to_string(),
             response: response_tx,
         });
-        app.cancel_task(&client, &tx);
+        app.cancel_task(backend_for(&client), &tx);
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
     }
@@ -969,7 +979,7 @@ mod tests {
         let mut app = test_app();
         app.is_running = true;
         app.task_queue.push_back("next task".to_string());
-        app.cancel_task(&client, &tx);
+        app.cancel_task(backend_for(&client), &tx);
         assert!(app.task_queue.is_empty());
         assert!(app.is_running, "queued task should start immediately");
         assert!(app.current_task.is_some());
@@ -991,7 +1001,7 @@ mod tests {
             response: response_tx,
         });
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        app.handle_confirmation_key(key, &client, &tx);
+        app.handle_confirmation_key(key, backend_for(&client), &tx);
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(!app.is_running);
@@ -1006,7 +1016,10 @@ mod tests {
         app.input = "hello".to_string();
         app.cursor = 5;
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        let result = app
+            .handle_key(key, &client, backend_for(&client), &tx)
+            .await
+            .unwrap();
         assert!(!result);
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
@@ -1025,7 +1038,8 @@ mod tests {
             selected: 0,
         });
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        app.handle_picker_key(key, &client).await;
+        app.handle_picker_key(key, backend_for(&client).as_ref())
+            .await;
         assert!(app.picker.is_none());
         assert!(
             app.model.is_none(),
@@ -1053,7 +1067,7 @@ mod tests {
                 name: "samantha-mistral:7b".to_string(),
                 result: Ok(()),
             },
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(!app.is_running);
@@ -1072,7 +1086,7 @@ mod tests {
                 name: "bad-model".to_string(),
                 result: Err("registry not found".to_string()),
             },
-            &client,
+            backend_for(&client),
             &tx,
         );
         assert!(!app.is_running);
@@ -1089,7 +1103,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
-        app.handle_event(UiEvent::SetupDone(Ok(())), &client, &tx);
+        app.handle_event(UiEvent::SetupDone(Ok(())), backend_for(&client), &tx);
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
         assert!(app.log.iter().any(|line| line.contains("Setup finished")));
@@ -1102,7 +1116,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.input = "/model missing-model".to_string();
-        let result = app.submit_input(&client, &tx).await;
+        let result = app.submit_input(&client, backend_for(&client), &tx).await;
         assert!(result.is_ok(), "TUI must survive slash-command failures");
         assert!(
             app.log.iter().any(|line| line.contains('⚠')),

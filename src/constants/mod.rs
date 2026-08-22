@@ -9,6 +9,7 @@ pub mod ansi;
 pub mod banner;
 pub mod cli;
 pub mod commands;
+pub mod engine;
 pub mod models;
 pub mod ollama;
 pub mod perf;

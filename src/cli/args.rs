@@ -2,7 +2,11 @@
 
 use crate::constants::agent::MAX_CONTEXT_TOKENS;
 use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
-use clap::{Parser, Subcommand};
+use crate::constants::engine::{
+    BENCH_DEFAULT_DEVICE_COST_USD, BENCH_DEFAULT_ELECTRICITY_USD_PER_KWH, BENCH_DEFAULT_ITERATIONS,
+    BENCH_DEFAULT_MAX_TOKENS,
+};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Command-line interface definition.
@@ -21,6 +25,10 @@ pub(crate) struct Cli {
     /// Ollama server URL.
     #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
     pub(crate) ollama_url: String,
+
+    /// Inference engine for the agent (experimental; `ollama` or `tensorrt`).
+    #[arg(long, global = true, default_value = "ollama", value_name = "NAME")]
+    pub(crate) engine: String,
 
     /// Model to use; auto-discovered when omitted.
     #[arg(short, long, global = true)]
@@ -79,6 +87,68 @@ pub(crate) enum Commands {
         #[arg(value_name = "MODEL")]
         model: String,
     },
+    /// Experimental inference engines and benchmarks.
+    Experimental {
+        #[command(subcommand)]
+        command: ExperimentalCommand,
+    },
+}
+
+/// Experimental subcommands.
+#[derive(Subcommand)]
+pub(crate) enum ExperimentalCommand {
+    /// Probe which experimental engines are available on this machine.
+    Doctor,
+    /// Benchmark engines and print a performance-per-watt-per-dollar report.
+    Bench(BenchArgs),
+}
+
+/// Arguments for `experimental bench`.
+#[derive(Args, Clone)]
+pub(crate) struct BenchArgs {
+    /// Engines to benchmark; defaults to every available engine.
+    #[arg(short, long, value_delimiter = ',', value_name = "ENGINE")]
+    pub(crate) engines: Vec<String>,
+
+    /// Model tag (Ollama) or ONNX model path (TensorRT).
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+
+    /// Prompt used for Ollama benchmarks.
+    #[arg(long, value_name = "PROMPT")]
+    pub(crate) prompt: Option<String>,
+
+    /// Maximum tokens for Ollama generation.
+    #[arg(long, default_value_t = BENCH_DEFAULT_MAX_TOKENS)]
+    pub(crate) max_tokens: usize,
+
+    /// Number of benchmark iterations per engine.
+    #[arg(long, default_value_t = BENCH_DEFAULT_ITERATIONS)]
+    pub(crate) iterations: usize,
+
+    /// TensorRT input sequence length used for prefill tokens/sec.
+    #[arg(long = "seq-len", default_value_t = crate::constants::engine::TRTEXEC_DEFAULT_SEQ_LEN)]
+    pub(crate) seq_len: usize,
+
+    /// TensorRT repetitions per trtexec run.
+    #[arg(long = "avg-runs", default_value_t = crate::constants::engine::TRTEXEC_DEFAULT_AVG_RUNS)]
+    pub(crate) avg_runs: usize,
+
+    /// Optional trtexec --shapes string for dynamic ONNX inputs.
+    #[arg(long = "trt-shapes", value_name = "SHAPES")]
+    pub(crate) trt_shapes: Option<String>,
+
+    /// Markdown report output path (empty writes to stdout only).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output: Option<PathBuf>,
+
+    /// Device purchase price in USD for amortization math.
+    #[arg(long, default_value_t = BENCH_DEFAULT_DEVICE_COST_USD)]
+    pub(crate) device_cost_usd: f64,
+
+    /// Electricity price in USD per kWh.
+    #[arg(long, default_value_t = BENCH_DEFAULT_ELECTRICITY_USD_PER_KWH)]
+    pub(crate) electricity_usd_per_kwh: f64,
 }
 
 #[cfg(test)]
@@ -91,6 +161,7 @@ mod tests {
         let cli = Cli::parse_from(["openbatrangs"]);
         assert!(cli.task.is_empty());
         assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(cli.engine, "ollama");
         assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
         assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
         assert_eq!(cli.max_ctx, MAX_CONTEXT_TOKENS);
@@ -151,6 +222,38 @@ mod tests {
         match cli.command {
             Some(Commands::Pull { model }) => assert_eq!(model, "samantha-mistral:7b"),
             _ => panic!("expected pull subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_engine_flag() {
+        let cli = Cli::parse_from(["openbatrangs", "--engine", "tensorrt", "list-models"]);
+        assert_eq!(cli.engine, "tensorrt");
+    }
+
+    #[test]
+    fn parses_experimental_bench_subcommand() {
+        let cli = Cli::parse_from([
+            "openbatrangs",
+            "experimental",
+            "bench",
+            "--engines",
+            "ollama,tensorrt",
+            "--model",
+            "model.onnx",
+            "--iterations",
+            "2",
+        ]);
+        match cli.command {
+            Some(Commands::Experimental { command }) => match command {
+                ExperimentalCommand::Bench(args) => {
+                    assert_eq!(args.engines, vec!["ollama", "tensorrt"]);
+                    assert_eq!(args.model.as_deref(), Some("model.onnx"));
+                    assert_eq!(args.iterations, 2);
+                }
+                _ => panic!("expected bench subcommand"),
+            },
+            _ => panic!("expected experimental subcommand"),
         }
     }
 }

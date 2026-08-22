@@ -5,15 +5,15 @@ use crate::constants::models::{
     CONTEXT_LENGTH_KEY_SUFFIX, FALLBACK_CONTEXT_LENGTH, GOOD_MODEL_SCORE_THRESHOLD,
     MEMORY_BUDGET_DENOMINATOR, MEMORY_BUDGET_NUMERATOR, MODEL_SELECT_MAX_ATTEMPTS,
 };
+use crate::engine::InferenceBackend;
 use crate::models;
 use crate::models::ModelScore;
-use crate::ollama::OllamaClient;
 use anyhow::{anyhow, bail, Result};
 
 /// Resolve a model from an optional explicit slot or auto-selection.
 ///
 /// # Arguments
-/// - `client`: Ollama HTTP client.
+/// - `backend`: inference backend.
 /// - `model_slot`: explicit model tag, if any.
 /// - `prefs`: model selection preferences.
 /// - `mem_budget`: usable memory in bytes.
@@ -22,7 +22,7 @@ use anyhow::{anyhow, bail, Result};
 /// # Returns
 /// The selected model score.
 pub(crate) async fn resolve_model(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     model_slot: &Option<String>,
     prefs: &ModelPrefs,
     mem_budget: u64,
@@ -34,15 +34,15 @@ pub(crate) async fn resolve_model(
                 model: Some(name.clone()),
                 ..prefs.clone()
             };
-            select_model(client, &explicit, mem_budget, on_status).await
+            select_model(backend, &explicit, mem_budget, on_status).await
         }
-        None => select_model(client, prefs, mem_budget, on_status).await,
+        None => select_model(backend, prefs, mem_budget, on_status).await,
     }
 }
 
 /// Select the best model, auto-pulling a fallback when needed.
 async fn select_model(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     prefs: &ModelPrefs,
     mem_budget: u64,
     on_status: &(dyn Fn(&str) + Sync),
@@ -56,15 +56,15 @@ async fn select_model(
         }
 
         if let Some(explicit) = &prefs.model {
-            return select_explicit_model(client, explicit, prefs.min_context, mem_budget).await;
+            return select_explicit_model(backend, explicit, prefs.min_context, mem_budget).await;
         }
 
-        let tags = client.tags().await?;
+        let tags = backend.tags().await?;
         if tags.is_empty() {
             if prefs.is_auto_pull_disabled {
                 bail!("no models installed and --no-auto-pull is set");
             }
-            pull_fallback(client, mem_budget, on_status).await?;
+            pull_fallback(backend, mem_budget, on_status).await?;
             continue;
         }
 
@@ -74,7 +74,7 @@ async fn select_model(
                     "⚠️  Best local model '{}' scores {:.0}/100 for agentic coding.",
                     best.name, best.score
                 ));
-                pull_fallback(client, mem_budget, on_status).await?;
+                pull_fallback(backend, mem_budget, on_status).await?;
             }
             Some(best) => return Ok(best.clone()),
             None if prefs.is_auto_pull_disabled => {
@@ -83,7 +83,7 @@ async fn select_model(
                     prefs.min_context
                 );
             }
-            None => pull_fallback(client, mem_budget, on_status).await?,
+            None => pull_fallback(backend, mem_budget, on_status).await?,
         }
     }
 }
@@ -95,7 +95,7 @@ fn needs_fallback(best: &ModelScore, prefs: &ModelPrefs) -> bool {
 
 /// Validate and score an explicitly requested model tag.
 async fn select_explicit_model(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     explicit: &str,
     min_context: u64,
     mem_budget: u64,
@@ -106,7 +106,7 @@ async fn select_explicit_model(
              Just run `openbatrangs setup` and it will pull a coding model for you."
         );
     }
-    let tags = client.tags().await?;
+    let tags = backend.tags().await?;
     let model = tags
         .iter()
         .find(|model| model.name == explicit)
@@ -119,21 +119,24 @@ async fn select_explicit_model(
 
 /// Pull the recommended fallback model and report progress.
 async fn pull_fallback(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     mem_budget: u64,
     on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let fallback = models::recommended_fallback_model(mem_budget);
     on_status(&format!("⬇️  Pulling a better default: {fallback}"));
-    client.pull(fallback, on_status).await
+    backend.pull(fallback, on_status).await
 }
 
-/// Resolve the context length of a model from Ollama metadata.
+/// Resolve the context length of a model from engine metadata.
 ///
 /// # Returns
 /// Context length in tokens, or `FALLBACK_CONTEXT_LENGTH` if unknown.
-pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
-    let show = client.show(model).await?;
+pub(crate) async fn resolve_model_context(
+    backend: &dyn InferenceBackend,
+    model: &str,
+) -> Result<u64> {
+    let show = backend.show(model).await?;
     Ok(context_length_from_show(&show))
 }
 

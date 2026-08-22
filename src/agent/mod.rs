@@ -21,7 +21,8 @@ use crate::constants::agent::{
 use crate::constants::ansi::{
     ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
 };
-use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
+use crate::engine::InferenceBackend;
+use crate::ollama::{ChatMessage, ChatRequest};
 use crate::tools;
 use anyhow::{bail, Context, Result};
 use execute::{execute_tool_or_report_error, print_changed_files};
@@ -53,14 +54,14 @@ enum AgentStepOutcome {
 /// Immutable inputs shared by every agent step.
 struct AgentRunContext<'a> {
     config: &'a AgentConfig,
-    client: &'a OllamaClient,
+    backend: &'a dyn InferenceBackend,
     model: &'a str,
     num_ctx: u64,
 }
 
 pub async fn run_agent<R: Reporter, C: Confirmer>(
     config: &AgentConfig,
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     model: &str,
     model_context: u64,
     task: &str,
@@ -76,7 +77,7 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
 
     let step_context = AgentRunContext {
         config,
-        client,
+        backend,
         model,
         num_ctx,
     };
@@ -117,7 +118,7 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
 
     let request = chat_request(context.model, messages, context.num_ctx);
     let (content, answer_was_streamed) = stream_model_response(
-        context.client,
+        context.backend,
         request,
         reporter,
         context.config.show_thinking,

@@ -8,6 +8,7 @@ use super::app::{App, PickerState};
 use super::split_command;
 use super::{run_pull_worker, run_setup_worker, UiEvent};
 use crate::cli::AgentMode;
+use crate::engine::InferenceBackend;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ impl App {
     pub(super) async fn run_slash_command(
         &mut self,
         client: &OllamaClient,
+        backend: &dyn InferenceBackend,
         line: &str,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<()> {
@@ -29,7 +31,7 @@ impl App {
             "help" | "h" => self.log_help(),
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
-            "model" => self.handle_model_command(client, arg).await?,
+            "model" => self.handle_model_command(client, backend, arg).await?,
             "pull" => self.handle_pull_command(client, arg, tx).await?,
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
@@ -88,6 +90,7 @@ impl App {
     async fn handle_model_command(
         &mut self,
         client: &OllamaClient,
+        backend: &dyn InferenceBackend,
         arg: &str,
     ) -> anyhow::Result<()> {
         if arg.is_empty() {
@@ -97,7 +100,7 @@ impl App {
 
         let tags = client.tags().await?;
         if model_installed(&tags, arg) {
-            self.activate_model(client, arg).await;
+            self.activate_model(backend, arg).await;
         } else {
             self.log.push(format!(
                 "❌ Model '{arg}' is not installed. Pull it first with /pull {arg}."
@@ -115,10 +118,10 @@ impl App {
         }
     }
 
-    async fn activate_model(&mut self, client: &OllamaClient, name: &str) {
+    async fn activate_model(&mut self, backend: &dyn InferenceBackend, name: &str) {
         self.model = Some(name.to_string());
         self.log.push(format!("✅ Model set to {name}"));
-        self.refresh_model_info(client).await;
+        self.refresh_model_info(backend).await;
     }
 
     async fn handle_pull_command(

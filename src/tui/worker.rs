@@ -5,10 +5,12 @@ use crate::agent::{AgentConfig, Confirmer, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
 use crate::constants::agent::MIN_CONTEXT_TOKENS;
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE, MAX_CHAT_HISTORY_MESSAGES};
+use crate::engine::InferenceBackend;
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use anyhow::Result;
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -61,7 +63,7 @@ impl Reporter for ChannelReporter {
 }
 
 pub(crate) async fn run_agent_worker(
-    client: OllamaClient,
+    backend: Arc<dyn InferenceBackend>,
     config: AgentRunConfig,
     model_slot: Option<String>,
     prefs: ModelPrefs,
@@ -70,7 +72,7 @@ pub(crate) async fn run_agent_worker(
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     if config.mode == AgentMode::Chat {
-        return run_chat_worker(client, config, model_slot, prefs, task, chat_history, tx).await;
+        return run_chat_worker(backend, config, model_slot, prefs, task, chat_history, tx).await;
     }
 
     let mem_budget = calculate_memory_budget();
@@ -78,8 +80,15 @@ pub(crate) async fn run_agent_worker(
     let on_status = move |msg: &str| {
         let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
     };
-    let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
-    let model_context = resolve_model_context(&client, &selected.name).await?;
+    let selected = resolve_model(
+        backend.as_ref(),
+        &model_slot,
+        &prefs,
+        mem_budget,
+        &on_status,
+    )
+    .await?;
+    let model_context = resolve_model_context(backend.as_ref(), &selected.name).await?;
     let agent_config = AgentConfig {
         cwd: config.cwd,
         max_steps: config.max_steps,
@@ -92,7 +101,7 @@ pub(crate) async fn run_agent_worker(
     let mut confirmer = ChannelConfirmer { tx };
     crate::agent::run_agent(
         &agent_config,
-        &client,
+        backend.as_ref(),
         &selected.name,
         model_context,
         &task,
@@ -104,7 +113,7 @@ pub(crate) async fn run_agent_worker(
 
 /// Run a plain chat completion: no tools, just conversation and code.
 async fn run_chat_worker(
-    client: OllamaClient,
+    backend: Arc<dyn InferenceBackend>,
     config: AgentRunConfig,
     model_slot: Option<String>,
     prefs: ModelPrefs,
@@ -117,9 +126,16 @@ async fn run_chat_worker(
     let on_status = move |msg: &str| {
         let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
     };
-    let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
+    let selected = resolve_model(
+        backend.as_ref(),
+        &model_slot,
+        &prefs,
+        mem_budget,
+        &on_status,
+    )
+    .await?;
     let max_ctx = config.max_ctx.max(MIN_CONTEXT_TOKENS);
-    let num_ctx = resolve_model_context(&client, &selected.name)
+    let num_ctx = resolve_model_context(backend.as_ref(), &selected.name)
         .await?
         .clamp(MIN_CONTEXT_TOKENS, max_ctx);
 
@@ -141,7 +157,7 @@ async fn run_chat_worker(
         })),
     };
 
-    let mut stream = Box::pin(client.chat_stream(request).await?);
+    let mut stream = Box::pin(backend.chat_stream(request).await?);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let _ = tx.send(UiEvent::Chunk(chunk));

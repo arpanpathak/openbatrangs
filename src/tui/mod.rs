@@ -34,6 +34,7 @@ pub(super) use worker::{run_agent_worker, run_pull_worker, run_setup_worker, UiE
 
 use crate::cli::Cli;
 use crate::constants::tui::TICK_MILLIS;
+use crate::engine::InferenceBackend;
 use crate::ollama::OllamaClient;
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
@@ -53,9 +54,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
+pub(crate) async fn run(
+    cli: &Cli,
+    client: &OllamaClient,
+    backend: std::sync::Arc<dyn InferenceBackend>,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, cli, client).await;
+    let result = run_loop(&mut terminal, cli, client, backend).await;
     teardown_terminal(&mut terminal)?;
     result
 }
@@ -118,11 +123,12 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     cli: &Cli,
     client: &OllamaClient,
+    backend: std::sync::Arc<dyn InferenceBackend>,
 ) -> Result<()> {
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
     let mut app = app::App::new(cli, tegrastats_shared);
-    app.refresh_model_info(client).await;
+    app.refresh_model_info(backend.as_ref()).await;
     let mut mouse_capture = false;
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut events = event::EventStream::new();
@@ -138,13 +144,13 @@ async fn run_loop(
         tokio::select! {
             maybe = rx.recv() => {
                 if let Some(event) = maybe {
-                    app.handle_event(event, client, &tx);
+                    app.handle_event(event, backend.clone(), &tx);
                 }
             }
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
-                        if app.handle_key(key, client, &tx).await? {
+                        if app.handle_key(key, client, backend.clone(), &tx).await? {
                             break;
                         }
                     }
@@ -224,7 +230,9 @@ mod tests {
             .unwrap();
         tx.send(UiEvent::Done(Ok(()))).unwrap();
         while let Ok(event) = rx.try_recv() {
-            app.handle_event(event, &client, &tx);
+            let backend: std::sync::Arc<dyn crate::engine::InferenceBackend> =
+                std::sync::Arc::new(crate::engine::OllamaBackend::new(client.clone()));
+            app.handle_event(event, backend, &tx);
         }
 
         let backend = TestBackend::new(100, 40);

@@ -5,11 +5,13 @@
 //! read from `/proc`.
 
 mod gpu;
+mod power;
 
 use crate::constants::perf::{
     GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
 };
 use gpu::{parse_nvidia_smi, parse_tegrastats, GpuStats};
+pub use power::PowerSampler;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};

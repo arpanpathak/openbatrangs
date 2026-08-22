@@ -3,24 +3,34 @@
 use crate::agent::{self, AgentConfig};
 use crate::banner;
 use crate::cli::{agent_run_config, model_prefs_from_cli, AgentRunConfig, Cli, ModelPrefs};
+use crate::engine::InferenceBackend;
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::OllamaClient;
 use anyhow::{bail, Result};
+use std::sync::Arc;
 
 /// Run the agent for a task, or start the TUI when the task is empty.
 pub(crate) async fn run_agent_or_tui(
     cli: &Cli,
     client: &OllamaClient,
+    backend: Arc<dyn InferenceBackend>,
     task: &[String],
 ) -> Result<()> {
     if task.is_empty() {
-        return crate::tui::run(cli, client).await;
+        return crate::tui::run(cli, client, backend).await;
     }
 
     banner::print_banner();
     let prefs = model_prefs_from_cli(cli);
     let config = agent_run_config(cli);
-    run_agent_task(client, &config, &mut None, &prefs, &task.join(" ")).await
+    run_agent_task(
+        backend.as_ref(),
+        &config,
+        &mut None,
+        &prefs,
+        &task.join(" "),
+    )
+    .await
 }
 
 /// Trim a task and reject empty input.
@@ -34,7 +44,7 @@ fn validate_task(task: &str) -> Result<String> {
 
 /// Run the agent once for a single task using stdout output.
 async fn run_agent_task(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     config: &AgentRunConfig,
     model_slot: &mut Option<String>,
     prefs: &ModelPrefs,
@@ -43,13 +53,13 @@ async fn run_agent_task(
     let task = validate_task(task)?;
 
     let mem_budget = calculate_memory_budget();
-    let selected = resolve_model(client, model_slot, prefs, mem_budget, &|msg| {
+    let selected = resolve_model(backend, model_slot, prefs, mem_budget, &|msg| {
         println!("{msg}")
     })
     .await?;
     *model_slot = Some(selected.name.clone());
 
-    let model_context = resolve_model_context(client, &selected.name).await?;
+    let model_context = resolve_model_context(backend, &selected.name).await?;
     println!(
         "\n🚀 Agent\n   model:   {}\n   cwd:     {}\n   steps:   {}\n   context: {}",
         selected.name,
@@ -71,7 +81,7 @@ async fn run_agent_task(
     let mut confirmer = agent::StdioConfirmer;
     agent::run_agent(
         &agent_config,
-        client,
+        backend,
         &selected.name,
         model_context,
         &task,

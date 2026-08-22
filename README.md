@@ -192,6 +192,21 @@ If nothing suitable is installed, it can automatically pull a recommended model
 --no-auto-pull       Never auto-pull models
 ```
 
+## Experimental engines (separate branch)
+
+On the `experimental/tensorrt-bench` branch there is a Rust-only experimental
+harness that benchmarks **Ollama** vs **TensorRT (`trtexec`)** on Jetson-class
+hardware and reports tokens/sec, watts, tokens/sec/W, and estimated USD per
+million tokens.
+
+```sh
+cargo run -- experimental doctor
+cargo run -- experimental bench
+```
+
+See [`experimental/README.md`](experimental/README.md) for details, measured
+results, and how to add new engines.
+
 ## Roadmap
 
 This is the first working version. Future steps for standalone distribution:

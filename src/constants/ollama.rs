@@ -11,3 +11,4 @@ pub const API_TAGS_PATH: &str = "/api/tags";
 pub const API_SHOW_PATH: &str = "/api/show";
 pub const API_CHAT_PATH: &str = "/api/chat";
 pub const API_PULL_PATH: &str = "/api/pull";
+pub const API_GENERATE_PATH: &str = "/api/generate";

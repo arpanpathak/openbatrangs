@@ -2,19 +2,20 @@
 
 use super::reporter::Reporter;
 use crate::constants::ansi::{ANSI_GREEN_CHECK, COLOR_CYAN, COLOR_RESET};
-use crate::ollama::{ChatRequest, OllamaClient};
+use crate::engine::InferenceBackend;
+use crate::ollama::ChatRequest;
 use anyhow::Result;
 use futures_util::StreamExt;
 
 /// Streams a model response, forwarding thought/answer text to the reporter,
 /// and returns the complete raw JSON content plus whether the answer was streamed.
 pub(super) async fn stream_model_response<R: Reporter>(
-    client: &OllamaClient,
+    backend: &dyn InferenceBackend,
     request: ChatRequest,
     reporter: &mut R,
     show_thinking: bool,
 ) -> Result<(String, bool)> {
-    let mut stream = Box::pin(client.chat_stream(request).await?);
+    let mut stream = Box::pin(backend.chat_stream(request).await?);
     let mut buffer = String::new();
     let mut thought = StreamState::new("thought", show_thinking);
     let mut answer = StreamState::new("answer", true);

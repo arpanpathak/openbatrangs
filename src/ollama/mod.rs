@@ -9,16 +9,22 @@
 mod stream;
 mod types;
 
-pub(crate) use types::{ChatMessage, ChatRequest, OllamaModel, PullRequest, TagsResponse};
+pub(crate) use types::{
+    ChatMessage, ChatRequest, GenerateRequest, GenerateResponse, OllamaModel, PullRequest,
+    TagsResponse,
+};
 
 use crate::constants::ollama::{
-    API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
-    HTTP_TIMEOUT_SECONDS,
+    API_CHAT_PATH, API_GENERATE_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH,
+    CONNECT_TIMEOUT_SECONDS, HTTP_TIMEOUT_SECONDS,
 };
 use anyhow::{anyhow, Context, Result};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Duration;
+
+/// Nanoseconds per second, used to normalize Ollama durations.
+const NANOSECONDS_PER_SECOND: f64 = 1_000_000_000.0;
 
 /// Client for talking to a local Ollama server.
 #[derive(Clone)]
@@ -176,6 +182,54 @@ impl OllamaClient {
         Ok(stream)
     }
 
+    /// Run a non-streaming generation and return benchmark metrics.
+    ///
+    /// # Returns
+    /// `(generated_text, prompt_tokens, generated_tokens, total_seconds)`
+    /// using Ollama's own counters from `/api/generate`.
+    pub async fn generate_bench(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<(String, u64, u64, f64)> {
+        let response = self
+            .http
+            .post(format!("{}{API_GENERATE_PATH}", self.base_url))
+            .json(&GenerateRequest {
+                model: model.to_string(),
+                prompt: prompt.to_string(),
+                stream: false,
+                options: Some(serde_json::json!({
+                    "num_predict": max_tokens,
+                    "temperature": 0.0,
+                })),
+            })
+            .send()
+            .await
+            .context("failed to call Ollama /api/generate")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Ollama /api/generate returned HTTP {status}: {text}"
+            ));
+        }
+
+        let body: GenerateResponse = response
+            .json()
+            .await
+            .context("failed to parse Ollama /api/generate response")?;
+        let total_seconds = body.total_duration as f64 / NANOSECONDS_PER_SECOND;
+        Ok((
+            body.response,
+            body.prompt_eval_count,
+            body.eval_count,
+            total_seconds,
+        ))
+    }
+
     /// Download a model from the Ollama registry.
     ///
     /// # Arguments
@@ -184,7 +238,11 @@ impl OllamaClient {
     ///
     /// # Returns
     /// `Ok(())` once the pull finishes successfully.
-    pub async fn pull(&self, name: &str, on_status: &(dyn Fn(&str) + Sync)) -> Result<()> {
+    pub async fn pull(
+        &self,
+        name: &str,
+        on_status: &(dyn for<'a> Fn(&'a str) + Sync),
+    ) -> Result<()> {
         on_status(&format!(
             "⬇️  Pulling model '{name}' from Ollama registry..."
         ));

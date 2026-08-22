@@ -72,6 +72,37 @@ pub struct PullRequest {
     pub stream: bool,
 }
 
+/// Payload for `POST /api/generate` (non-streaming benchmark helper).
+#[derive(Serialize, Debug)]
+pub struct GenerateRequest {
+    /// Model tag to use.
+    pub model: String,
+    /// Prompt text.
+    pub prompt: String,
+    /// Whether to stream the response.
+    pub stream: bool,
+    /// Optional sampling options (`num_predict`, `temperature`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Value>,
+}
+
+/// Response body of `POST /api/generate` (non-streaming benchmark helper).
+#[derive(Deserialize, Debug, Default)]
+pub struct GenerateResponse {
+    /// Generated completion text.
+    #[serde(default)]
+    pub response: String,
+    /// Prompt tokens evaluated.
+    #[serde(default)]
+    pub prompt_eval_count: u64,
+    /// Generated tokens.
+    #[serde(default)]
+    pub eval_count: u64,
+    /// Total request duration in nanoseconds (Ollama-reported).
+    #[serde(default)]
+    pub total_duration: u64,
+}
+
 /// A meaningful event extracted from one Ollama NDJSON stream line.
 pub enum StreamLine {
     /// Assistant content delta.
