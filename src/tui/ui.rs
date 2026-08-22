@@ -13,8 +13,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Wrap,
+    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
 };
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -36,6 +36,7 @@ pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     render_input_box(f, app, chunks[5]);
     render_cursor(f, app, chunks[5]);
     render_model_picker(f, app);
+    render_confirmation(f, app);
 }
 
 fn perf_visible(app: &App, area_height: u16) -> bool {
@@ -215,17 +216,17 @@ fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
 fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
-    let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width)) as u16;
-    let visible_height = area.height.saturating_sub(2);
+    let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
+    let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content_height.saturating_sub(visible_height);
     // Re-stick to the bottom when the user scrolls down to the latest line, but
     // never yank them back down while they are reading older content.
     if app.auto_scroll {
         // Already following the latest output.
-    } else if app.chat_scroll_offset >= max_scroll as usize {
+    } else if app.chat_scroll_offset >= max_scroll {
         app.auto_scroll = true;
     } else {
-        app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll as usize);
+        app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll);
     }
     let scroll_y = chat_scroll(app, &chat_text, area);
     let chat_lines = highlighted_chat_lines(&chat_text);
@@ -236,7 +237,7 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 .title(" openBatarangs "),
         )
         .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
+        .scroll((scroll_y.min(u16::MAX as usize) as u16, 0));
     f.render_widget(chat, area);
 
     if max_scroll > 0 && area.width >= 3 {
@@ -253,7 +254,7 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .track_symbol(Some("│"))
             .thumb_symbol("█");
         let mut scrollbar_state =
-            ScrollbarState::new(max_scroll as usize).position(scroll_y.min(max_scroll) as usize);
+            ScrollbarState::new(max_scroll).position(scroll_y.min(max_scroll));
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
@@ -262,14 +263,20 @@ fn chat_inner_width(area_width: u16) -> usize {
     (area_width as usize).saturating_sub(2).max(1)
 }
 
-/// Compute a safe vertical scroll offset that never overflows `u16`.
-fn chat_scroll(app: &App, chat_text: &str, area: Rect) -> u16 {
-    let content_height = text_wrapped_height(chat_text, chat_inner_width(area.width)) as u16;
-    let visible_height = area.height.saturating_sub(2);
+/// Compute a safe vertical scroll offset as `usize`.
+///
+/// Content can be much taller than `u16::MAX` after long streamed output wraps
+/// into hundreds of thousands of visual rows. Keeping the math in `usize`
+/// prevents the previous `as u16` truncation that made scrolling stop/glitch
+/// once the chat grew past 65,535 rows. Ratatui only accepts `u16` offsets, so
+/// callers cap the final value before passing it to `Paragraph::scroll`.
+fn chat_scroll(app: &App, chat_text: &str, area: Rect) -> usize {
+    let content_height = text_wrapped_height(chat_text, chat_inner_width(area.width));
+    let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content_height.saturating_sub(visible_height);
     match app.auto_scroll {
         true => max_scroll,
-        false => (app.chat_scroll_offset as u16).min(max_scroll),
+        false => app.chat_scroll_offset.min(max_scroll),
     }
 }
 
@@ -279,7 +286,9 @@ fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
         AgentMode::Chat => " · chat",
         AgentMode::Agent => "",
     };
-    let status_line = if app.is_running {
+    let status_line = if app.pending_confirmation.is_some() {
+        "❓ y = confirm · n / Esc = abort".to_string()
+    } else if app.is_running {
         let spin = app.spinner();
         if app.last_action.is_empty() {
             format!("{spin} {}{} — thinking...", app.status, mode_suffix)
@@ -445,6 +454,43 @@ fn render_model_picker(f: &mut ratatui::Frame, app: &App) {
     );
 }
 
+fn render_confirmation(f: &mut ratatui::Frame, app: &App) {
+    let Some(pending) = &app.pending_confirmation else {
+        return;
+    };
+    let area = centered_rect(60, 35, f.area());
+    let lines = vec![
+        Line::from(Span::styled(
+            "❓ Confirmation required",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(pending.prompt.clone())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press y to confirm · n / Esc to abort",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" confirm ")
+            .border_style(Style::default().fg(Color::Yellow)),
+        area,
+    );
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        area.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        }),
+    );
+}
+
 fn centered_rect(
     percent_x: u16,
     percent_y: u16,
@@ -482,6 +528,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use clap::Parser;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -517,5 +565,79 @@ mod tests {
         let rows = wrap_text_to_lines(text, 10);
         assert_eq!(rows.concat(), text);
         assert!(rows.len() > 1);
+    }
+
+    #[test]
+    fn chat_scroll_handles_content_taller_than_u16_max() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let shared = Arc::new(Mutex::new(None));
+        let mut app = App::new(&cli, shared);
+        // One wrapped line with more visual rows than u16::MAX. Before the fix,
+        // the `as u16` truncation made the scroll offset wrap to a tiny value.
+        app.live = "x".repeat(70_000 * 80);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+
+        app.auto_scroll = true;
+        let bottom = chat_scroll(&app, &app.chat_text(), area);
+        assert!(
+            bottom > u16::MAX as usize,
+            "true bottom scroll must stay in usize space, got {bottom}"
+        );
+
+        app.auto_scroll = false;
+        app.chat_scroll_offset = 10_000;
+        assert_eq!(chat_scroll(&app, &app.chat_text(), area), 10_000);
+    }
+
+    #[test]
+    fn scroll_offset_cap_never_wraps_for_ratatui() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let shared = Arc::new(Mutex::new(None));
+        let mut app = App::new(&cli, shared);
+        app.live = "x".repeat(70_000 * 80);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        app.auto_scroll = true;
+        let scroll_y = chat_scroll(&app, &app.chat_text(), area);
+        let ratatui_scroll = scroll_y.min(u16::MAX as usize) as u16;
+        assert_eq!(ratatui_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn confirmation_popup_renders_prompt() {
+        use crate::tui::app::PendingConfirmation;
+
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let shared = Arc::new(Mutex::new(None));
+        let mut app = App::new(&cli, shared);
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "write file 'a.txt'?".to_string(),
+            response: response_tx,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| super::ui(frame, &mut app))
+            .expect("draw with confirmation popup should not panic");
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Confirmation required"));
+        assert!(content.contains("write file 'a.txt'?"));
+        assert!(content.contains("Press y to confirm"));
     }
 }

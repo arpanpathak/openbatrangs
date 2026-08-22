@@ -9,6 +9,7 @@
 //! This module owns the orchestration: the run loop, step handling, and
 //! conversation-history management.
 
+mod confirm;
 mod execute;
 mod reporter;
 mod stream;
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 use stream::stream_model_response;
 use tool::{parse_agent_response, Tool, ToolCall};
 
+pub use confirm::{Confirmer, StdioConfirmer};
 pub use reporter::{Reporter, StdoutReporter};
 
 #[derive(Debug, Clone)]
@@ -56,13 +58,14 @@ struct AgentRunContext<'a> {
     num_ctx: u64,
 }
 
-pub async fn run_agent<R: Reporter>(
+pub async fn run_agent<R: Reporter, C: Confirmer>(
     config: &AgentConfig,
     client: &OllamaClient,
     model: &str,
     model_context: u64,
     task: &str,
     reporter: &mut R,
+    confirmer: &mut C,
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
 
@@ -84,6 +87,7 @@ pub async fn run_agent<R: Reporter>(
             &mut messages,
             &mut changed_files,
             reporter,
+            confirmer,
             step,
         )
         .await?;
@@ -101,11 +105,12 @@ pub async fn run_agent<R: Reporter>(
 }
 
 /// Run one agent iteration: stream a response, parse it, and act on it.
-async fn run_agent_step<R: Reporter>(
+async fn run_agent_step<R: Reporter, C: Confirmer>(
     context: &AgentRunContext<'_>,
     messages: &mut Vec<ChatMessage>,
     changed_files: &mut Vec<String>,
     reporter: &mut R,
+    confirmer: &mut C,
     step: usize,
 ) -> Result<AgentStepOutcome> {
     report_step_start(reporter, step, context.config.max_steps, context.model);
@@ -142,6 +147,7 @@ async fn run_agent_step<R: Reporter>(
             messages,
             changed_files,
             reporter,
+            confirmer,
             &content,
             tool_call,
         )
@@ -153,11 +159,12 @@ async fn run_agent_step<R: Reporter>(
 }
 
 /// Execute a parsed tool call and append the assistant/tool messages.
-async fn handle_tool_call<R: Reporter>(
+async fn handle_tool_call<R: Reporter, C: Confirmer>(
     config: &AgentConfig,
     messages: &mut Vec<ChatMessage>,
     changed_files: &mut Vec<String>,
     reporter: &mut R,
+    confirmer: &mut C,
     content: &str,
     tool_call: ToolCall,
 ) -> Result<AgentStepOutcome> {
@@ -177,7 +184,8 @@ async fn handle_tool_call<R: Reporter>(
         "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
         tool.describe()
     ));
-    let result_text = execute_tool_or_report_error(config, &config.cwd, &tool, changed_files).await;
+    let result_text =
+        execute_tool_or_report_error(config, &config.cwd, &tool, changed_files, confirmer).await;
     reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
 
     messages.push(ChatMessage {

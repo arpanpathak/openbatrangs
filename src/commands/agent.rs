@@ -68,6 +68,7 @@ async fn run_agent_task(
     };
 
     let mut reporter = agent::StdoutReporter;
+    let mut confirmer = agent::StdioConfirmer;
     agent::run_agent(
         &agent_config,
         client,
@@ -75,6 +76,7 @@ async fn run_agent_task(
         model_context,
         &task,
         &mut reporter,
+        &mut confirmer,
     )
     .await
 }

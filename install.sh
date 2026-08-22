@@ -18,9 +18,10 @@ ARCH="$(uname -m)"
 
 case "${ARCH}" in
   aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+  x86_64|amd64) TARGET="x86_64-unknown-linux-gnu" ;;
   *)
     echo "❌ Unsupported architecture for the prebuilt binary: ${ARCH}"
-    echo "   Prebuilt releases currently target aarch64 (Jetson/ARM64)."
+    echo "   Prebuilt releases currently target aarch64 and x86_64 Linux."
     echo "   To build from source instead:"
     echo "     git clone https://github.com/arpanpathak/openbatrangs.git"
     echo "     cd openbatrangs && cargo build --release"
@@ -50,19 +51,30 @@ fi
 BIN="${BIN_DIR}/openbatrangs"
 
 # --- Download --------------------------------------------------------------
+if ! command -v curl >/dev/null 2>&1; then
+  echo "❌ curl is required to download openBatarangs."
+  exit 1
+fi
+
 echo "🦇 Installing/updating openBatarangs (${TARGET})..."
 mkdir -p "${BIN_DIR}"
 TMP_BIN="$(mktemp)"
+trap 'rm -f "${TMP_BIN}"' EXIT HUP INT TERM
 
 echo "⬇️  Downloading ${BASE_URL}/openbatrangs-${TARGET} ..."
 if ! curl -fsSL -o "${TMP_BIN}" "${BASE_URL}/openbatrangs-${TARGET}"; then
   echo "❌ Download failed. Check your network or GitHub availability."
-  rm -f "${TMP_BIN}"
+  exit 1
+fi
+
+if [ ! -s "${TMP_BIN}" ]; then
+  echo "❌ Downloaded file is empty. The release asset may not exist yet."
   exit 1
 fi
 
 chmod +x "${TMP_BIN}"
 mv "${TMP_BIN}" "${BIN}"
+trap - EXIT HUP INT TERM
 
 echo "✅ Installed: ${BIN}"
 

@@ -28,6 +28,11 @@ pub(super) struct PickerState {
     pub(super) selected: usize,
 }
 
+pub(super) struct PendingConfirmation {
+    pub(super) prompt: String,
+    pub(super) response: tokio::sync::oneshot::Sender<bool>,
+}
+
 pub(super) struct App {
     pub(super) log: SessionLog,
     pub(super) live: String,
@@ -65,6 +70,7 @@ pub(super) struct App {
     pub(super) last_chat_area: Option<Rect>,
     pub(super) rate_window_chars: u64,
     pub(super) rate_window_start: Option<Instant>,
+    pub(super) pending_confirmation: Option<PendingConfirmation>,
 }
 
 impl App {
@@ -122,6 +128,7 @@ impl App {
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,
+            pending_confirmation: None,
         }
     }
 
@@ -373,6 +380,10 @@ impl App {
                     }
                 }
             }
+            UiEvent::ConfirmRequest { prompt, response } => {
+                self.pending_confirmation = Some(PendingConfirmation { prompt, response });
+                self.status = "confirm".to_string();
+            }
         }
     }
 
@@ -382,6 +393,11 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
+        if self.pending_confirmation.is_some() {
+            self.handle_confirmation_key(key);
+            return Ok(false);
+        }
+
         if self.picker.is_some() {
             self.handle_picker_key(key, client).await;
             return Ok(false);
@@ -436,6 +452,9 @@ impl App {
         if let Some(handle) = self.current_task.take() {
             handle.abort();
         }
+        if let Some(pending) = self.pending_confirmation.take() {
+            let _ = pending.response.send(false);
+        }
         if self.run_config.mode == AgentMode::Chat
             && self
                 .chat_history
@@ -464,6 +483,9 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        if self.pending_confirmation.is_some() {
+            return;
+        }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
             MouseEventKind::ScrollDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
@@ -547,6 +569,30 @@ impl App {
         chat_text
     }
 
+    /// Resolve a pending tool confirmation from a single keypress.
+    ///
+    /// `y`/`Y` confirms, anything else that is explicitly a choice (`n`, `N`,
+    /// `Esc`, `Enter`) aborts, and unrelated keys are ignored so the modal stays
+    /// open.
+    fn handle_confirmation_key(&mut self, key: event::KeyEvent) {
+        let Some(pending) = self.pending_confirmation.take() else {
+            return;
+        };
+        let answer = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => Some(false),
+            _ => None,
+        };
+        let Some(answer) = answer else {
+            self.pending_confirmation = Some(pending);
+            return;
+        };
+        if !answer {
+            self.log.push("⛔ Tool aborted by user.".to_string());
+        }
+        let _ = pending.response.send(answer);
+    }
+
     async fn handle_picker_key(&mut self, key: event::KeyEvent, client: &OllamaClient) {
         let Some(picker) = &mut self.picker else {
             return;
@@ -584,6 +630,9 @@ impl App {
     }
 
     pub(super) fn insert_text(&mut self, text: &str) {
+        if self.pending_confirmation.is_some() {
+            return;
+        }
         self.clamp_cursor_to_boundary();
         // Normalize CRLF/CR pastes to plain newlines so multiline paste behaves
         // identically across terminals and never leaves stray control chars.
@@ -837,6 +886,18 @@ mod tests {
     }
 
     #[test]
+    fn scroll_chat_keeps_large_offsets_in_usize_space() {
+        let mut app = test_app();
+        // Offsets larger than u16::MAX are possible with very long wrapped
+        // output; they must never be truncated to a small u16 value.
+        app.chat_scroll_offset = u16::MAX as usize + 100;
+        app.scroll_chat(1);
+        assert_eq!(app.chat_scroll_offset, u16::MAX as usize + 101);
+        app.scroll_chat(-1);
+        assert_eq!(app.chat_scroll_offset, u16::MAX as usize + 100);
+    }
+
+    #[test]
     fn scrollbar_click_jumps_to_scroll_position() {
         let mut app = test_app();
         for i in 0..100 {
@@ -925,6 +986,89 @@ mod tests {
         app.cancel_task();
         assert!(app.chat_history.is_empty());
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
+    }
+
+    #[test]
+    fn confirm_request_sets_pending_confirmation() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        app.handle_event(
+            UiEvent::ConfirmRequest {
+                prompt: "write file 'a.txt'?".to_string(),
+                response: response_tx,
+            },
+            &client,
+            &tx,
+        );
+        assert!(app.pending_confirmation.is_some());
+        assert_eq!(app.status, "confirm");
+    }
+
+    #[test]
+    fn confirmation_key_yes_sends_true() {
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "write file 'a.txt'?".to_string(),
+            response: response_tx,
+        });
+        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.pending_confirmation.is_none());
+        assert!(response_rx.try_recv() == Ok(true));
+    }
+
+    #[test]
+    fn confirmation_key_no_sends_false() {
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "run command: rm -rf /?".to_string(),
+            response: response_tx,
+        });
+        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.pending_confirmation.is_none());
+        assert!(response_rx.try_recv() == Ok(false));
+        assert!(app.log.iter().any(|line| line.contains("aborted")));
+    }
+
+    #[test]
+    fn confirmation_key_esc_aborts() {
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "run command: make?".to_string(),
+            response: response_tx,
+        });
+        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(response_rx.try_recv() == Ok(false));
+    }
+
+    #[test]
+    fn confirmation_key_ignores_unrelated_keys() {
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "write file 'a.txt'?".to_string(),
+            response: response_tx,
+        });
+        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.pending_confirmation.is_some());
+        assert!(response_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancel_task_resolves_pending_confirmation_with_false() {
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.pending_confirmation = Some(PendingConfirmation {
+            prompt: "write file 'a.txt'?".to_string(),
+            response: response_tx,
+        });
+        app.cancel_task();
+        assert!(app.pending_confirmation.is_none());
+        assert!(response_rx.try_recv() == Ok(false));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Background agent/chat workers for the TUI.
 
 use super::text::strip_ansi;
-use crate::agent::{AgentConfig, Reporter};
+use crate::agent::{AgentConfig, Confirmer, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
 use crate::constants::agent::MIN_CONTEXT_TOKENS;
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE, MAX_CHAT_HISTORY_MESSAGES};
@@ -10,6 +10,7 @@ use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub(crate) enum UiEvent {
     Log(String),
@@ -20,6 +21,29 @@ pub(crate) enum UiEvent {
         result: Result<(), String>,
     },
     SetupDone(Result<(), String>),
+    /// The agent worker needs a y/n decision from the TUI user.
+    ConfirmRequest {
+        prompt: String,
+        response: oneshot::Sender<bool>,
+    },
+}
+
+/// TUI-side confirmation: sends the prompt to the UI and waits for the keypress.
+struct ChannelConfirmer {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl Confirmer for ChannelConfirmer {
+    async fn confirm(&mut self, prompt: &str) -> Result<bool> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = self.tx.send(UiEvent::ConfirmRequest {
+            prompt: prompt.to_string(),
+            response: response_tx,
+        });
+        // If the UI is gone (quit/cancel), treat it as "no" so the agent
+        // aborts the tool instead of hanging forever.
+        Ok(response_rx.await.unwrap_or(false))
+    }
 }
 
 struct ChannelReporter {
@@ -64,7 +88,8 @@ pub(crate) async fn run_agent_worker(
         show_thinking: config.show_thinking,
         max_ctx: config.max_ctx,
     };
-    let mut reporter = ChannelReporter { tx };
+    let mut reporter = ChannelReporter { tx: tx.clone() };
+    let mut confirmer = ChannelConfirmer { tx };
     crate::agent::run_agent(
         &agent_config,
         &client,
@@ -72,6 +97,7 @@ pub(crate) async fn run_agent_worker(
         model_context,
         &task,
         &mut reporter,
+        &mut confirmer,
     )
     .await
 }
@@ -151,4 +177,34 @@ pub(crate) async fn run_setup_worker(client: OllamaClient, tx: mpsc::UnboundedSe
     let _ = tx.send(UiEvent::SetupDone(
         result.map_err(|error| format!("{error:#}")),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn channel_confirmer_sends_prompt_and_waits_for_answer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut confirmer = ChannelConfirmer { tx };
+        let handle = tokio::spawn(async move { confirmer.confirm("write file 'a.txt'?").await });
+
+        let event = rx.recv().await.expect("confirmer should send an event");
+        let UiEvent::ConfirmRequest { prompt, response } = event else {
+            panic!("expected ConfirmRequest");
+        };
+        assert_eq!(prompt, "write file 'a.txt'?");
+        response.send(true).unwrap();
+        assert!(handle.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_confirmer_aborts_when_ui_is_gone() {
+        // `_` (not `_rx`) drops the receiver immediately, so the confirmer's
+        // prompt can never be answered and must resolve to "no".
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut confirmer = ChannelConfirmer { tx };
+        let result = confirmer.confirm("run command: make?").await.unwrap();
+        assert!(!result, "dropped UI must be treated as 'no'");
+    }
 }
