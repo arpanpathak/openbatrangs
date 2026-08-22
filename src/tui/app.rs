@@ -303,7 +303,11 @@ impl App {
                 }
                 self.live.push_str(&msg);
                 if self.live.len() > MAX_LIVE_CHARS {
-                    self.live.truncate(MAX_LIVE_CHARS);
+                    // Spill the overflow into the disk-backed log instead of
+                    // truncating, so long code is never silently lost.
+                    let overflow = std::mem::take(&mut self.live);
+                    self.log.push(overflow);
+                    self.log.push("… (output continued)".to_string());
                 }
             }
             UiEvent::Done(result) => {
@@ -861,6 +865,22 @@ mod tests {
         };
         app.last_chat_area = Some(area);
         assert!(!app.handle_scrollbar_click(area.width - 5, area.y + 5));
+    }
+
+    #[test]
+    fn long_streamed_output_spills_to_log_without_loss() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let part_a = "A".repeat(30_000);
+        let part_b = "B".repeat(30_000);
+        let part_c = "C".repeat(30_000);
+        app.handle_event(UiEvent::Chunk(part_a.clone()), &client, &tx);
+        app.handle_event(UiEvent::Chunk(part_b.clone()), &client, &tx);
+        app.handle_event(UiEvent::Chunk(part_c.clone()), &client, &tx);
+        assert!(app.log.text().contains(&part_a));
+        assert!(app.log.text().contains(&part_b));
+        assert_eq!(app.live, part_c);
     }
 
     #[test]
