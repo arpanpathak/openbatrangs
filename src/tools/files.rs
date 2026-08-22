@@ -132,7 +132,17 @@ pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<Strin
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create parent dirs for {}", file.display()))?;
         let canonical_parent = ensure_canonical_within_root(root, parent)?;
-        canonical_parent.join(file.file_name().unwrap_or_default())
+        let file = canonical_parent.join(file.file_name().unwrap_or_default());
+        // Parent-directory symlinks are already rejected by canonicalization,
+        // but a symlink in the final component would still be followed by
+        // `std::fs::write`. Refuse to write through any existing symlink so the
+        // agent can never modify a file outside the workspace.
+        if let Ok(metadata) = std::fs::symlink_metadata(&file) {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to write through symlink: {}", file.display());
+            }
+        }
+        file
     } else {
         file
     };
@@ -358,6 +368,47 @@ mod tests {
         assert!(list_files(&root, "escape", 5).is_err());
         assert!(grep_files(&root, "secret", "escape", 10).is_err());
         assert!(write_file(&root, "escape/new.txt", "x").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_symlink_file_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        fs::write(outside.join("secret.txt"), "original").unwrap();
+        symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+
+        let result = write_file(&root, "link.txt", "pwned");
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "original",
+            "writing through a symlink must not touch the target"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_dangling_symlink_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        symlink(outside.join("new.txt"), root.join("dangling.txt")).unwrap();
+
+        assert!(write_file(&root, "dangling.txt", "x").is_err());
+        assert!(
+            !outside.join("new.txt").exists(),
+            "dangling symlink target must not be created outside the workspace"
+        );
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();

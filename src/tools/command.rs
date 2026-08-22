@@ -23,7 +23,14 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
     let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
     create_sandbox_dirs(root);
     let mut process = tokio::process::Command::new("bash");
-    process.arg("-lc").arg(command).current_dir(root);
+    process
+        .arg("-lc")
+        .arg(command)
+        .current_dir(root)
+        // If `timeout` below fires, the `Child` is dropped and must take the
+        // shell (and its descendants) down with it instead of leaving an
+        // orphaned command running in the background.
+        .kill_on_drop(true);
     for (key, value) in agent_sandbox_env(root) {
         process.env(key, value);
     }
@@ -117,6 +124,21 @@ mod tests {
         assert!(result.is_err());
         let error = format!("{:#}", result.unwrap_err());
         assert!(error.contains("timed out"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_child_process() {
+        let root = temp_dir();
+        // If the timed-out shell is not killed, it will eventually `touch done`
+        // after the sleep finishes, proving the child leaked.
+        let result = run_command(&root, "sleep 2 && touch done", 1).await;
+        assert!(result.is_err());
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(
+            !root.join("done").exists(),
+            "timed-out command must not keep running after the timeout"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

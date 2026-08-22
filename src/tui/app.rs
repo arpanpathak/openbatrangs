@@ -407,7 +407,16 @@ impl App {
             KeyCode::Char(character)
                 if character == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.cancel_task(client, tx);
+                if self.is_running
+                    || self.pending_confirmation.is_some()
+                    || !self.task_queue.is_empty()
+                {
+                    self.cancel_task(client, tx);
+                } else {
+                    // Nothing to cancel: behave like a normal line-clear.
+                    self.input.clear();
+                    self.cursor = 0;
+                }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_newline();
@@ -631,6 +640,9 @@ impl App {
                 self.picker = None;
             }
             KeyCode::Esc => self.picker = None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.picker = None
+            }
             _ => {}
         }
     }
@@ -1161,6 +1173,41 @@ mod tests {
         assert!(response_rx.try_recv() == Ok(false));
         assert!(!app.is_running);
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_at_idle_clears_input_without_cancel_log() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        assert!(!result);
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert!(
+            !app.log.iter().any(|line| line.contains("Cancelled")),
+            "idle Ctrl+C must not log a fake cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn picker_ctrl_c_closes_picker() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let mut app = test_app();
+        app.picker = Some(PickerState {
+            models: vec!["qwen2.5-coder:7b".to_string()],
+            selected: 0,
+        });
+        let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_picker_key(key, &client).await;
+        assert!(app.picker.is_none());
+        assert!(
+            app.model.is_none(),
+            "closing picker must not change the model"
+        );
     }
 
     #[test]
