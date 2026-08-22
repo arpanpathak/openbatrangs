@@ -447,11 +447,16 @@ mod tests {
     use ratatui::Terminal;
     use std::sync::{Arc, Mutex};
 
+    fn test_backend() -> std::sync::Arc<dyn crate::engine::InferenceBackend> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        std::sync::Arc::new(crate::engine::OllamaBackend::new(client))
+    }
+
     #[test]
     fn input_height_grows_for_wrapped_long_lines() {
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
+        let mut app = App::new(&cli, shared, test_backend());
         let width = 20u16;
         let area_height = 40u16;
 
@@ -466,7 +471,7 @@ mod tests {
     fn input_height_handles_wide_unicode() {
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
+        let mut app = App::new(&cli, shared, test_backend());
         let width = 20u16;
         let area_height = 40u16;
         app.input = "😀".repeat(30);
@@ -486,7 +491,7 @@ mod tests {
     fn chat_scroll_handles_content_taller_than_u16_max() {
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
+        let mut app = App::new(&cli, shared, test_backend());
         // One wrapped line with more visual rows than u16::MAX. Before the fix,
         // the `as u16` truncation made the scroll offset wrap to a tiny value.
         app.live = "x".repeat(70_000 * 80);
@@ -515,7 +520,7 @@ mod tests {
     fn scroll_offset_cap_never_wraps_for_ratatui() {
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
+        let mut app = App::new(&cli, shared, test_backend());
         app.live = "x".repeat(70_000 * 80);
         let area = Rect {
             x: 0,
@@ -537,7 +542,7 @@ mod tests {
 
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
+        let mut app = App::new(&cli, shared, test_backend());
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
         app.pending_confirmation = Some(PendingConfirmation {
             prompt: "write file 'a.txt'?".to_string(),

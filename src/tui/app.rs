@@ -50,6 +50,8 @@ pub(super) struct App {
     pub(super) picker: Option<PickerState>,
     pub(super) should_quit: bool,
     pub(super) model: Option<String>,
+    pub(super) engine_name: String,
+    pub(super) backend: Arc<dyn InferenceBackend>,
     pub(super) server_url: String,
     pub(super) model_info: Option<String>,
     pub(super) current_prompt: Option<String>,
@@ -73,7 +75,11 @@ pub(super) struct App {
 }
 
 impl App {
-    pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
+    pub(super) fn new(
+        cli: &Cli,
+        tegrastats: Arc<Mutex<Option<String>>>,
+        backend: Arc<dyn InferenceBackend>,
+    ) -> Self {
         let banner = strip_ansi(&crate::banner::banner_text());
         let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut log = SessionLog::new(MAX_LOG_LINES);
@@ -101,6 +107,8 @@ impl App {
             picker: None,
             should_quit: false,
             model: cli.model.clone(),
+            engine_name: cli.engine.clone(),
+            backend,
             server_url: cli.ollama_url.clone(),
             model_info: None,
             current_prompt: None,
@@ -138,10 +146,14 @@ impl App {
             AgentMode::Plan => "plan",
             AgentMode::Chat => "chat",
         };
+        let engine = &self.engine_name;
         match &self.model_info {
-            Some(info) => format!("{info} · mode: {mode} · server {}", self.server_url),
+            Some(info) => format!(
+                "{info} · mode: {mode} · engine: {engine} · server {}",
+                self.server_url
+            ),
             None => format!(
-                "model: {} · mode: {mode} · server {}",
+                "model: {} · mode: {mode} · engine: {engine} · server {}",
                 self.model.as_deref().unwrap_or("auto"),
                 self.server_url
             ),
@@ -152,8 +164,8 @@ impl App {
         self.current_prompt.clone()
     }
 
-    pub(super) async fn refresh_model_info(&mut self, backend: &dyn InferenceBackend) {
-        let Ok(tags) = backend.tags().await else {
+    pub(super) async fn refresh_model_info(&mut self) {
+        let Ok(tags) = self.backend.tags().await else {
             return;
         };
         let Some(model) = tags.iter().find(|model| {
@@ -198,12 +210,7 @@ impl App {
             .unwrap_or("")
     }
 
-    pub(super) fn start_task(
-        &mut self,
-        task: String,
-        backend: Arc<dyn InferenceBackend>,
-        tx: &mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(super) fn start_task(&mut self, task: String, tx: &mpsc::UnboundedSender<UiEvent>) {
         self.is_running = true;
         self.status = "running".to_string();
         self.last_action.clear();
@@ -222,7 +229,7 @@ impl App {
         }
         let chat_history = self.chat_history.clone();
         let tx2 = tx.clone();
-        let backend2 = backend.clone();
+        let backend2 = self.backend.clone();
         let run_config = self.run_config.clone();
         let model = self.model.clone();
         let prefs = ModelPrefs {
@@ -246,12 +253,7 @@ impl App {
         self.current_task = Some(handle);
     }
 
-    pub(super) fn handle_event(
-        &mut self,
-        event: UiEvent,
-        backend: Arc<dyn InferenceBackend>,
-        tx: &mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(super) fn handle_event(&mut self, event: UiEvent, tx: &mpsc::UnboundedSender<UiEvent>) {
         match event {
             UiEvent::Log(msg) => {
                 if msg.starts_with("🔧") {
@@ -316,7 +318,7 @@ impl App {
                 self.last_action.clear();
                 if let Some(next) = self.task_queue.pop_front() {
                     self.log.push("▶️  Starting next queued task.".to_string());
-                    self.start_task(next, backend.clone(), tx);
+                    self.start_task(next, tx);
                 } else {
                     self.status = "ready".to_string();
                 }
@@ -364,16 +366,15 @@ impl App {
         &mut self,
         key: event::KeyEvent,
         client: &OllamaClient,
-        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         if self.pending_confirmation.is_some() {
-            self.handle_confirmation_key(key, backend, tx);
+            self.handle_confirmation_key(key, tx);
             return Ok(false);
         }
 
         if self.picker.is_some() {
-            self.handle_picker_key(key, backend.as_ref()).await;
+            self.handle_picker_key(key).await;
             return Ok(false);
         }
 
@@ -385,7 +386,7 @@ impl App {
                     || self.pending_confirmation.is_some()
                     || !self.task_queue.is_empty()
                 {
-                    self.cancel_task(backend, tx);
+                    self.cancel_task(tx);
                 } else {
                     // Nothing to cancel: behave like a normal line-clear.
                     self.input.clear();
@@ -415,7 +416,7 @@ impl App {
                 {
                     self.insert_newline();
                 } else {
-                    return self.submit_input(client, backend.clone(), tx).await;
+                    return self.submit_input(client, tx).await;
                 }
             }
             KeyCode::Esc => {
@@ -431,11 +432,7 @@ impl App {
         Ok(self.should_quit)
     }
 
-    pub(super) fn cancel_task(
-        &mut self,
-        backend: Arc<dyn InferenceBackend>,
-        tx: &mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(super) fn cancel_task(&mut self, tx: &mpsc::UnboundedSender<UiEvent>) {
         if let Some(handle) = self.current_task.take() {
             handle.abort();
         }
@@ -458,7 +455,7 @@ impl App {
         // tasks the user already queued behind it.
         if let Some(next) = self.task_queue.pop_front() {
             self.log.push("▶️  Starting next queued task.".to_string());
-            self.start_task(next, backend, tx);
+            self.start_task(next, tx);
         } else {
             self.is_running = false;
             self.status = "ready".to_string();
@@ -536,7 +533,6 @@ impl App {
     fn handle_confirmation_key(
         &mut self,
         key: event::KeyEvent,
-        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(pending) = self.pending_confirmation.take() else {
@@ -544,7 +540,7 @@ impl App {
         };
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             let _ = pending.response.send(false);
-            self.cancel_task(backend, tx);
+            self.cancel_task(tx);
             return;
         }
         let answer = match key.code {
@@ -562,7 +558,7 @@ impl App {
         let _ = pending.response.send(answer);
     }
 
-    async fn handle_picker_key(&mut self, key: event::KeyEvent, backend: &dyn InferenceBackend) {
+    async fn handle_picker_key(&mut self, key: event::KeyEvent) {
         let Some(picker) = &mut self.picker else {
             return;
         };
@@ -575,7 +571,7 @@ impl App {
                 if let Some(name) = picker.models.get(picker.selected) {
                     self.model = Some(name.clone());
                     self.log.push(format!("✅ Model set to {name}"));
-                    self.refresh_model_info(backend).await;
+                    self.refresh_model_info().await;
                 }
                 self.picker = None;
             }
@@ -590,7 +586,6 @@ impl App {
     async fn submit_input(
         &mut self,
         client: &OllamaClient,
-        backend: Arc<dyn InferenceBackend>,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
         let task = self.input.trim().to_string();
@@ -611,10 +606,7 @@ impl App {
         if task.starts_with('/') {
             // Slash commands can hit the network (models, doctor, pull, ...).
             // Log failures into the chat instead of tearing down the whole TUI.
-            if let Err(error) = self
-                .run_slash_command(client, backend.as_ref(), &task, tx)
-                .await
-            {
+            if let Err(error) = self.run_slash_command(client, &task, tx).await {
                 self.log.push(format!("⚠️ {error:#}"));
             }
         } else if self.is_running {
@@ -622,7 +614,7 @@ impl App {
             self.log
                 .push("⏳ Queued — will run after the current task.".to_string());
         } else {
-            self.start_task(task, backend, tx);
+            self.start_task(task, tx);
         }
         Ok(self.should_quit)
     }
@@ -681,10 +673,15 @@ mod tests {
         Arc::new(crate::engine::OllamaBackend::new(client.clone()))
     }
 
+    fn backend() -> Arc<dyn InferenceBackend> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        backend_for(&client)
+    }
+
     #[test]
     fn unicode_paste_does_not_panic() {
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)), backend());
         let text = "NVIDIA — 3% → 😀\n| table |\n```rust\nfn main() {}\n```";
         for ch in text.chars() {
             app.insert_char(ch);
@@ -700,7 +697,7 @@ mod tests {
     #[test]
     fn paste_multiline_crlf_unicode_keeps_cursor_valid() {
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)), backend());
         let text = "line1 😀\r\nline2 🦇\r\n```rust\r\nfn main() {}\r\n```";
         app.insert_text(text);
         assert!(app.input.is_char_boundary(app.cursor));
@@ -719,7 +716,7 @@ mod tests {
 
     fn test_app() -> App {
         let cli = Cli::parse_from(["openbatrangs"]);
-        App::new(&cli, Arc::new(Mutex::new(None)))
+        App::new(&cli, Arc::new(Mutex::new(None)), backend())
     }
 
     #[test]
@@ -799,15 +796,14 @@ mod tests {
 
     #[test]
     fn long_streamed_output_spills_to_log_without_loss() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let part_a = "A".repeat(30_000);
         let part_b = "B".repeat(30_000);
         let part_c = "C".repeat(30_000);
-        app.handle_event(UiEvent::Chunk(part_a.clone()), backend_for(&client), &tx);
-        app.handle_event(UiEvent::Chunk(part_b.clone()), backend_for(&client), &tx);
-        app.handle_event(UiEvent::Chunk(part_c.clone()), backend_for(&client), &tx);
+        app.handle_event(UiEvent::Chunk(part_a.clone()), &tx);
+        app.handle_event(UiEvent::Chunk(part_b.clone()), &tx);
+        app.handle_event(UiEvent::Chunk(part_c.clone()), &tx);
         assert!(app.log.text().contains(&part_a));
         assert!(app.log.text().contains(&part_b));
         assert_eq!(app.live, part_c);
@@ -815,7 +811,6 @@ mod tests {
 
     #[test]
     fn done_event_appends_assistant_to_chat_history() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.run_config.mode = AgentMode::Chat;
@@ -824,7 +819,7 @@ mod tests {
             content: "hello".to_string(),
         });
         app.live.push_str("world");
-        app.handle_event(UiEvent::Done(Ok(())), backend_for(&client), &tx);
+        app.handle_event(UiEvent::Done(Ok(())), &tx);
         assert_eq!(app.chat_history.len(), 2);
         assert_eq!(app.chat_history[1].role, "assistant");
         assert_eq!(app.chat_history[1].content, "world");
@@ -850,7 +845,6 @@ mod tests {
 
     #[test]
     fn cancel_task_removes_pending_chat_user_message() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.run_config.mode = AgentMode::Chat;
@@ -858,14 +852,13 @@ mod tests {
             role: "user".to_string(),
             content: "question".to_string(),
         });
-        app.cancel_task(backend_for(&client), &tx);
+        app.cancel_task(&tx);
         assert!(app.chat_history.is_empty());
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
     }
 
     #[test]
     fn confirm_request_sets_pending_confirmation() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
@@ -874,7 +867,6 @@ mod tests {
                 prompt: "write file 'a.txt'?".to_string(),
                 response: response_tx,
             },
-            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_some());
@@ -883,7 +875,6 @@ mod tests {
 
     #[test]
     fn confirmation_key_yes_sends_true() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
@@ -893,7 +884,6 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
-            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_none());
@@ -902,7 +892,6 @@ mod tests {
 
     #[test]
     fn confirmation_key_no_sends_false() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
@@ -912,7 +901,6 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
-            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_none());
@@ -922,7 +910,6 @@ mod tests {
 
     #[test]
     fn confirmation_key_esc_aborts() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
@@ -930,17 +917,12 @@ mod tests {
             prompt: "run command: make?".to_string(),
             response: response_tx,
         });
-        app.handle_confirmation_key(
-            event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            backend_for(&client),
-            &tx,
-        );
+        app.handle_confirmation_key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(response_rx.try_recv() == Ok(false));
     }
 
     #[test]
     fn confirmation_key_ignores_unrelated_keys() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
@@ -950,7 +932,6 @@ mod tests {
         });
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            backend_for(&client),
             &tx,
         );
         assert!(app.pending_confirmation.is_some());
@@ -959,7 +940,6 @@ mod tests {
 
     #[test]
     fn cancel_task_resolves_pending_confirmation_with_false() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
@@ -967,19 +947,18 @@ mod tests {
             prompt: "write file 'a.txt'?".to_string(),
             response: response_tx,
         });
-        app.cancel_task(backend_for(&client), &tx);
+        app.cancel_task(&tx);
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
     }
 
     #[tokio::test]
     async fn cancel_task_starts_next_queued_task() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
         app.task_queue.push_back("next task".to_string());
-        app.cancel_task(backend_for(&client), &tx);
+        app.cancel_task(&tx);
         assert!(app.task_queue.is_empty());
         assert!(app.is_running, "queued task should start immediately");
         assert!(app.current_task.is_some());
@@ -991,7 +970,6 @@ mod tests {
 
     #[test]
     fn confirmation_ctrl_c_cancels_task_and_resolves_false() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
@@ -1001,7 +979,7 @@ mod tests {
             response: response_tx,
         });
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        app.handle_confirmation_key(key, backend_for(&client), &tx);
+        app.handle_confirmation_key(key, &tx);
         assert!(app.pending_confirmation.is_none());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(!app.is_running);
@@ -1016,10 +994,7 @@ mod tests {
         app.input = "hello".to_string();
         app.cursor = 5;
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let result = app
-            .handle_key(key, &client, backend_for(&client), &tx)
-            .await
-            .unwrap();
+        let result = app.handle_key(key, &client, &tx).await.unwrap();
         assert!(!result);
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
@@ -1031,15 +1006,13 @@ mod tests {
 
     #[tokio::test]
     async fn picker_ctrl_c_closes_picker() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let mut app = test_app();
         app.picker = Some(PickerState {
             models: vec!["qwen2.5-coder:7b".to_string()],
             selected: 0,
         });
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        app.handle_picker_key(key, backend_for(&client).as_ref())
-            .await;
+        app.handle_picker_key(key).await;
         assert!(app.picker.is_none());
         assert!(
             app.model.is_none(),
@@ -1058,7 +1031,6 @@ mod tests {
 
     #[test]
     fn pull_done_event_marks_ready_and_logs_success() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
@@ -1067,7 +1039,6 @@ mod tests {
                 name: "samantha-mistral:7b".to_string(),
                 result: Ok(()),
             },
-            backend_for(&client),
             &tx,
         );
         assert!(!app.is_running);
@@ -1077,7 +1048,6 @@ mod tests {
 
     #[test]
     fn pull_done_event_logs_failure_without_crashing() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
@@ -1086,7 +1056,6 @@ mod tests {
                 name: "bad-model".to_string(),
                 result: Err("registry not found".to_string()),
             },
-            backend_for(&client),
             &tx,
         );
         assert!(!app.is_running);
@@ -1099,11 +1068,10 @@ mod tests {
 
     #[test]
     fn setup_done_event_marks_ready_and_logs_success() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
-        app.handle_event(UiEvent::SetupDone(Ok(())), backend_for(&client), &tx);
+        app.handle_event(UiEvent::SetupDone(Ok(())), &tx);
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
         assert!(app.log.iter().any(|line| line.contains("Setup finished")));
@@ -1116,7 +1084,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.input = "/model missing-model".to_string();
-        let result = app.submit_input(&client, backend_for(&client), &tx).await;
+        let result = app.submit_input(&client, &tx).await;
         assert!(result.is_ok(), "TUI must survive slash-command failures");
         assert!(
             app.log.iter().any(|line| line.contains('⚠')),

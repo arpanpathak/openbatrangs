@@ -139,6 +139,7 @@ Inside the `openBatarangs>` prompt:
 /setup         install/start Ollama + pull a model
 /models        list installed models + scores
 /model <tag>   switch model (e.g. /model qwen2.5-coder:7b)
+/engine <name> switch inference engine (ollama|tensorrt, experimental)
 /read-only     toggle read-only mode
 /confirm       toggle confirm-before-write/command
 /steps <n>     set max agent steps
@@ -183,6 +184,7 @@ If nothing suitable is installed, it can automatically pull a recommended model
 
 ```
 --ollama-url <URL>   Ollama server URL (default http://localhost:11434)
+--engine <NAME>      Inference engine (ollama|tensorrt, experimental; default ollama)
 --model <TAG>        Use a specific Ollama model tag
 --cwd <DIR>          Workspace directory (default .)
 --max-steps <N>      Max agent iterations (default 12)

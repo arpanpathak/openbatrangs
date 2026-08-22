@@ -127,8 +127,8 @@ async fn run_loop(
 ) -> Result<()> {
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
-    let mut app = app::App::new(cli, tegrastats_shared);
-    app.refresh_model_info(backend.as_ref()).await;
+    let mut app = app::App::new(cli, tegrastats_shared, backend);
+    app.refresh_model_info().await;
     let mut mouse_capture = false;
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut events = event::EventStream::new();
@@ -144,13 +144,13 @@ async fn run_loop(
         tokio::select! {
             maybe = rx.recv() => {
                 if let Some(event) = maybe {
-                    app.handle_event(event, backend.clone(), &tx);
+                    app.handle_event(event, &tx);
                 }
             }
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
-                        if app.handle_key(key, client, backend.clone(), &tx).await? {
+                        if app.handle_key(key, client, &tx).await? {
                             break;
                         }
                     }
@@ -179,6 +179,11 @@ mod tests {
     use super::*;
     use crate::banner;
 
+    fn test_backend() -> std::sync::Arc<dyn crate::engine::InferenceBackend> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").expect("client");
+        std::sync::Arc::new(crate::engine::OllamaBackend::new(client))
+    }
+
     #[test]
     fn stripped_banner_has_content_for_tui() {
         let banner = strip_ansi(&banner::banner_text());
@@ -196,7 +201,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test backend");
         let shared = Arc::new(Mutex::new(None));
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = app::App::new(&cli, shared);
+        let mut app = app::App::new(&cli, shared, test_backend());
         terminal
             .draw(|frame| ui::ui(frame, &mut app))
             .expect("draw ui");
@@ -218,21 +223,17 @@ mod tests {
         use clap::Parser;
         use ratatui::backend::TestBackend;
 
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434")
-            .expect("client should build");
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
         let shared = Arc::new(Mutex::new(None));
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = app::App::new(&cli, shared);
+        let mut app = app::App::new(&cli, shared, test_backend());
 
         tx.send(UiEvent::Log("🦇 Step 1/1".to_string())).unwrap();
         tx.send(UiEvent::Chunk("HELLO from agent".to_string()))
             .unwrap();
         tx.send(UiEvent::Done(Ok(()))).unwrap();
         while let Ok(event) = rx.try_recv() {
-            let backend: std::sync::Arc<dyn crate::engine::InferenceBackend> =
-                std::sync::Arc::new(crate::engine::OllamaBackend::new(client.clone()));
-            app.handle_event(event, backend, &tx);
+            app.handle_event(event, &tx);
         }
 
         let backend = TestBackend::new(100, 40);
@@ -265,7 +266,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test backend");
         let shared = Arc::new(Mutex::new(None));
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = app::App::new(&cli, shared);
+        let mut app = app::App::new(&cli, shared, test_backend());
         app.input = "NVIDIA — 3% → 😀\n| table |\n```rust\nfn main() {}\n```".repeat(200);
         terminal
             .draw(|frame| ui::ui(frame, &mut app))
@@ -281,7 +282,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test backend");
         let shared = Arc::new(Mutex::new(None));
         let cli = Cli::parse_from(["openbatrangs"]);
-        let mut app = app::App::new(&cli, shared);
+        let mut app = app::App::new(&cli, shared, test_backend());
         terminal
             .draw(|frame| ui::ui(frame, &mut app))
             .expect("draw on a tiny terminal should not panic");

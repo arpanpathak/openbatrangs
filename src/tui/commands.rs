@@ -8,7 +8,6 @@ use super::app::{App, PickerState};
 use super::split_command;
 use super::{run_pull_worker, run_setup_worker, UiEvent};
 use crate::cli::AgentMode;
-use crate::engine::InferenceBackend;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -22,7 +21,6 @@ impl App {
     pub(super) async fn run_slash_command(
         &mut self,
         client: &OllamaClient,
-        backend: &dyn InferenceBackend,
         line: &str,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<()> {
@@ -31,7 +29,8 @@ impl App {
             "help" | "h" => self.log_help(),
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
-            "model" => self.handle_model_command(client, backend, arg).await?,
+            "model" => self.handle_model_command(client, arg).await?,
+            "engine" => self.handle_engine_command(client, arg).await?,
             "pull" => self.handle_pull_command(client, arg, tx).await?,
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
@@ -54,8 +53,10 @@ impl App {
         self.log.push("Commands:".to_string());
         self.log
             .push("  /help, /exit, /quit, /setup, /models".to_string());
-        self.log
-            .push("  /pull <tag>, /model <tag>, /read-only, /confirm, /perf".to_string());
+        self.log.push(
+            "  /pull <tag>, /model <tag>, /engine ollama|tensorrt, /read-only, /confirm, /perf"
+                .to_string(),
+        );
         self.log
             .push("  /mode agent|plan|chat, /thinking on|off, /steps <n>, /cwd <path>".to_string());
         self.log.push(
@@ -90,7 +91,6 @@ impl App {
     async fn handle_model_command(
         &mut self,
         client: &OllamaClient,
-        backend: &dyn InferenceBackend,
         arg: &str,
     ) -> anyhow::Result<()> {
         if arg.is_empty() {
@@ -100,7 +100,7 @@ impl App {
 
         let tags = client.tags().await?;
         if model_installed(&tags, arg) {
-            self.activate_model(backend, arg).await;
+            self.activate_model(arg).await;
         } else {
             self.log.push(format!(
                 "❌ Model '{arg}' is not installed. Pull it first with /pull {arg}."
@@ -118,10 +118,46 @@ impl App {
         }
     }
 
-    async fn activate_model(&mut self, backend: &dyn InferenceBackend, name: &str) {
+    async fn activate_model(&mut self, name: &str) {
         self.model = Some(name.to_string());
         self.log.push(format!("✅ Model set to {name}"));
-        self.refresh_model_info(backend).await;
+        self.refresh_model_info().await;
+    }
+
+    /// Switch the active inference engine at runtime.
+    async fn handle_engine_command(
+        &mut self,
+        client: &OllamaClient,
+        arg: &str,
+    ) -> anyhow::Result<()> {
+        let name = arg.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            self.log
+                .push(format!("Current engine: {}", self.engine_name));
+            self.log.push("Usage: /engine ollama|tensorrt".to_string());
+            return Ok(());
+        }
+        let kind = crate::engine::EngineKind::parse(&name)
+            .ok_or_else(|| anyhow::anyhow!("unknown engine '{name}' (try: ollama, tensorrt)"))?;
+        if self.is_running {
+            self.log
+                .push("⚠️  Busy — finish the current task before switching engines.".to_string());
+            return Ok(());
+        }
+        let config = crate::engine::EngineConfig::new(kind, &client.base_url, self.model.clone());
+        let backend = crate::engine::create_backend(&config)?;
+        if !backend.is_available().await {
+            self.log.push(format!(
+                "❌ Engine '{name}' is not available on this machine."
+            ));
+            return Ok(());
+        }
+        self.backend = backend;
+        self.engine_name = kind.as_str().to_string();
+        self.log
+            .push(format!("✅ Engine set to {} ({name})", kind.display_name()));
+        self.refresh_model_info().await;
+        Ok(())
     }
 
     async fn handle_pull_command(
@@ -376,12 +412,25 @@ mod tests {
     #[tokio::test]
     async fn pull_command_without_model_shows_usage_and_does_not_run() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
-        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         let client = OllamaClient::new("http://localhost:11434").unwrap();
+        let backend: std::sync::Arc<dyn crate::engine::InferenceBackend> =
+            std::sync::Arc::new(crate::engine::OllamaBackend::new(client.clone()));
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)), backend);
         let (tx, _rx) = mpsc::unbounded_channel();
         app.handle_pull_command(&client, "", &tx).await.unwrap();
         assert!(app.log.iter().any(|line| line.contains("Usage: /pull")));
         assert!(!app.is_running);
         assert!(app.current_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn engine_command_rejects_unknown_engine_without_network() {
+        let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
+        let client = OllamaClient::new("http://localhost:11434").unwrap();
+        let backend: std::sync::Arc<dyn crate::engine::InferenceBackend> =
+            std::sync::Arc::new(crate::engine::OllamaBackend::new(client.clone()));
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)), backend);
+        let result = app.handle_engine_command(&client, "vllm").await;
+        assert!(result.is_err());
     }
 }

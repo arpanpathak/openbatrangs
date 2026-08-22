@@ -23,6 +23,26 @@ same conventions as the rest of the project: focused modules, constants in
 `src/constants`, pattern matching instead of nested `if/else`, and an
 open-for-extension/closed-for-modification backend trait.
 
+## Using engines directly in the CLI
+
+The engine is selectable at startup and switchable at runtime:
+
+```sh
+# Start the agent/TUI with a specific engine
+openbatrangs --engine ollama "explain this repo"
+openbatrangs --engine tensorrt "task..."   # benchmark-only; see note below
+
+# Inside the TUI, switch engines without restarting
+/engine ollama
+/engine tensorrt
+```
+
+- `/engine` with no argument shows the current engine.
+- Switching requires the engine to be available (`experimental doctor` checks this).
+- `tensorrt` is currently **benchmark-only**: `trtexec` cannot serve interactive
+  chat/tool-calling, so agent tasks on TensorRT will report an unsupported error
+  until a real TensorRT chat server (e.g. TensorRT-LLM) is added.
+
 ## Commands
 
 ```sh

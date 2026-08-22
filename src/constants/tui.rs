@@ -8,6 +8,7 @@ pub const COMMANDS: &[&str] = &[
     "setup",
     "models",
     "model",
+    "engine",
     "pull",
     "read-only",
     "confirm",
@@ -27,6 +28,7 @@ pub const PREFIXED_COMMANDS: &[(&str, &[&str])] = &[
     ("mode ", &["agent", "plan", "chat"]),
     ("thinking ", &["on", "off"]),
     ("mouse ", &["on", "off"]),
+    ("engine ", &["ollama", "tensorrt"]),
 ];
 
 /// Spinner frames shown while the agent is working.
