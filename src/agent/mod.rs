@@ -15,12 +15,11 @@ mod stream;
 mod tool;
 
 use crate::constants::agent::{
-    AGENT_TEMPERATURE, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
+    AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
 };
 use crate::constants::ansi::{
     ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
 };
-use crate::constants::tools::DEFAULT_LIST_DEPTH;
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
 use anyhow::{bail, Context, Result};
@@ -209,10 +208,12 @@ fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
 }
 
 fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
-    let initial_listing = tools::list_files(cwd, ".", DEFAULT_LIST_DEPTH)
+    // Shallow top-level listing only. The model should call `list_files` on
+    // specific directories instead of forcing a recursive scan on every task.
+    let initial_listing = tools::list_files(cwd, ".", INITIAL_LIST_DEPTH)
         .unwrap_or_else(|error| format!("(could not list files: {error})"));
     let user_content = format!(
-        "Workspace root: {}\n\nInitial file listing:\n{}\n\nTask:\n{}",
+        "Workspace root: {}\n\nInitial top-level file listing:\n{}\n(Use list_files on specific subdirectories when you need deeper context.)\n\nTask:\n{}",
         cwd.display(),
         initial_listing,
         task
@@ -290,5 +291,27 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].content, "task");
         assert_eq!(messages[2].content, "a2");
+    }
+
+    #[test]
+    fn initial_messages_use_shallow_listing_not_recursive_scan() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openbatrangs-shallow-test-{unique}"));
+        std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+        std::fs::write(root.join("top.txt"), "top").unwrap();
+        std::fs::write(root.join("sub/nested/deep.txt"), "deep").unwrap();
+
+        let messages = initial_messages(&root, "test task");
+        let user_content = &messages[1].content;
+        assert!(user_content.contains("top.txt"));
+        assert!(!user_content.contains("deep.txt"));
+        assert!(user_content.contains("Use list_files on specific subdirectories"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

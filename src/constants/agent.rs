@@ -9,6 +9,12 @@ pub const MAX_CONTEXT_TOKENS: u64 = 8_192;
 /// Minimum context window used for agent requests.
 pub const MIN_CONTEXT_TOKENS: u64 = 4_096;
 
+/// Depth of the initial workspace listing injected into the first agent turn.
+///
+/// Kept shallow so starting a task never recursively scans the whole repo;
+/// the model can call `list_files` on specific directories when needed.
+pub const INITIAL_LIST_DEPTH: usize = 1;
+
 /// Default number of characters read by the `read_file` tool.
 pub const DEFAULT_READ_CHARS: usize = 8_000;
 
