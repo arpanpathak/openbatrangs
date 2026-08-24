@@ -139,6 +139,17 @@ async fn run_loop(
             maybe = rx.recv() => {
                 if let Some(event) = maybe {
                     app.handle_event(event, client, &tx);
+                    // Coalesce bursts of background events (e.g. streaming
+                    // tokens) so the terminal is redrawn once per batch instead
+                    // of once per token. This keeps generation smooth.
+                    let mut drained = 0usize;
+                    while drained < 128 {
+                        match rx.try_recv() {
+                            Ok(event) => app.handle_event(event, client, &tx),
+                            Err(_) => break,
+                        }
+                        drained += 1;
+                    }
                 }
             }
             maybe = events.next() => {

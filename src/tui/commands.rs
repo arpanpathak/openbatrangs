@@ -60,7 +60,7 @@ impl App {
             "  /doctor, /clear, /mouse on|off · Ctrl+C cancel · PgUp/PgDn scroll".to_string(),
         );
         self.log.push(
-            "  Mouse select/copy always on by default · /mouse on for wheel/click".to_string(),
+            "  Mouse wheel/scrollbar ON by default · /mouse off for native select/copy".to_string(),
         );
         self.log.push(
             "  Confirmations ON by default · /yolo to skip them · /confirm to re-enable"
@@ -239,8 +239,7 @@ impl App {
             "off" => {
                 self.mouse_capture = false;
                 self.log.push(
-                    "Mouse mode: OFF (native select/copy always works, scroll with PgUp/PgDn)"
-                        .to_string(),
+                    "Mouse mode: OFF (native select/copy, scroll with PgUp/PgDn)".to_string(),
                 );
             }
             _ => {

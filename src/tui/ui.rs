@@ -7,7 +7,7 @@ use crate::constants::tui::{
     COMPACT_BANNER_HEIGHT, FULL_BANNER_MIN_TERMINAL_HEIGHT, FULL_BANNER_MIN_WIDTH,
     INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
     MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, SMALL_BANNER_HEIGHT,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD, SMALL_BANNER_HEIGHT,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -145,15 +145,29 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll);
     }
     let scroll_y = chat_scroll(app, area, content_height);
-    let chat_lines = app.chat_render.lines(&chat_text);
-    let chat = Paragraph::new(chat_lines.to_vec())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" openBatarangs "),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y.min(u16::MAX as usize) as u16, 0));
+    // Huge logs skip the syntect code-highlighting path entirely. Building
+    // styled `Vec<Line>`s for every streaming token is what made generation
+    // freeze on low-power devices once the chat grew long.
+    let chat = if chat_text.len() > RAW_CHAT_RENDER_THRESHOLD {
+        Paragraph::new(chat_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" openBatarangs "),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y.min(u16::MAX as usize) as u16, 0))
+    } else {
+        let chat_lines = app.chat_render.lines(&chat_text);
+        Paragraph::new(chat_lines.to_vec())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" openBatarangs "),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y.min(u16::MAX as usize) as u16, 0))
+    };
     f.render_widget(chat, area);
 
     if max_scroll > 0 && area.width >= 3 {
@@ -169,8 +183,9 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             .end_symbol(Some("↓"))
             .track_symbol(Some("│"))
             .thumb_symbol("█");
-        let mut scrollbar_state =
-            ScrollbarState::new(max_scroll).position(scroll_y.min(max_scroll));
+        let mut scrollbar_state = ScrollbarState::new(content_height)
+            .position(scroll_y.min(max_scroll))
+            .viewport_content_length(visible_height);
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
