@@ -146,7 +146,11 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
         }
     };
 
+    // The model may answer, call exactly one tool, or do neither. Matching on
+    // the tuple keeps all three outcomes explicit and exhaustive.
     match (response.answer, response.tool) {
+        // A final answer ends the loop. If it was already streamed live, do
+        // not print it a second time.
         (Some(answer), _) => {
             if !answer_was_streamed {
                 reporter.line(format!("\n{ANSI_GREEN_CHECK} {answer}"));
@@ -154,6 +158,7 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
             print_changed_files(&context.config.cwd, changed_files, reporter);
             Ok(AgentStepOutcome::Finished)
         }
+        // A tool call continues the loop: execute, append the result, repeat.
         (None, Some(tool_call)) => {
             handle_tool_call(
                 context.config,
@@ -166,6 +171,7 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
             )
             .await
         }
+        // Neither field is a model failure; surface it and stop cleanly.
         (None, None) => {
             reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
             Ok(AgentStepOutcome::Finished)
@@ -185,11 +191,16 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
 ) -> Result<AgentStepOutcome> {
     let tool = Tool::from_call(tool_call)?;
     match tool {
+        // `finish` is the model's way of saying "done": report the summary,
+        // list changed files, and stop the loop.
         Tool::Finish { summary } => {
             reporter.line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
             print_changed_files(&config.cwd, changed_files, reporter);
             Ok(AgentStepOutcome::Finished)
         }
+        // Any real tool (list/read/grep/write/run) follows the same contract:
+        // push the assistant JSON, execute, push the result, and continue so
+        // the model can decide what to do next.
         other => {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),

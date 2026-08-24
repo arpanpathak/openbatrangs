@@ -419,11 +419,11 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                // Esc never quits the app. It clears the current input line so
-                // an accidental press cannot destroy the session. Use /quit,
-                // /exit, or Ctrl+C at idle to leave.
-                self.input.clear();
-                self.cursor = 0;
+                // Esc is intentionally a no-op in the main input area: it must
+                // neither quit the TUI nor destroy text the user is composing.
+                // Picker/confirmation popups handle Esc themselves before this
+                // match is reached. Use /quit, /exit, or Ctrl+C at idle to
+                // leave the app.
             }
             _ => {}
         }
@@ -1043,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn esc_clears_input_and_never_quits() {
+    async fn esc_preserves_input_and_never_quits() {
         let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
@@ -1052,8 +1052,8 @@ mod tests {
         let key = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let result = app.handle_key(key, &client, &tx).await.unwrap();
         assert!(!result, "Esc must not quit the TUI");
-        assert!(app.input.is_empty());
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input, "hello", "Esc must not clear composed input");
+        assert_eq!(app.cursor, 5);
         assert!(!app.should_quit);
 
         // Esc on an already-empty input is also a no-op quit-wise.
