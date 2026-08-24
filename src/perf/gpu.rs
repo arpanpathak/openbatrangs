@@ -1,4 +1,14 @@
-//! GPU metric parsing from `tegrastats` (Jetson) and `nvidia-smi`.
+//! # GPU metric parsing from `tegrastats` (Jetson) and `nvidia-smi`
+//!
+//! The performance panel needs GPU utilization, memory, power, and temperature.
+//! On Jetson devices that data comes from `tegrastats`; on desktop systems it
+//! comes from `nvidia-smi`. Parsing is kept pure (a string goes in, a struct
+//! comes out) so every branch is testable without hardware.
+//!
+//! ## References
+//!
+//! - NVIDIA `nvidia-smi` query format: <https://developer.nvidia.com/nvidia-system-management-interface>
+//! - Jetson `tegrastats`: <https://docs.nvidia.com/jetson/archives/r36.2.0/developer-guide/sd/ApplicationNotes/Tegrastats.html>
 
 use crate::constants::perf::MILLIWATTS_PER_WATT;
 use regex::Regex;
@@ -65,7 +75,20 @@ pub(super) fn parse_nvidia_smi() -> Option<GpuStats> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().next()?;
+    parse_nvidia_smi_line(text.lines().next()?)
+}
+
+/// Parse one `nvidia-smi --format=csv,noheader,nounits` line.
+///
+/// # Parameters
+///
+/// - `line`: raw CSV line, e.g.
+///   `NVIDIA GeForce RTX 4090, 100, 12345, 24564, 250.00, 65`.
+///
+/// # Returns
+///
+/// Parsed [`GpuStats`], or `None` when the line has fewer than six fields.
+fn parse_nvidia_smi_line(line: &str) -> Option<GpuStats> {
     let fields: Vec<&str> = line.split(',').map(str::trim).collect();
     if fields.len() < 6 {
         return None;
@@ -125,5 +148,32 @@ mod tests {
     fn parses_float_na_as_missing() {
         assert!(parse_float("[N/A]").is_none());
         assert_eq!(parse_float("42.5"), Some(42.5));
+    }
+
+    #[test]
+    fn parses_nvidia_smi_line() {
+        let line = "NVIDIA GeForce RTX 4090, 100, 12345, 24564, 250.00, 65";
+        let stats = parse_nvidia_smi_line(line).unwrap();
+        assert_eq!(stats.name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        assert_eq!(stats.util_percent, Some(100.0));
+        assert_eq!(stats.memory_used_mb, Some(12345));
+        assert_eq!(stats.memory_total_mb, Some(24564));
+        assert_eq!(stats.power_watts, Some(250.0));
+        assert_eq!(stats.temp_c, Some(65.0));
+    }
+
+    #[test]
+    fn nvidia_smi_line_with_na_fields_parses_partially() {
+        let line = "Tesla T4, [N/A], 100, 15109, [N/A], [N/A]";
+        let stats = parse_nvidia_smi_line(line).unwrap();
+        assert_eq!(stats.util_percent, None);
+        assert_eq!(stats.memory_used_mb, Some(100));
+        assert_eq!(stats.power_watts, None);
+        assert_eq!(stats.temp_c, None);
+    }
+
+    #[test]
+    fn nvidia_smi_line_with_too_few_fields_is_none() {
+        assert!(parse_nvidia_smi_line("GPU 0, 50").is_none());
     }
 }

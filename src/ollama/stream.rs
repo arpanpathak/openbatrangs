@@ -1,4 +1,14 @@
-//! NDJSON stream parsing for Ollama chat and model pull endpoints.
+//! # NDJSON stream parsing for Ollama chat and model pull endpoints
+//!
+//! Ollama streams responses as newline-delimited JSON. Because HTTP chunks can
+//! split a JSON line arbitrarily, the client keeps a string buffer and drains
+//! only complete lines. This module owns that buffering/parsing logic so it can
+//! be unit-tested without any network access.
+//!
+//! ## References
+//!
+//! - NDJSON specification: <https://ndjson.org/>
+//! - Ollama streaming chat API: <https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion>
 
 use super::types::StreamLine;
 use serde_json::Value;

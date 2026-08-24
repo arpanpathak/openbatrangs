@@ -1,10 +1,19 @@
-//! Minimal async HTTP client for the Ollama local model server.
+//! # Minimal async HTTP client for the Ollama local model server
 //!
 //! This module wraps the endpoints used by openBatarangs:
 //! - `GET  /api/tags`    — list installed models
 //! - `POST /api/show`    — inspect model metadata
 //! - `POST /api/chat`    — chat completion (streaming and non-streaming)
 //! - `POST /api/pull`    — download a model from the Ollama registry
+//!
+//! The client uses `reqwest` with conservative timeouts so a hung local server
+//! cannot freeze the TUI or the one-shot CLI.
+//!
+//! ## References
+//!
+//! - Ollama API reference: <https://github.com/ollama/ollama/blob/main/docs/api.md>
+//! - `reqwest` streaming responses: <https://docs.rs/reqwest/latest/reqwest/struct.Response.html#method.bytes_stream>
+//! - NDJSON (newline-delimited JSON): <https://ndjson.org/>
 
 mod stream;
 mod types;

@@ -1,10 +1,18 @@
-//! High-level command implementations: setup, doctor, listing, one-shot agent.
+//! # High-level command implementations: setup, doctor, listing, one-shot agent
 //!
 //! The module is split by concern:
 //! - [`setup`]: Ollama onboarding (`/setup`).
 //! - [`models`]: model listing (`list-models`).
 //! - [`doctor`]: connectivity/health report (`doctor`).
 //! - [`agent`]: one-shot agent/TUI dispatch.
+//!
+//! [`ensure_ollama`] is the shared bootstrap: it probes the server, starts
+//! `ollama serve` when the binary exists, and polls until the server responds.
+//!
+//! ## References
+//!
+//! - Ollama server CLI: <https://github.com/ollama/ollama>
+//! - Polling pattern: <https://en.wikipedia.org/wiki/Polling_(computer_science)>
 
 mod agent;
 mod doctor;
