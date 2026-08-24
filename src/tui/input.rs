@@ -1,7 +1,13 @@
-//! Input editing, history navigation, and slash-command suggestions.
+//! # Input editing, history navigation, and slash-command suggestions
 //!
-//! These methods are inherent `impl App` blocks so the state stays in one place
-//! while the file stays focused on one responsibility: text input.
+//! The input box is a single `String` plus a byte cursor. This module owns the
+//! editing operations (insert, delete, move, history) and the slash-command
+//! suggestion filter, keeping `App` free of string-manipulation details.
+//!
+//! ## References
+//!
+//! - UTF-8 and character boundaries: <https://doc.rust-lang.org/std/string/struct.String.html#method.is_char_boundary>
+//! - Unicode segmentation: <https://unicode.org/reports/tr29/>
 
 use super::app::App;
 use crate::constants::tui::{COMMANDS, PREFIXED_COMMANDS};

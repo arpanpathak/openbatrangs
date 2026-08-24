@@ -1,4 +1,19 @@
-//! TUI text helpers: ANSI stripping, wrapping, path extraction, and editor launch.
+//! # TUI text helpers: ANSI stripping, wrapping, path extraction, editor launch
+//!
+//! The TUI renders arbitrary model/tool output, which may contain ANSI escape
+//! sequences, very long lines, and file paths. This module keeps those concerns
+//! in one place:
+//!
+//! - [`strip_ansi`] removes terminal escapes so the chat log stores plain text.
+//! - [`text_wrapped_height`] / [`wrap_text_to_lines`] compute visual wrapping
+//!   for Unicode-safe layout.
+//! - [`extract_path_from_line`] lets users click a file path in the chat.
+//!
+//! ## References
+//!
+//! - ANSI escape code standard: <https://en.wikipedia.org/wiki/ANSI_escape_code>
+//! - Unicode grapheme clusters: <https://www.unicode.org/reports/tr29/>
+//! - Ratatui wrapping: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 
 use crate::constants::tui::VIM_TERMINALS;
 use std::path::{Path, PathBuf};
