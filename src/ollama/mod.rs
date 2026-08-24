@@ -294,4 +294,209 @@ mod tests {
         assert_eq!(details.quantization_level.as_deref(), Some("Q4_K_M"));
         assert_eq!(details.context_length, Some(32_768));
     }
+
+    // ========================================================================
+    // Local mock Ollama HTTP server
+    //
+    // These tests exercise the real reqwest client against a minimal in-process
+    // HTTP server so the network layer is covered without flaky mocks or a
+    // real Ollama installation.
+    // ========================================================================
+
+    struct MockResponse {
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+    }
+
+    impl MockResponse {
+        fn json(status: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                content_type: "application/json",
+                body: body.into(),
+            }
+        }
+
+        fn text(status: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                content_type: "text/plain",
+                body: body.into(),
+            }
+        }
+    }
+
+    /// Spawn a minimal HTTP server that routes requests by path.
+    async fn spawn_mock_server(
+        handler: impl Fn(&str) -> MockResponse + Send + Sync + 'static,
+    ) -> String {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handler = Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = handler(path);
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.status,
+                        response.content_type,
+                        response.body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(response.body.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        base_url
+    }
+
+    fn sample_request() -> ChatRequest {
+        ChatRequest {
+            model: "qwen2.5-coder:3b".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            stream: false,
+            keep_alive: None,
+            format: None,
+            options: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn is_available_true_on_success() {
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/tags");
+            MockResponse::json("200 OK", r#"{"models":[]}"#)
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(client.is_available().await);
+    }
+
+    #[tokio::test]
+    async fn is_available_false_on_error() {
+        let base_url =
+            spawn_mock_server(|_| MockResponse::text("503 Service Unavailable", "down")).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(!client.is_available().await);
+    }
+
+    #[tokio::test]
+    async fn tags_parses_models_from_mock_server() {
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/tags");
+            MockResponse::json(
+                "200 OK",
+                r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#,
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let tags = client.tags().await.unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "qwen2.5-coder:3b");
+        assert_eq!(tags[0].size, 123);
+    }
+
+    #[tokio::test]
+    async fn tags_returns_error_on_http_failure() {
+        let base_url =
+            spawn_mock_server(|_| MockResponse::text("500 Internal Server Error", "boom")).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(client.tags().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn show_returns_model_metadata() {
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/show");
+            MockResponse::json("200 OK", r#"{"model_info":{"llama.context_length":32768}}"#)
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let value = client.show("qwen2.5-coder:7b").await.unwrap();
+        assert_eq!(value["model_info"]["llama.context_length"], 32_768);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_yields_content_deltas() {
+        use futures_util::StreamExt;
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/chat");
+            MockResponse::json(
+                "200 OK",
+                "{\"message\":{\"content\":\"hello\"}}\n{\"message\":{\"content\":\" world\"}}\n{\"done\":true}\n",
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let mut stream = Box::pin(client.chat_stream(sample_request()).await.unwrap());
+        let mut parts = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            parts.push(chunk.unwrap());
+        }
+        assert_eq!(parts, vec!["hello".to_string(), " world".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_returns_error_on_http_failure() {
+        let base_url =
+            spawn_mock_server(|_| MockResponse::text("400 Bad Request", "bad model")).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(client.chat_stream(sample_request()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pull_reports_statuses_and_finishes() {
+        use std::sync::{Arc, Mutex};
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/pull");
+            MockResponse::json(
+                "200 OK",
+                "{\"status\":\"pulling manifest\"}\n{\"status\":\"downloading\",\"total\":100,\"completed\":50}\n{\"status\":\"success\"}\n",
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        client
+            .pull("qwen2.5-coder:3b", &move |msg| {
+                captured.lock().unwrap().push(msg.to_string());
+            })
+            .await
+            .unwrap();
+        let statuses = statuses.lock().unwrap();
+        assert!(statuses.iter().any(|s| s.contains("pulling manifest")));
+        assert!(statuses.iter().any(|s| s.contains("50%")));
+        assert!(statuses.iter().any(|s| s.contains("Pull finished")));
+    }
 }
