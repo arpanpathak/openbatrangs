@@ -1,4 +1,14 @@
-//! Output truncation helpers.
+//! # Output truncation helpers
+//!
+//! Tool results are fed back into the model's context window, which is small on
+//! Jetson-class devices. These helpers cap results at
+//! [`MAX_TOOL_OUTPUT`](crate::constants::tools::MAX_TOOL_OUTPUT) characters and
+//! append an omission note so the model knows the output was truncated.
+//!
+//! ## References
+//!
+//! - Context window limits in LLMs: <https://en.wikipedia.org/wiki/Large_language_model#Context_window>
+//! - Rust `str::chars` for Unicode-safe truncation: <https://doc.rust-lang.org/std/primitive.str.html#method.chars>
 
 use crate::constants::tools::MAX_TOOL_OUTPUT;
 
@@ -8,6 +18,16 @@ pub(crate) fn truncate(text: String) -> String {
 }
 
 /// Truncate a string to at most `max` characters, appending an omission note.
+///
+/// # Parameters
+///
+/// - `text`: string to truncate.
+/// - `max`: maximum number of Unicode characters to keep.
+///
+/// # Returns
+///
+/// The original string when it fits, otherwise a truncated string ending with
+/// `... (truncated, N chars omitted)`.
 pub(super) fn truncate_to(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;

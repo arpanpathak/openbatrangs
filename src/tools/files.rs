@@ -1,4 +1,14 @@
-//! Filesystem tools: list, read, write, grep.
+//! # Filesystem tools: list, read, write, grep
+//!
+//! These are the safe file operations exposed to the agent. Every function
+//! validates paths through [`super::path`], skips heavy directories, and caps
+//! output so a huge repository cannot flood the model's context window.
+//!
+//! ## References
+//!
+//! - Regex in Rust: <https://docs.rs/regex/latest/regex/>
+//! - `walkdir` for recursive traversal: <https://docs.rs/walkdir/latest/walkdir/>
+//! - Path traversal attack: <https://owasp.org/www-community/attacks/Path_Traversal>
 
 use super::path::{canonical_root, ensure_canonical_within_root, resolve_in_root};
 use super::text::{truncate, truncate_to};

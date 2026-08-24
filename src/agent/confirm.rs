@@ -1,9 +1,15 @@
-//! Confirmation prompts for mutating agent tools.
+//! # Confirmation prompts for mutating agent tools
 //!
-//! One-shot CLI mode confirms on stdin/stdout. The TUI cannot do that while raw
-//! mode and the alternate screen are active, so it provides a channel-based
-//! confirmer that asks the UI to display a modal prompt and waits for the user's
-//! keypress.
+//! Mutating tools (`write_file`, `run_command`) are gated behind a
+//! [`Confirmer`]. One-shot CLI mode reads `y`/`N` from stdin. The TUI cannot
+//! do that while raw mode and the alternate screen are active, so it provides
+//! a channel-based confirmer that asks the UI to display a modal prompt and
+//! waits for the user's keypress.
+//!
+//! ## References
+//!
+//! - Human-in-the-loop safety for agents: <https://en.wikipedia.org/wiki/Human-in-the-loop>
+//! - Rust `tokio::task::spawn_blocking`: <https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html>
 
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -12,7 +18,13 @@ use std::io::Write;
 pub trait Confirmer: Send {
     /// Ask the user to confirm `prompt`.
     ///
+    /// # Parameters
+    ///
+    /// - `prompt`: human-readable description of the mutation, e.g.
+    ///   `write file 'a.txt'?`.
+    ///
     /// # Returns
+    ///
     /// `Ok(true)` to allow the tool, `Ok(false)` to abort it.
     async fn confirm(&mut self, prompt: &str) -> Result<bool>;
 }

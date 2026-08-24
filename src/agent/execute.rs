@@ -1,4 +1,22 @@
-//! Tool execution, confirmation, and terminal-friendly result formatting.
+//! # Tool execution, confirmation, and terminal-friendly result formatting
+//!
+//! Once a [`Tool`] has been parsed and typed, this module is responsible for
+//! actually doing the work: listing files, reading/writing files, grepping,
+//! running shell commands, and formatting results for the terminal.
+//!
+//! Mutating tools are protected by two guards:
+//!
+//! - [`AgentConfig::is_read_only`] disables writes/commands entirely.
+//! - [`Confirmer`] asks the user before a write/command when confirm mode is on.
+//!
+//! Results are also made terminal-friendly: written files become OSC 8
+//! hyperlinks and control characters are stripped so a model cannot inject
+//! escape sequences through a crafted file name.
+//!
+//! ## References
+//!
+//! - OSC 8 hyperlinks: <https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda>
+//! - Human-in-the-loop safety: <https://en.wikipedia.org/wiki/Human-in-the-loop>
 
 use super::confirm::Confirmer;
 use super::reporter::Reporter;

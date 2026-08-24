@@ -1,4 +1,18 @@
-//! Shell command execution for the agent.
+//! # Shell command execution for the agent
+//!
+//! The agent's `run_command` tool executes shell commands inside the workspace
+//! and captures combined output. Commands run through `bash -lc` with a
+//! timeout so a hung process cannot freeze the agent loop.
+//!
+//! The environment is sandboxed: `$HOME` and common tool caches are redirected
+//! under `<workspace>/.agent/` so builds and installs do not pollute the real
+//! user home directory.
+//!
+//! ## References
+//!
+//! - Shell injection / command injection: <https://owasp.org/www-community/attacks/Command_Injection>
+//! - Tokio process + timeout: <https://docs.rs/tokio/latest/tokio/time/fn.timeout.html>
+//! - Unix environment variables: <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html>
 
 use super::text::truncate;
 use crate::constants::tools::MIN_COMMAND_TIMEOUT_SECONDS;

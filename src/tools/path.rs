@@ -1,4 +1,15 @@
-//! Path-safety helpers for agent-supplied paths.
+//! # Path-safety helpers for agent-supplied paths
+//!
+//! The model can ask the agent to read, write, list, or grep files. Because
+//! the model is an untrusted input, every path must be validated before it
+//! touches the filesystem: absolute paths and `..` traversal are rejected, and
+//! symlinks are canonicalized so they cannot escape the workspace.
+//!
+//! ## References
+//!
+//! - Path traversal attack: <https://owasp.org/www-community/attacks/Path_Traversal>
+//! - Symlink attack: <https://en.wikipedia.org/wiki/Symlink_attack>
+//! - Rust `Path`/`Component`: <https://doc.rust-lang.org/std/path/index.html>
 
 use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf};

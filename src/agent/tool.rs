@@ -1,44 +1,96 @@
-//! Typed tool-call model, argument parsing, and JSON response parsing.
+//! # Typed tool-call model and JSON argument parsing
+//!
+//! The agent model communicates its next action as a JSON object. To avoid
+//! passing raw `serde_json::Value` objects around the rest of the codebase,
+//! this module converts the model's free-form JSON into the exhaustive [`Tool`]
+//! enum. Every tool the agent may call is represented as a variant, and every
+//! variant's arguments are validated here.
+//!
+//! Parsing happens in two stages:
+//!
+//! 1. [`parse_agent_response`] deserializes the whole model reply into
+//!    [`AgentResponse`] (either `answer` or `tool`).
+//! 2. [`Tool::from_call`] validates the tool arguments and builds a typed
+//!    [`Tool`].
+//!
+//! ## References
+//!
+//! - JSON data model and string escapes, RFC 8259: <https://datatracker.ietf.org/doc/html/rfc8259>
+//! - Serde JSON: <https://serde.rs/json.html>
+//! - OpenAI function calling (the same JSON tool-call idea): <https://platform.openai.com/docs/guides/function-calling>
+//! - ReAct: reasoning + acting: <https://arxiv.org/abs/2210.03629>
 
 use crate::constants::agent::{DEFAULT_GREP_MAX_RESULTS, DEFAULT_READ_CHARS};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// A raw tool call as deserialized from the model's JSON response.
 #[derive(Debug, Deserialize)]
 pub(super) struct ToolCall {
+    /// Tool name, e.g. `"list_files"`.
     pub(super) name: String,
+    /// Raw tool arguments; validated by [`Tool::from_call`].
     pub(super) arguments: Value,
 }
 
 /// Typed, exhaustively-matched representation of every tool the agent can invoke.
+///
+/// Each variant stores only the arguments that tool actually needs. This makes
+/// the rest of the codebase free of stringly-typed tool dispatch.
 #[derive(Debug)]
 pub(super) enum Tool {
+    /// Recursively list files under `path`.
     ListFiles {
+        /// Relative directory to list; `.` means the workspace root.
         path: String,
     },
+    /// Read a text file with a character cap.
     ReadFile {
+        /// Relative file path inside the workspace.
         path: String,
+        /// Maximum characters to include in the result.
         max_chars: usize,
     },
+    /// Regex-search file contents under `path`.
     GrepFiles {
+        /// Regular expression to match.
         pattern: String,
+        /// Relative directory to search.
         path: String,
+        /// Maximum number of matches to return.
         max_results: usize,
     },
+    /// Write (or overwrite) a file.
     WriteFile {
+        /// Relative file path inside the workspace.
         path: String,
+        /// Full file contents.
         content: String,
     },
+    /// Run a shell command in the workspace.
     RunCommand {
+        /// Shell command line, executed with `bash -lc`.
         command: String,
     },
+    /// Signal that the task is complete.
     Finish {
+        /// Short summary of what was done.
         summary: String,
     },
 }
 
 impl Tool {
+    /// Convert a raw [`ToolCall`] into a typed [`Tool`], validating arguments.
+    ///
+    /// # Parameters
+    ///
+    /// - `call`: raw tool call from the model.
+    ///
+    /// # Returns
+    ///
+    /// A typed [`Tool`], or an error when the tool name is unknown or an
+    /// argument has the wrong type.
     pub(super) fn from_call(call: ToolCall) -> Result<Self> {
         let args = &call.arguments;
         match call.name.as_str() {
@@ -84,14 +136,30 @@ impl Tool {
     }
 }
 
+/// The two possible shapes of a model response: either a final `answer` or a
+/// single `tool` call. Serde fills the missing field with `None`.
 #[derive(Debug, Deserialize)]
 pub(super) struct AgentResponse {
+    /// Tool call to execute, when the model is not done yet.
     #[serde(default)]
     pub(super) tool: Option<ToolCall>,
+    /// Final answer, when the model is done.
     #[serde(default)]
     pub(super) answer: Option<String>,
 }
 
+/// Parse the model's raw text into an [`AgentResponse`].
+///
+/// The model is asked to emit strict JSON, but smaller local models sometimes
+/// wrap it in a markdown code fence, so both forms are accepted.
+///
+/// # Parameters
+///
+/// - `content`: raw model output.
+///
+/// # Returns
+///
+/// A parsed [`AgentResponse`], or an error describing the JSON problem.
 pub(super) fn parse_agent_response(content: &str) -> Result<AgentResponse> {
     let cleaned = content
         .trim()
@@ -105,6 +173,7 @@ pub(super) fn parse_agent_response(content: &str) -> Result<AgentResponse> {
         .with_context(|| format!("JSON did not match agent schema: {content}"))
 }
 
+/// Require a string argument; error when it is missing or not a string.
 pub(super) fn required_string_arg<'a>(
     args: &'a Value,
     key: &str,
@@ -113,6 +182,10 @@ pub(super) fn required_string_arg<'a>(
     string_arg(args, key)?.ok_or_else(|| anyhow!("{tool_name} requires '{key}'"))
 }
 
+/// Read an optional string argument.
+///
+/// `null` and missing keys both produce `None`; any other JSON type is an
+/// error so the model cannot smuggle a number into a path.
 pub(super) fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
     match args.get(key) {
         Some(Value::String(value)) => Ok(Some(value)),
@@ -121,6 +194,10 @@ pub(super) fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a st
     }
 }
 
+/// Read an optional non-negative integer argument.
+///
+/// `null` and missing keys both produce `None`; negative or non-numeric values
+/// are rejected.
 pub(super) fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
         Some(Value::Number(number)) => number
