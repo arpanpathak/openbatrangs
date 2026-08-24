@@ -25,11 +25,14 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 /// State of the markdown code-fence scanner.
+///
+/// The highlighter is boxed because `HighlightLines` is a large type; boxing
+/// keeps the enum small and satisfies `clippy::large_enum_variant`.
 enum CodeFenceState<'a> {
     /// Outside a fenced code block; lines are rendered as plain text.
     Plain,
     /// Inside a fenced code block with an active syntect highlighter.
-    InCode(HighlightLines<'a>),
+    InCode(Box<HighlightLines<'a>>),
 }
 
 struct Highlighter {
@@ -107,7 +110,8 @@ fn toggle_fence<'a>(
     match state {
         CodeFenceState::Plain => {
             let lang = trimmed.trim_start_matches("```").trim().to_string();
-            CodeFenceState::InCode(HighlightLines::new(code_syntax(h, &lang), &h.theme))
+            let highlighter = HighlightLines::new(code_syntax(h, &lang), &h.theme);
+            CodeFenceState::InCode(Box::new(highlighter))
         }
         CodeFenceState::InCode(_) => CodeFenceState::Plain,
     }

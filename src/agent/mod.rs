@@ -1,4 +1,14 @@
-//! Agentic coding loop: model conversation, tool-call parsing, and execution.
+//! # Agentic coding loop
+//!
+//! The agent alternates between two phases:
+//!
+//! 1. Ask the model for the next action as a strict JSON object.
+//! 2. If the JSON contains a tool call, execute it and feed the result back;
+//!    otherwise treat the `answer` field as the final response.
+//!
+//! The loop is bounded by `max_steps` so a misbehaving model cannot run
+//! forever. All tool calls are parsed through an exhaustive [`Tool`] enum and
+//! executed by the `execute` submodule.
 //!
 //! Responsibilities are split into focused submodules:
 //! - `reporter`: output abstraction for stdout and TUI.
@@ -6,8 +16,11 @@
 //! - `stream`: incremental JSON field streaming.
 //! - `execute`: tool execution, confirmation, and path formatting.
 //!
-//! This module owns the orchestration: the run loop, step handling, and
-//! conversation-history management.
+//! ## References
+//!
+//! - ReAct: reasoning + acting: <https://arxiv.org/abs/2210.03629>
+//! - Ollama `/api/chat`: <https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion>
+//! - JSON Schema for strict tool-call responses: <https://json-schema.org/>
 
 mod confirm;
 mod execute;
@@ -133,29 +146,31 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
         }
     };
 
-    if let Some(answer) = response.answer {
-        if !answer_was_streamed {
-            reporter.line(format!("\n{ANSI_GREEN_CHECK} {answer}"));
+    match (response.answer, response.tool) {
+        (Some(answer), _) => {
+            if !answer_was_streamed {
+                reporter.line(format!("\n{ANSI_GREEN_CHECK} {answer}"));
+            }
+            print_changed_files(&context.config.cwd, changed_files, reporter);
+            Ok(AgentStepOutcome::Finished)
         }
-        print_changed_files(&context.config.cwd, changed_files, reporter);
-        return Ok(AgentStepOutcome::Finished);
+        (None, Some(tool_call)) => {
+            handle_tool_call(
+                context.config,
+                messages,
+                changed_files,
+                reporter,
+                confirmer,
+                &content,
+                tool_call,
+            )
+            .await
+        }
+        (None, None) => {
+            reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
+            Ok(AgentStepOutcome::Finished)
+        }
     }
-
-    if let Some(tool_call) = response.tool {
-        return handle_tool_call(
-            context.config,
-            messages,
-            changed_files,
-            reporter,
-            confirmer,
-            &content,
-            tool_call,
-        )
-        .await;
-    }
-
-    reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
-    Ok(AgentStepOutcome::Finished)
 }
 
 /// Execute a parsed tool call and append the assistant/tool messages.
@@ -169,31 +184,35 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
     tool_call: ToolCall,
 ) -> Result<AgentStepOutcome> {
     let tool = Tool::from_call(tool_call)?;
-    if let Tool::Finish { summary } = &tool {
-        reporter.line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
-        print_changed_files(&config.cwd, changed_files, reporter);
-        return Ok(AgentStepOutcome::Finished);
+    match tool {
+        Tool::Finish { summary } => {
+            reporter.line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
+            print_changed_files(&config.cwd, changed_files, reporter);
+            Ok(AgentStepOutcome::Finished)
+        }
+        other => {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: content.to_string(),
+            });
+
+            reporter.line(format!(
+                "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
+                other.describe()
+            ));
+            let result_text =
+                execute_tool_or_report_error(config, &config.cwd, &other, changed_files, confirmer)
+                    .await;
+            reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
+
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: format!("Tool result:\n{result_text}"),
+            });
+            trim_messages(messages, MAX_HISTORY_MESSAGES);
+            Ok(AgentStepOutcome::Continue)
+        }
     }
-
-    messages.push(ChatMessage {
-        role: "assistant".to_string(),
-        content: content.to_string(),
-    });
-
-    reporter.line(format!(
-        "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
-        tool.describe()
-    ));
-    let result_text =
-        execute_tool_or_report_error(config, &config.cwd, &tool, changed_files, confirmer).await;
-    reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
-
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: format!("Tool result:\n{result_text}"),
-    });
-    trim_messages(messages, MAX_HISTORY_MESSAGES);
-    Ok(AgentStepOutcome::Continue)
 }
 
 fn report_step_start<R: Reporter>(reporter: &mut R, step: usize, max_steps: usize, model: &str) {
