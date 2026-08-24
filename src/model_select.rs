@@ -210,4 +210,157 @@ mod tests {
     fn memory_budget_is_positive_on_linux() {
         assert!(calculate_memory_budget() > 0);
     }
+
+    fn prefs(model: Option<&str>, auto_pull_disabled: bool) -> ModelPrefs {
+        ModelPrefs {
+            model: model.map(str::to_string),
+            is_auto_pull_disabled: auto_pull_disabled,
+            min_context: 8_192,
+        }
+    }
+
+    fn model_json() -> &'static str {
+        r#"{"models":[{"name":"qwen2.5-coder:7b","size":4700000000,"details":{"parameter_size":"7.6B","quantization_level":"Q4_K_M","context_length":32768}}]}"#
+    }
+
+    #[tokio::test]
+    async fn resolve_model_returns_explicit_installed_model() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/tags");
+            MockResponse::json("200 OK", model_json())
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let statuses = std::sync::Mutex::new(Vec::new());
+        let scored = resolve_model(
+            &client,
+            &Some("qwen2.5-coder:7b".to_string()),
+            &prefs(None, false),
+            16_000_000_000,
+            &|msg| statuses.lock().unwrap().push(msg.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scored.name, "qwen2.5-coder:7b");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_errors_when_explicit_model_missing() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url =
+            spawn_mock_server(|_| MockResponse::json("200 OK", r#"{"models":[]}"#)).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let result = resolve_model(
+            &client,
+            &Some("missing:7b".to_string()),
+            &prefs(None, false),
+            16_000_000_000,
+            &|_| {},
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("not installed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_model_rejects_path_like_explicit_slot() {
+        let client = OllamaClient::new("http://127.0.0.1:1").unwrap();
+        let result = resolve_model(
+            &client,
+            &Some("./model.gguf".to_string()),
+            &prefs(None, false),
+            16_000_000_000,
+            &|_| {},
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("looks like a file path"));
+    }
+
+    #[tokio::test]
+    async fn resolve_model_auto_selects_best_installed_model() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url = spawn_mock_server(|_| MockResponse::json("200 OK", model_json())).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let scored = resolve_model(&client, &None, &prefs(None, false), 16_000_000_000, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(scored.name, "qwen2.5-coder:7b");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_auto_errors_when_no_models_and_pull_disabled() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url =
+            spawn_mock_server(|_| MockResponse::json("200 OK", r#"{"models":[]}"#)).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let result =
+            resolve_model(&client, &None, &prefs(None, true), 16_000_000_000, &|_| {}).await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("no models installed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_model_auto_pulls_fallback_when_empty() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let base_url = spawn_mock_server(move |path| match path {
+            "/api/tags" if calls.load(Ordering::SeqCst) == 0 => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                MockResponse::json("200 OK", r#"{"models":[]}"#)
+            }
+            "/api/pull" => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                MockResponse::json("200 OK", "{\"status\":\"success\"}\n")
+            }
+            "/api/tags" => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                MockResponse::json("200 OK", model_json())
+            }
+            _ => MockResponse::text("404 Not Found", "no route"),
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let statuses = std::sync::Mutex::new(Vec::new());
+        let scored = resolve_model(
+            &client,
+            &None,
+            &prefs(None, false),
+            16_000_000_000,
+            &|msg| statuses.lock().unwrap().push(msg.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scored.name, "qwen2.5-coder:7b");
+        assert!(statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|msg| msg.contains("Pulling a better default")));
+    }
+
+    #[tokio::test]
+    async fn resolve_model_context_reads_show_endpoint() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/show");
+            MockResponse::json("200 OK", r#"{"model_info":{"llama.context_length":32768}}"#)
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert_eq!(
+            resolve_model_context(&client, "qwen2.5-coder:7b")
+                .await
+                .unwrap(),
+            32_768
+        );
+    }
 }
