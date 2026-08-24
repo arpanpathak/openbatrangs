@@ -104,7 +104,7 @@ curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/
 # One-time auto setup: install/start Ollama + pull a coding model
 openbatrangs setup
 
-# Interactive DeepCode-style agent (type tasks, keep chatting)
+# Interactive mode starts in chat (no tools); type /mode agent for full agent
 openbatrangs
 
 # One-shot agent mode with a task
@@ -145,17 +145,24 @@ Inside the `openBatarangs>` prompt:
 /steps <n>     set max agent steps
 /cwd <path>    change workspace
 /doctor        check Ollama + best model
+/mouse on|off  wheel/scrollbar capture (default on)
 ```
 
-Anything else you type is sent to the coding agent as a task.
+The interactive TUI starts in **chat** mode (no tools). Use `/mode agent` to
+enable the full agentic loop, or `/mode plan` for read-only planning.
+
+Anything else you type is sent to chat; in agent/plan mode it is sent to the
+coding agent as a task.
 
 ## Agent tools
 
-The agent can use these tools during a task:
+The agent can use these tools during a task. It does **not** scan the
+workspace unless your task explicitly asks about the current directory,
+project structure, codebase, or which files exist:
 
 | Tool | Description |
 | --- | --- |
-| `list_files` | List files in the workspace (skips `target`, `.git`, `node_modules`, etc.) |
+| `list_files` | List files in a directory (max depth 2; skips `target`, `.git`, `node_modules`, `data`, build/cache dirs, etc.) |
 | `read_file` | Read a text file with a size cap |
 | `grep_files` | Regex search across workspace files |
 | `write_file` | Write or overwrite a file (relative paths only) |

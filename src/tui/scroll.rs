@@ -5,7 +5,7 @@
 
 use super::app::App;
 use super::text_wrapped_height;
-use crate::constants::tui::LOG_LOAD_CHUNK;
+use crate::constants::tui::{CHAT_SCROLL_STEP, LOG_LOAD_CHUNK};
 
 impl App {
     pub(super) fn scroll_chat(&mut self, delta: i32) {
@@ -17,6 +17,16 @@ impl App {
         } else {
             self.chat_scroll_offset = next.max(0) as usize;
         }
+    }
+
+    /// Scroll by one viewport page (PageUp/PageDown).
+    pub(super) fn scroll_chat_page(&mut self, direction: i32) {
+        let visible_height = self
+            .last_chat_area
+            .map(|area| area.height.saturating_sub(2).max(1) as usize)
+            .unwrap_or(CHAT_SCROLL_STEP);
+        let delta = (visible_height as i32).saturating_mul(direction);
+        self.scroll_chat(delta);
     }
 
     /// Handle clicks/drags on the chat scrollbar. Returns `true` when consumed.

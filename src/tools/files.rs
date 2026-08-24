@@ -252,14 +252,17 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::create_dir_all(root.join(".agent/cache")).unwrap();
+        fs::create_dir_all(root.join("data/text")).unwrap();
         fs::write(root.join("target/ignored.txt"), "x").unwrap();
         fs::write(root.join(".agent/cache/secret.txt"), "x").unwrap();
+        fs::write(root.join("data/text/book.txt"), "x").unwrap();
         fs::write(root.join("keep.txt"), "y").unwrap();
 
         let output = list_files(&root, ".", 5).unwrap();
         assert!(output.contains("keep.txt"));
         assert!(!output.contains("target/ignored.txt"));
         assert!(!output.contains(".agent/cache/secret.txt"));
+        assert!(!output.contains("data/text/book.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 

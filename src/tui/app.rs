@@ -85,7 +85,7 @@ impl App {
         let mut log = SessionLog::new(MAX_LOG_LINES);
         log.push(String::new());
         log.push(
-            "Type a task, or /help. Enter sends, Shift+Enter adds a new line. /models picks a model."
+            "Chat mode. Type a message, or /help. /mode agent enables the full agent tools."
                 .to_string(),
         );
         Self {
@@ -117,14 +117,17 @@ impl App {
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
                 should_confirm: true,
-                mode: AgentMode::Agent,
+                mode: AgentMode::Chat,
                 show_thinking: true,
                 max_ctx: cli.max_ctx,
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
             show_perf: true,
-            mouse_capture: false,
+            // Mouse capture is ON by default so wheel scrolling and the
+            // scrollbar work out of the box. Use /mouse off for native
+            // selection/copy without Shift.
+            mouse_capture: true,
             perf: PerfMonitor::new(tegrastats),
             system_stats: SystemStats::default(),
             stream_chars: 0,
@@ -405,8 +408,8 @@ impl App {
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
-            KeyCode::PageUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
-            KeyCode::PageDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
+            KeyCode::PageUp => self.scroll_chat_page(-1),
+            KeyCode::PageDown => self.scroll_chat_page(1),
             KeyCode::Tab => self.accept_suggestion(),
             KeyCode::Enter => {
                 let modifiers = key.modifiers;
@@ -761,6 +764,32 @@ mod tests {
         assert_eq!(app.chat_scroll_offset, u16::MAX as usize + 101);
         app.scroll_chat(-1);
         assert_eq!(app.chat_scroll_offset, u16::MAX as usize + 100);
+    }
+
+    #[test]
+    fn tui_defaults_to_chat_mode_with_mouse_capture() {
+        let app = test_app();
+        assert_eq!(app.run_config.mode, AgentMode::Chat);
+        assert!(
+            app.mouse_capture,
+            "mouse wheel/scrollbar should be on by default"
+        );
+    }
+
+    #[test]
+    fn scroll_chat_page_scrolls_by_viewport_height() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 22,
+        });
+        app.chat_scroll_offset = 100;
+        app.scroll_chat_page(-1);
+        assert_eq!(app.chat_scroll_offset, 80);
+        app.scroll_chat_page(1);
+        assert_eq!(app.chat_scroll_offset, 100);
     }
 
     #[test]

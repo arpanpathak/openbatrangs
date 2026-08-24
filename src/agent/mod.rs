@@ -216,17 +216,59 @@ fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Phrases that signal the user wants information about the current workspace
+/// or project structure. Only these tasks get an automatic top-level listing;
+/// everything else starts with zero filesystem scanning.
+const WORKSPACE_SCAN_HINTS: &[&str] = &[
+    "current dir",
+    "current directory",
+    "this directory",
+    "this folder",
+    "this project",
+    "this repo",
+    "this repository",
+    "workspace",
+    "codebase",
+    "repository",
+    "file structure",
+    "project structure",
+    "list files",
+    "what files",
+    "explore",
+];
+
+/// True when the task explicitly asks about the project/workspace layout.
+fn task_requests_workspace_scan(task: &str) -> bool {
+    let task_lower = task.to_ascii_lowercase();
+    WORKSPACE_SCAN_HINTS
+        .iter()
+        .any(|hint| task_lower.contains(hint))
+}
+
+/// Build the system + first user turn.
+///
+/// The workspace is only listed when the user actually asks about the current
+/// directory/project structure. For any other task the agent starts with zero
+/// filesystem scanning, which keeps agent mode fast and avoids flooding the
+/// model with irrelevant files.
 fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
-    // Shallow top-level listing only. The model should call `list_files` on
-    // specific directories instead of forcing a recursive scan on every task.
-    let initial_listing = tools::list_files(cwd, ".", INITIAL_LIST_DEPTH)
-        .unwrap_or_else(|error| format!("(could not list files: {error})"));
-    let user_content = format!(
-        "Workspace root: {}\n\nInitial top-level file listing:\n{}\n(Use list_files on specific subdirectories when you need deeper context.)\n\nTask:\n{}",
-        cwd.display(),
-        initial_listing,
-        task
-    );
+    let workspace_note = if task_requests_workspace_scan(task) {
+        // Shallow top-level listing only. The model should call `list_files` on
+        // specific directories instead of forcing a recursive scan.
+        let initial_listing = tools::list_files(cwd, ".", INITIAL_LIST_DEPTH)
+            .unwrap_or_else(|error| format!("(could not list files: {error})"));
+        format!(
+            "Workspace root: {}\n\nInitial top-level file listing:\n{}\n(Use list_files on specific subdirectories when you need deeper context.)",
+            cwd.display(),
+            initial_listing
+        )
+    } else {
+        format!(
+            "Workspace root: {}\n\n(No files were listed because this task did not ask about the project structure. Call list_files only if you need to inspect the workspace.)",
+            cwd.display()
+        )
+    };
+    let user_content = format!("{workspace_note}\n\nTask:\n{task}");
     vec![
         ChatMessage {
             role: "system".to_string(),
@@ -303,18 +345,44 @@ mod tests {
     }
 
     #[test]
-    fn initial_messages_use_shallow_listing_not_recursive_scan() {
+    fn initial_messages_list_shallowly_when_task_asks_about_codebase() {
         let root = crate::test_support::unique_temp_dir("openbatrangs-shallow-test");
         std::fs::create_dir_all(root.join("sub/nested")).unwrap();
         std::fs::write(root.join("top.txt"), "top").unwrap();
         std::fs::write(root.join("sub/nested/deep.txt"), "deep").unwrap();
 
-        let messages = initial_messages(&root, "test task");
+        let messages = initial_messages(&root, "analyze this codebase");
         let user_content = &messages[1].content;
         assert!(user_content.contains("top.txt"));
         assert!(!user_content.contains("deep.txt"));
         assert!(user_content.contains("Use list_files on specific subdirectories"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_messages_do_not_scan_for_generic_task() {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-no-scan-test");
+        std::fs::write(root.join("top.txt"), "top").unwrap();
+
+        let messages = initial_messages(&root, "write a quicksort function in Rust");
+        let user_content = &messages[1].content;
+        assert!(!user_content.contains("top.txt"));
+        assert!(user_content.contains("No files were listed"));
+        assert!(user_content.contains("Call list_files only if you need to inspect"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_workspace_scan_hints_are_case_insensitive() {
+        assert!(task_requests_workspace_scan(
+            "Look at the CURRENT DIRECTORY layout"
+        ));
+        assert!(task_requests_workspace_scan("explore this repo"));
+        assert!(task_requests_workspace_scan(
+            "what files are in this project?"
+        ));
+        assert!(!task_requests_workspace_scan("write a unit test"));
     }
 }

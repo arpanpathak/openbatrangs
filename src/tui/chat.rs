@@ -46,8 +46,20 @@ fn code_syntax<'a>(h: &'a Highlighter, lang: &str) -> &'a syntect::parsing::Synt
         .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text())
 }
 
+/// Above this size, skip syntect highlighting entirely and render plain lines.
+/// This keeps long streaming output usable on Jetson-class devices.
+const FAST_PATH_MAX_CHARS: usize = 50_000;
+const FAST_PATH_MAX_LINES: usize = 2_000;
+
 /// Render chat text with syntax highlighting inside ``` code fences.
 fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
+    if text.len() > FAST_PATH_MAX_CHARS || text.lines().count() > FAST_PATH_MAX_LINES {
+        return text
+            .lines()
+            .map(|line| Line::from(Span::raw(line.to_string())))
+            .collect();
+    }
+
     let h = highlighter();
     let mut out = Vec::new();
     let mut in_code = false;
