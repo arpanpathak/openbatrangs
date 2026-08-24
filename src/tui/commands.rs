@@ -6,7 +6,7 @@
 
 use super::app::{App, PickerState};
 use super::split_command;
-use super::{run_pull_worker, run_setup_worker, UiEvent};
+use super::{run_pull_worker, run_setup_worker, ScrollMode, UiEvent};
 use crate::cli::AgentMode;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
@@ -153,7 +153,7 @@ impl App {
         self.is_running = true;
         self.status = "pulling model".to_string();
         self.last_action = format!("pulling {name}");
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
 
         let client = client.clone();
         let tx = tx.clone();
@@ -304,7 +304,7 @@ impl App {
         self.is_running = true;
         self.status = "running setup".to_string();
         self.last_action = "setup".to_string();
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
 
         let client = client.clone();
         let tx = tx.clone();
@@ -320,7 +320,7 @@ impl App {
         self.live.clear();
         self.current_prompt = None;
         self.chat_history.clear();
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
         self.chat_scroll_offset = 0;
     }
 

@@ -64,40 +64,56 @@ pub(super) async fn stream_model_response<R: Reporter>(
     Ok((buffer.trim().to_string(), answer_was_streamed))
 }
 
+/// Lifecycle of a single JSON string field while its value is being streamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldState {
+    /// Still receiving characters; the closing quote has not been seen.
+    Active,
+    /// The field is hidden (thinking disabled) or shadowed by a tool call.
+    Skipped,
+    /// The closing quote was seen; no more text will arrive.
+    Complete,
+}
+
 /// Tracks incremental extraction of a JSON string field from a streaming buffer.
 pub(super) struct StreamState {
     key: &'static str,
+    state: FieldState,
     has_printed_prefix: bool,
     printed_length: usize,
-    is_complete: bool,
-    is_skipped: bool,
 }
 
 impl StreamState {
     pub(super) fn new(key: &'static str, enabled: bool) -> Self {
+        let state = if key == "thought" && !enabled {
+            FieldState::Skipped
+        } else {
+            FieldState::Active
+        };
         Self {
             key,
+            state,
             has_printed_prefix: false,
             printed_length: 0,
-            is_complete: false,
-            is_skipped: key == "thought" && !enabled,
         }
     }
 
     pub(super) fn feed<R: Reporter>(&mut self, reporter: &mut R, buffer: &str) -> Result<()> {
-        if self.is_complete || self.is_skipped {
-            return Ok(());
+        match self.state {
+            FieldState::Skipped | FieldState::Complete => return Ok(()),
+            FieldState::Active => {}
         }
 
         // If a top-level tool call exists before this field, don't stream it —
         // it might be text inside tool arguments rather than the real field.
-        if let (Some(field_pos), Some(tool_pos)) =
-            (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
+        let shadowed_by_tool = match (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
         {
-            if tool_pos < field_pos {
-                self.is_skipped = true;
-                return Ok(());
-            }
+            (Some(field_pos), Some(tool_pos)) => tool_pos < field_pos,
+            _ => false,
+        };
+        if shadowed_by_tool {
+            self.state = FieldState::Skipped;
+            return Ok(());
         }
 
         if let Some((text, is_complete)) = extract_json_string(buffer, self.key) {
@@ -111,7 +127,7 @@ impl StreamState {
                 self.printed_length = text.len();
             }
             if is_complete {
-                self.is_complete = true;
+                self.state = FieldState::Complete;
                 reporter.line(String::new());
             }
         }
@@ -238,7 +254,7 @@ mod tests {
     #[test]
     fn stream_state_skips_when_disabled() {
         let mut state = StreamState::new("thought", false);
-        assert!(state.is_skipped);
+        assert_eq!(state.state, FieldState::Skipped);
         state
             .feed(
                 &mut super::super::reporter::StdoutReporter,

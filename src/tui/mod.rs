@@ -32,6 +32,19 @@ pub(super) use text::{
 };
 pub(super) use worker::{run_agent_worker, run_pull_worker, run_setup_worker, UiEvent};
 
+/// How the chat viewport follows newly generated output.
+///
+/// Using an enum instead of a raw boolean makes the two states explicit and
+/// impossible to confuse: `Follow` pins the view to the newest lines, `Manual`
+/// leaves the user's scroll offset alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScrollMode {
+    /// Stay pinned to the bottom as new output arrives.
+    Follow,
+    /// Preserve the user's current scroll position.
+    Manual,
+}
+
 use crate::cli::Cli;
 use crate::constants::tui::TICK_MILLIS;
 use crate::ollama::OllamaClient;

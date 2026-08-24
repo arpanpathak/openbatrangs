@@ -1,9 +1,20 @@
-//! Chat text rendering: syntax highlighting and a cheap render cache.
+//! # Chat text rendering: syntax highlighting and a cheap render cache
 //!
-//! The full chat log is re-highlighted by syntect on every TUI frame when the
+//! The full chat log is re-highlighted by [syntect] on every TUI frame when the
 //! text changes. On idle frames (spinner ticks) the log is unchanged, so we
 //! cache the last rendered `Vec<Line>` and only rebuild when the underlying
 //! text actually differs.
+//!
+//! Code fences are tracked with an explicit [`CodeFenceState`] enum instead of
+//! a pair of booleans/options; the highlighter lives inside the enum variant so
+//! multi-line constructs (comments, strings, doc blocks) keep their state
+//! across lines.
+//!
+//! ## References
+//!
+//! - Syntect: <https://github.com/trishume/syntect>
+//! - Ratatui `Line`/`Span`: <https://docs.rs/ratatui/latest/ratatui/text/index.html>
+//! - CommonMark fenced code blocks: <https://spec.commonmark.org/0.31.2/#fenced-code-blocks>
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -12,6 +23,14 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style as SynStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
+
+/// State of the markdown code-fence scanner.
+enum CodeFenceState<'a> {
+    /// Outside a fenced code block; lines are rendered as plain text.
+    Plain,
+    /// Inside a fenced code block with an active syntect highlighter.
+    InCode(HighlightLines<'a>),
+}
 
 struct Highlighter {
     syntaxes: SyntaxSet,
@@ -62,55 +81,62 @@ fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
 
     let h = highlighter();
     let mut out = Vec::new();
-    let mut in_code = false;
-    // One highlighter per code block so multi-line constructs (comments,
-    // strings, doc blocks) keep their highlighting state across lines.
-    let mut line_highlighter: Option<HighlightLines> = None;
+    let mut fence_state = CodeFenceState::Plain;
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
-            if in_code {
-                in_code = false;
-                line_highlighter = None;
-            } else {
-                in_code = true;
-                let lang = trimmed.trim_start_matches("```").trim().to_string();
-                line_highlighter = Some(HighlightLines::new(code_syntax(h, &lang), &h.theme));
-            }
+            fence_state = toggle_fence(fence_state, trimmed, h);
             out.push(Line::from(Span::styled(
                 raw.to_string(),
                 Style::default().fg(Color::DarkGray),
             )));
             continue;
         }
+        out.push(render_chat_line(raw, &mut fence_state, h));
+    }
+    out
+}
 
-        if in_code {
+/// Toggle between plain text and an active code fence.
+fn toggle_fence<'a>(
+    state: CodeFenceState<'a>,
+    trimmed: &str,
+    h: &'a Highlighter,
+) -> CodeFenceState<'a> {
+    match state {
+        CodeFenceState::Plain => {
+            let lang = trimmed.trim_start_matches("```").trim().to_string();
+            CodeFenceState::InCode(HighlightLines::new(code_syntax(h, &lang), &h.theme))
+        }
+        CodeFenceState::InCode(_) => CodeFenceState::Plain,
+    }
+}
+
+/// Render one chat line, highlighting it when inside a code fence.
+fn render_chat_line<'a>(
+    raw: &str,
+    fence_state: &mut CodeFenceState<'a>,
+    h: &'a Highlighter,
+) -> Line<'static> {
+    match fence_state {
+        CodeFenceState::Plain => Line::from(Span::raw(raw.to_string())),
+        CodeFenceState::InCode(highlighter) => {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            if let Some(line_highlighter) = &mut line_highlighter {
-                for line in LinesWithEndings::from(raw) {
-                    match line_highlighter.highlight_line(line, &h.syntaxes) {
-                        Ok(regions) => {
-                            for (style, segment) in regions {
-                                spans.push(Span::styled(
-                                    segment.to_string(),
-                                    syn_style_to_ratatui(style),
-                                ));
-                            }
-                        }
-                        Err(_) => spans.push(Span::raw(raw.to_string())),
-                    }
+            for line in LinesWithEndings::from(raw) {
+                match highlighter.highlight_line(line, &h.syntaxes) {
+                    Ok(regions) => spans.extend(regions.into_iter().map(|(style, segment)| {
+                        Span::styled(segment.to_string(), syn_style_to_ratatui(style))
+                    })),
+                    Err(_) => spans.push(Span::raw(raw.to_string())),
                 }
             }
             if spans.is_empty() {
                 spans.push(Span::raw(raw.to_string()));
             }
-            out.push(Line::from(spans));
-        } else {
-            out.push(Line::from(Span::raw(raw.to_string())));
+            Line::from(spans)
         }
     }
-    out
 }
 
 /// Cache of the last highlighted chat log.

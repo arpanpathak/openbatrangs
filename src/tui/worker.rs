@@ -69,8 +69,12 @@ pub(crate) async fn run_agent_worker(
     chat_history: Vec<ChatMessage>,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
-    if config.mode == AgentMode::Chat {
-        return run_chat_worker(client, config, model_slot, prefs, task, chat_history, tx).await;
+    match config.mode {
+        AgentMode::Chat => {
+            return run_chat_worker(client, config, model_slot, prefs, task, chat_history, tx)
+                .await;
+        }
+        AgentMode::Agent | AgentMode::Plan => {}
     }
 
     let mem_budget = calculate_memory_budget();
@@ -83,7 +87,7 @@ pub(crate) async fn run_agent_worker(
     let agent_config = AgentConfig {
         cwd: config.cwd,
         max_steps: config.max_steps,
-        is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
+        is_read_only: config.is_read_only || matches!(config.mode, AgentMode::Plan),
         should_confirm: config.should_confirm,
         show_thinking: config.show_thinking,
         max_ctx: config.max_ctx,

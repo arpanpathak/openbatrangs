@@ -15,7 +15,7 @@
 //! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
 use super::app::App;
-use super::{text_wrapped_height, wrap_text_to_lines};
+use super::{text_wrapped_height, wrap_text_to_lines, ScrollMode};
 use crate::cli::AgentMode;
 use crate::constants::tui::{
     COMPACT_BANNER_HEIGHT, FULL_BANNER_MIN_TERMINAL_HEIGHT, FULL_BANNER_MIN_WIDTH,
@@ -151,12 +151,14 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let max_scroll = content_height.saturating_sub(visible_height);
     // Re-stick to the bottom when the user scrolls down to the latest line, but
     // never yank them back down while they are reading older content.
-    if app.auto_scroll {
-        // Already following the latest output.
-    } else if app.chat_scroll_offset >= max_scroll {
-        app.auto_scroll = true;
-    } else {
-        app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll);
+    match app.scroll_mode {
+        ScrollMode::Follow => {}
+        ScrollMode::Manual if app.chat_scroll_offset >= max_scroll => {
+            app.scroll_mode = ScrollMode::Follow;
+        }
+        ScrollMode::Manual => {
+            app.chat_scroll_offset = app.chat_scroll_offset.min(max_scroll);
+        }
     }
     let scroll_y = chat_scroll(app, area, content_height);
     // Huge logs skip the syntect code-highlighting path entirely. Building
@@ -218,9 +220,9 @@ fn chat_inner_width(area_width: u16) -> usize {
 fn chat_scroll(app: &App, area: Rect, content_height: usize) -> usize {
     let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content_height.saturating_sub(visible_height);
-    match app.auto_scroll {
-        true => max_scroll,
-        false => app.chat_scroll_offset.min(max_scroll),
+    match app.scroll_mode {
+        ScrollMode::Follow => max_scroll,
+        ScrollMode::Manual => app.chat_scroll_offset.min(max_scroll),
     }
 }
 
@@ -528,14 +530,14 @@ mod tests {
         let chat_text = app.chat_text();
         let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
 
-        app.auto_scroll = true;
+        app.scroll_mode = ScrollMode::Follow;
         let bottom = chat_scroll(&app, area, content_height);
         assert!(
             bottom > u16::MAX as usize,
             "true bottom scroll must stay in usize space, got {bottom}"
         );
 
-        app.auto_scroll = false;
+        app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 10_000;
         assert_eq!(chat_scroll(&app, area, content_height), 10_000);
     }
@@ -554,7 +556,7 @@ mod tests {
         };
         let chat_text = app.chat_text();
         let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
-        app.auto_scroll = true;
+        app.scroll_mode = ScrollMode::Follow;
         let scroll_y = chat_scroll(&app, area, content_height);
         let ratatui_scroll = scroll_y.min(u16::MAX as usize) as u16;
         assert_eq!(ratatui_scroll, u16::MAX);

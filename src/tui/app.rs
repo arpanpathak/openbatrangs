@@ -2,7 +2,9 @@
 
 use super::chat::ChatRenderCache;
 use super::session::SessionLog;
-use super::{chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, UiEvent};
+use super::{
+    chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, ScrollMode, UiEvent,
+};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
@@ -41,7 +43,7 @@ pub(super) struct App {
     pub(super) is_running: bool,
     pub(super) status: String,
     pub(super) last_action: String,
-    pub(super) auto_scroll: bool,
+    pub(super) scroll_mode: ScrollMode,
     pub(super) chat_scroll_offset: usize,
     pub(super) spinner_frame: u64,
     pub(super) task_queue: VecDeque<String>,
@@ -92,7 +94,7 @@ impl App {
             is_running: false,
             status: "ready".to_string(),
             last_action: String::new(),
-            auto_scroll: false,
+            scroll_mode: ScrollMode::Manual,
             chat_scroll_offset: 0,
             spinner_frame: 0,
             task_queue: VecDeque::new(),
@@ -209,7 +211,7 @@ impl App {
         self.is_running = true;
         self.status = "running".to_string();
         self.last_action.clear();
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
         self.stream_chars = 0;
         self.stream_started_at = None;
         self.tokens_per_sec = 0.0;
@@ -449,7 +451,7 @@ impl App {
             self.chat_history.pop();
         }
         self.last_action.clear();
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
         self.flush_live();
         self.log.push("⛔ Cancelled.".to_string());
         // Keep the queue moving: cancelling the active task should not strand
@@ -495,10 +497,9 @@ impl App {
         let visual_lines = chat_visual_line_indices(&chat_text, max_text_width);
         let content_height = visual_lines.len().max(1);
         let visible_height = area.height.saturating_sub(2) as usize;
-        let scroll = if self.auto_scroll {
-            content_height.saturating_sub(visible_height)
-        } else {
-            self.chat_scroll_offset.min(content_height)
+        let scroll = match self.scroll_mode {
+            ScrollMode::Follow => content_height.saturating_sub(visible_height),
+            ScrollMode::Manual => self.chat_scroll_offset.min(content_height),
         };
         let visual_index = scroll + relative;
         let Some(source_index) = visual_lines.get(visual_index).copied() else {
@@ -599,7 +600,7 @@ impl App {
             return Ok(false);
         }
         self.history.push(task.clone());
-        self.auto_scroll = true;
+        self.scroll_mode = ScrollMode::Follow;
         if !task.starts_with('/') {
             self.current_prompt = Some(task.clone());
             self.log.push("─".repeat(CHAT_SEPARATOR_LENGTH));
@@ -854,13 +855,13 @@ mod tests {
             role: "user".to_string(),
             content: "task".to_string(),
         });
-        app.auto_scroll = false;
+        app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 42;
         app.clear_chat();
         assert!(app.chat_history.is_empty());
         assert!(app.current_prompt.is_none());
         assert!(app.log.is_empty());
-        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_mode, ScrollMode::Follow);
         assert_eq!(app.chat_scroll_offset, 0);
     }
 

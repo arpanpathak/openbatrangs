@@ -18,16 +18,18 @@
 
 use super::app::App;
 use super::text_wrapped_height;
+use super::ScrollMode;
 use crate::constants::tui::{CHAT_SCROLL_STEP, LOG_LOAD_CHUNK};
 
 impl App {
     /// Scroll the chat by `delta` wrapped rows.
     ///
-    /// Scrolling always disables auto-follow. When the user scrolls up past the
-    /// top of the in-memory window, the next chunk of disk-backed history is
-    /// loaded and the offset resets to the top of that chunk.
+    /// Scrolling always switches to [`ScrollMode::Manual`]. When the user
+    /// scrolls up past the top of the in-memory window, the next chunk of
+    /// disk-backed history is loaded and the offset resets to the top of that
+    /// chunk.
     pub(super) fn scroll_chat(&mut self, delta: i32) {
-        self.auto_scroll = false;
+        self.scroll_mode = ScrollMode::Manual;
         let next = self.chat_scroll_offset as i32 + delta;
         if next <= 0 && delta < 0 && self.log.has_more_history() {
             self.log.load_more(LOG_LOAD_CHUNK);
@@ -75,7 +77,11 @@ impl App {
         let offset = (max_scroll as f64 * ratio).round() as usize;
         let offset = offset.min(max_scroll);
 
-        self.auto_scroll = offset >= max_scroll;
+        self.scroll_mode = if offset >= max_scroll {
+            ScrollMode::Follow
+        } else {
+            ScrollMode::Manual
+        };
         self.chat_scroll_offset = offset;
         true
     }
