@@ -382,16 +382,13 @@ impl App {
             KeyCode::Char(character)
                 if character == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if self.is_running
-                    || self.pending_confirmation.is_some()
-                    || !self.task_queue.is_empty()
-                {
+                if self.is_running || !self.task_queue.is_empty() {
                     self.cancel_task(client, tx);
-                } else {
-                    // Nothing to cancel: behave like a normal line-clear.
-                    self.input.clear();
-                    self.cursor = 0;
                 }
+                // Always clear the input line: Ctrl+C should not leave
+                // half-typed text sitting in the box after a cancel.
+                self.input.clear();
+                self.cursor = 0;
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_newline();

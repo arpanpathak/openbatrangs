@@ -1,13 +1,26 @@
-//! Bounded chat log with disk-backed history.
+//! # Bounded chat log with disk-backed history
 //!
-//! Only the most recent lines are kept in memory. Older lines are appended to a
-//! temporary session file and loaded back on demand when the user scrolls up,
-//! so long agent sessions do not grow memory without bound.
+//! An agentic session can produce thousands of lines (tool output, file
+//! listings, long code diffs). Keeping every line in memory is wasteful on
+//! Jetson-class devices, so this log keeps only a recent window in RAM and
+//! spills older lines to a temporary file.
 //!
-//! The on-disk history is accessed with a byte cursor: each evicted line's
-//! offset is recorded when it is appended, and `load_more` seeks straight to the
-//! next unread offset. This keeps repeated scroll-up loads O(chunk) instead of
-//! O(total history) per call.
+//! Scrolling up should feel like paging through a normal chat: the first
+//! `load_more` returns the lines that were evicted most recently, i.e. the
+//! lines immediately before the live window. Loading from the very beginning
+//! of the session would make the first PageUp jump to the first message ever,
+//! which is almost never what the user wants.
+//!
+//! The prefix window is also capped (`max_prefix`). When it grows too large,
+//! the oldest lines are dropped from the front so they can be reloaded on
+//! demand. Once the user reaches the very beginning, the cap stops dropping
+//! lines so the oldest message stays visible.
+//!
+//! ## References
+//!
+//! - `std::fs::File` seek/read: <https://doc.rust-lang.org/std/fs/struct.File.html>
+//! - `BufRead::lines`: <https://doc.rust-lang.org/std/io/trait.BufRead.html#method.lines>
+//! - Temporary directories: <https://doc.rust-lang.org/std/env/fn.temp_dir.html>
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -18,12 +31,19 @@ pub(super) struct SessionLog {
     path: PathBuf,
     memory: Vec<String>,
     max_memory: usize,
+    /// Maximum number of disk-backed lines kept in the visible prefix window.
+    /// Older lines are dropped from the front of the window and reloaded on
+    /// demand, so memory stays bounded even when the user scrolls far back.
+    max_prefix: usize,
+    /// Disk-backed lines currently visible before the live memory window, in
+    /// chronological order.
     prefix: Vec<String>,
+    /// Index into `disk_offsets` of the first line in `prefix`.
+    prefix_start: usize,
     /// Byte offset of each evicted line's start in `path`.
     disk_offsets: Vec<u64>,
     /// Current length of the disk file (end offset of the last evicted line).
     disk_len: u64,
-    loaded_prefix_count: usize,
 }
 
 impl SessionLog {
@@ -40,20 +60,30 @@ impl SessionLog {
             path,
             memory: Vec::new(),
             max_memory,
+            max_prefix: max_memory.saturating_mul(2).max(1),
             prefix: Vec::new(),
+            prefix_start: 0,
             disk_offsets: Vec::new(),
             disk_len: 0,
-            loaded_prefix_count: 0,
         }
     }
 
     pub(super) fn push(&mut self, line: String) {
         self.memory.push(line);
-        if self.memory.len() > self.max_memory {
-            let evicted = self.memory.remove(0);
-            if let Some(offset) = append_line(&self.path, self.disk_len, &evicted) {
-                self.disk_offsets.push(offset);
-                self.disk_len = offset + evicted.len() as u64 + 1;
+        if self.memory.len() <= self.max_memory {
+            return;
+        }
+
+        let evicted = self.memory.remove(0);
+        if let Some(offset) = append_line(&self.path, self.disk_len, &evicted) {
+            self.disk_offsets.push(offset);
+            self.disk_len = offset + evicted.len() as u64 + 1;
+            // Keep the loaded prefix contiguous with the live window: a line
+            // evicted while the user is reading older history still belongs
+            // between the prefix and the in-memory tail.
+            if !self.prefix.is_empty() {
+                self.prefix.push(evicted);
+                self.enforce_prefix_cap();
             }
         }
     }
@@ -61,27 +91,42 @@ impl SessionLog {
     pub(super) fn clear(&mut self) {
         self.memory.clear();
         self.prefix.clear();
+        self.prefix_start = 0;
         self.disk_offsets.clear();
         self.disk_len = 0;
-        self.loaded_prefix_count = 0;
         let _ = std::fs::write(&self.path, "");
     }
 
     /// True when older lines exist on disk that have not been loaded yet.
     pub(super) fn has_more_history(&self) -> bool {
-        self.loaded_prefix_count < self.disk_offsets.len()
+        if self.prefix.is_empty() {
+            !self.disk_offsets.is_empty()
+        } else {
+            self.prefix_start > 0
+        }
     }
 
     /// Load up to `chunk` older lines from disk into the visible prefix.
     ///
+    /// Lines are read backwards from the live memory window, so the first
+    /// scroll-up shows the most recently evicted lines instead of jumping to
+    /// the very beginning of the session.
+    ///
     /// # Returns
     /// `true` if at least one line was loaded.
     pub(super) fn load_more(&mut self, chunk: usize) -> bool {
-        let start = self.loaded_prefix_count;
-        if start >= self.disk_offsets.len() {
-            return false;
-        }
-        let end = (start + chunk).min(self.disk_offsets.len());
+        let end = if self.prefix.is_empty() {
+            if self.disk_offsets.is_empty() {
+                return false;
+            }
+            self.disk_offsets.len()
+        } else {
+            if self.prefix_start == 0 {
+                return false;
+            }
+            self.prefix_start
+        };
+        let start = end.saturating_sub(chunk);
         let Some(offset) = self.disk_offsets.get(start).copied() else {
             return false;
         };
@@ -93,21 +138,43 @@ impl SessionLog {
             return false;
         }
 
-        let mut loaded = 0usize;
+        let mut loaded = Vec::with_capacity(end - start);
         for line in reader.lines().take(end - start) {
             match line {
-                Ok(line) => {
-                    self.prefix.push(line);
-                    loaded += 1;
-                }
+                Ok(line) => loaded.push(line),
                 Err(_) => break,
             }
         }
-        if loaded == 0 {
+        if loaded.is_empty() {
             return false;
         }
-        self.loaded_prefix_count = start + loaded;
+
+        if self.prefix.is_empty() {
+            self.prefix = loaded;
+        } else {
+            self.prefix.splice(0..0, loaded);
+        }
+        self.prefix_start = start;
+        self.enforce_prefix_cap();
         true
+    }
+
+    /// Drop the oldest loaded lines when the prefix window grows too large.
+    ///
+    /// Dropping from the front keeps the window contiguous with the live
+    /// memory tail and leaves `has_more_history` true, so those lines can be
+    /// reloaded if the user keeps scrolling up. When the user has reached the
+    /// very beginning of the session (`prefix_start == 0`) nothing is dropped;
+    /// otherwise the oldest lines would never be displayable.
+    fn enforce_prefix_cap(&mut self) {
+        if self.prefix_start == 0 {
+            return;
+        }
+        let excess = self.prefix.len().saturating_sub(self.max_prefix);
+        if excess > 0 {
+            self.prefix.drain(0..excess);
+            self.prefix_start += excess;
+        }
     }
 
     /// Full visible text: loaded history followed by the in-memory window.
@@ -189,21 +256,28 @@ mod tests {
     }
 
     #[test]
-    fn loads_history_in_chunks_in_order() {
+    fn loads_history_backwards_from_live_window_in_chunks() {
         let mut log = SessionLog::new(2);
+        // Raise the cap so this test exercises ordering, not the memory bound.
+        log.max_prefix = 100;
         for i in 0..10 {
             log.push(format!("line {i}"));
         }
         assert_eq!(log.memory.len(), 2);
         assert!(log.has_more_history());
 
+        // First scroll-up loads the newest evicted lines (7, 6, 5), not the
+        // oldest ones, so the visible chat is contiguous with what was on
+        // screen before scrolling.
         assert!(log.load_more(3));
-        assert!(log.text().starts_with("line 0\nline 1\nline 2"));
+        assert!(log
+            .text()
+            .starts_with("line 5\nline 6\nline 7\nline 8\nline 9"));
 
         assert!(log.load_more(3));
         assert!(log
             .text()
-            .starts_with("line 0\nline 1\nline 2\nline 3\nline 4\nline 5"));
+            .starts_with("line 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
 
         assert!(log.load_more(100));
         assert!(!log.has_more_history());
@@ -218,12 +292,35 @@ mod tests {
         }
         assert!(log.load_more(10));
         assert!(!log.has_more_history());
+
         log.push("line 4".to_string());
         assert_eq!(log.memory.len(), 2);
-        // The newly evicted line (line 2) is now on disk and can be loaded.
-        assert!(log.has_more_history());
-        assert!(log.load_more(10));
+        // The newly evicted line is folded into the loaded prefix so the
+        // visible history stays contiguous with the live memory window.
+        assert!(!log.has_more_history());
         assert!(log.text().starts_with("line 0\nline 1\nline 2"));
         assert!(log.text().ends_with("line 4"));
+    }
+
+    #[test]
+    fn prefix_window_is_capped_and_older_lines_can_reload() {
+        let mut log = SessionLog::new(2);
+        log.max_prefix = 3;
+        for i in 0..10 {
+            log.push(format!("line {i}"));
+        }
+
+        // Loading in small chunks keeps the window bounded while there is
+        // still older history to load.
+        assert!(log.load_more(3));
+        assert!(log.load_more(3));
+        assert!(log.prefix.len() <= log.max_prefix);
+        assert!(log.has_more_history());
+
+        // Once the user reaches the very beginning, the oldest lines must
+        // remain visible instead of being dropped by the cap.
+        assert!(log.load_more(100));
+        assert!(log.text().starts_with("line 0"));
+        assert!(!log.has_more_history());
     }
 }

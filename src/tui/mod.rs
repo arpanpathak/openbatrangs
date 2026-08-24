@@ -135,23 +135,12 @@ async fn run_loop(
             break;
         }
 
+        // Biased: keyboard/mouse input is checked before background stream
+        // events so scrolling and Ctrl+C stay responsive while the model is
+        // generating. Without this, a continuously-full event channel can
+        // starve input and make scroll feel broken.
         tokio::select! {
-            maybe = rx.recv() => {
-                if let Some(event) = maybe {
-                    app.handle_event(event, client, &tx);
-                    // Coalesce bursts of background events (e.g. streaming
-                    // tokens) so the terminal is redrawn once per batch instead
-                    // of once per token. This keeps generation smooth.
-                    let mut drained = 0usize;
-                    while drained < 128 {
-                        match rx.try_recv() {
-                            Ok(event) => app.handle_event(event, client, &tx),
-                            Err(_) => break,
-                        }
-                        drained += 1;
-                    }
-                }
-            }
+            biased;
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
@@ -165,6 +154,23 @@ async fn run_loop(
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
+                }
+            }
+            maybe = rx.recv() => {
+                if let Some(event) = maybe {
+                    app.handle_event(event, client, &tx);
+                    // Coalesce bursts of background events (e.g. streaming
+                    // tokens) so the terminal is redrawn once per batch instead
+                    // of once per token. The biased select above still lets
+                    // keyboard/mouse through between batches.
+                    let mut drained = 0usize;
+                    while drained < 32 {
+                        match rx.try_recv() {
+                            Ok(event) => app.handle_event(event, client, &tx),
+                            Err(_) => break,
+                        }
+                        drained += 1;
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(TICK_MILLIS)) => {

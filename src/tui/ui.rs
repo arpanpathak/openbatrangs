@@ -1,4 +1,18 @@
-//! Ratatui rendering for the TUI.
+//! # Ratatui rendering for the TUI
+//!
+//! This module owns the layout and widget construction. Keeping rendering out
+//! of the event loop makes the TUI testable with ratatui's `TestBackend` and
+//! keeps the state transitions in `App` free of layout concerns.
+//!
+//! Large chat logs are rendered with a raw paragraph (no syntect pass) so
+//! streaming stays responsive on Jetson-class devices; smaller logs keep code
+//! syntax highlighting.
+//!
+//! ## References
+//!
+//! - Ratatui layout API: <https://docs.rs/ratatui/latest/ratatui/layout/index.html>
+//! - Ratatui `Paragraph`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
+//! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
 use super::app::App;
 use super::{text_wrapped_height, wrap_text_to_lines};
