@@ -13,7 +13,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt, clippy, llvm-tools-preview
+          components: rustfmt, clippy
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -24,15 +24,35 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          files: lcov.info
-          fail_ci_if_error: false
-          verbose: true
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage badge data
+        run: |
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+          percent="$(awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END { if (lf>0) printf "%.1f", 100*lh/lf; else print "0" }' lcov.info)"
+          echo "line coverage: ${percent}%"
+          jq -n --arg percent "$percent" \
+            '{schemaVersion:1,label:"coverage",message:($percent + "%"),color:"brightgreen"}' > badge.json
+
+      - name: Publish coverage badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin coverage || true
+          git checkout -B coverage origin/coverage 2>/dev/null || git checkout --orphan coverage
+          cp badge.json coverage.json
+          git add coverage.json
+          git commit -m "chore(coverage): update badge [skip ci]" || echo "no coverage change"
+          git push origin coverage --force

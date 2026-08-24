@@ -18,7 +18,7 @@
 
 [![Agentic](https://img.shields.io/badge/Agentic-Tools-8A2BE2?style=for-the-badge)](https://github.com/arpanpathak/openbatrangs) [![Context Aware](https://img.shields.io/badge/Context-32K%2B-FF6B6B?style=for-the-badge)](https://github.com/arpanpathak/openbatrangs) [![Maintained](https://img.shields.io/badge/Maintained-YES-2E8B57?style=for-the-badge&logo=github&logoColor=white)](https://github.com/arpanpathak/openbatrangs)
 
-[![CI](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml/badge.svg)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/arpanpathak/openbatrangs/branch/main/graph/badge.svg)](https://codecov.io/gh/arpanpathak/openbatrangs)
+[![CI](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml/badge.svg)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Farpanpathak%2Fopenbatrangs%2Fcoverage%2Fcoverage.json&style=for-the-badge)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
 
 </div>
 
