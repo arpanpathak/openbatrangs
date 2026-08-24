@@ -419,12 +419,11 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                if self.input.is_empty() {
-                    self.should_quit = true;
-                } else {
-                    self.input.clear();
-                    self.cursor = 0;
-                }
+                // Esc never quits the app. It clears the current input line so
+                // an accidental press cannot destroy the session. Use /quit,
+                // /exit, or Ctrl+C at idle to leave.
+                self.input.clear();
+                self.cursor = 0;
             }
             _ => {}
         }
@@ -1041,6 +1040,27 @@ mod tests {
             !app.log.iter().any(|line| line.contains("Cancelled")),
             "idle Ctrl+C must not log a fake cancel"
         );
+    }
+
+    #[tokio::test]
+    async fn esc_clears_input_and_never_quits() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        let key = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        assert!(!result, "Esc must not quit the TUI");
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert!(!app.should_quit);
+
+        // Esc on an already-empty input is also a no-op quit-wise.
+        let key = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        assert!(!result, "Esc on empty input must not quit the TUI");
+        assert!(!app.should_quit);
     }
 
     #[tokio::test]
