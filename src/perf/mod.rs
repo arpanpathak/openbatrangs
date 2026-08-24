@@ -319,4 +319,30 @@ mod tests {
         let _ = sampler.sample();
         let _ = sampler.sample();
     }
+
+    #[test]
+    fn perf_monitor_samples_when_due_and_skips_early_samples() {
+        use std::time::Duration;
+
+        let shared = Arc::new(Mutex::new(Some(
+            "RAM 100/1000MB GR3D_FREQ 10% gpu@40C VDD_IN 5000mW/".to_string(),
+        )));
+        let mut monitor = PerfMonitor::new(shared);
+        let now = Instant::now();
+        let first = monitor.sample_if_due(now);
+        assert!(first.is_some());
+        let stats = first.unwrap();
+        assert_eq!(stats.gpu_util_percent, Some(10.0));
+        assert_eq!(stats.gpu_temp_c, Some(40.0));
+        assert_eq!(stats.gpu_power_watts, Some(5.0));
+        let not_due = monitor.sample_if_due(now + Duration::from_millis(1));
+        assert!(not_due.is_none());
+    }
+
+    #[test]
+    fn tegrastats_guard_handles_missing_binary() {
+        let shared = Arc::new(Mutex::new(None));
+        let guard = TegrastatsGuard::start(shared);
+        drop(guard);
+    }
 }

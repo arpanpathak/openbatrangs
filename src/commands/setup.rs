@@ -1,4 +1,13 @@
-//! Ollama onboarding: install/start Ollama and pull a recommended model.
+//! # Ollama onboarding: install/start Ollama and pull a recommended model
+//!
+//! `setup` is the zero-knowledge entry point: it makes sure Ollama is running
+//! (installing it if necessary) and pulls a coding model that fits the device's
+//! memory. The status callback variant keeps the TUI's alternate screen intact.
+//!
+//! ## References
+//!
+//! - Ollama install script: <https://ollama.com/download/linux>
+//! - Ollama pull API: <https://github.com/ollama/ollama/blob/main/docs/api.md#pull-a-model>
 
 use super::{has_ollama_binary, start_ollama_server, wait_until_available};
 use crate::constants::commands::{OLLAMA_INSTALL_SCRIPT_URL, SETUP_START_POLL_ATTEMPTS};
@@ -73,4 +82,34 @@ fn install_ollama(on_status: &(dyn Fn(&str) + Sync)) -> Result<()> {
         bail!("Ollama install failed. Install manually from https://ollama.com/download/linux");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setup_with_status_pulls_fallback_when_missing() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+        use std::sync::{Arc, Mutex};
+
+        let base_url = spawn_mock_server(|path| match path {
+            "/api/tags" => MockResponse::json("200 OK", r#"{"models":[]}"#),
+            "/api/pull" => MockResponse::json("200 OK", "{\"status\":\"success\"}\n"),
+            _ => MockResponse::text("404 Not Found", "no route"),
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&statuses);
+        setup_with_status(&client, &move |msg| {
+            captured.lock().unwrap().push(msg.to_string());
+        })
+        .await
+        .unwrap();
+
+        let statuses = statuses.lock().unwrap();
+        assert!(statuses.iter().any(|s| s.contains("Setup complete")));
+        assert!(statuses.iter().any(|s| s.contains("Pulling")));
+    }
 }
