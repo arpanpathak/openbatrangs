@@ -242,6 +242,7 @@ impl OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{spawn_mock_server, MockResponse};
 
     #[test]
     fn client_strips_trailing_slashes_from_base_url() {
@@ -298,81 +299,9 @@ mod tests {
     // ========================================================================
     // Local mock Ollama HTTP server
     //
-    // These tests exercise the real reqwest client against a minimal in-process
-    // HTTP server so the network layer is covered without flaky mocks or a
-    // real Ollama installation.
+    // `spawn_mock_server` and `MockResponse` live in `crate::test_support` so
+    // the same real-HTTP seam is reusable by command/model tests.
     // ========================================================================
-
-    struct MockResponse {
-        status: &'static str,
-        content_type: &'static str,
-        body: String,
-    }
-
-    impl MockResponse {
-        fn json(status: &'static str, body: impl Into<String>) -> Self {
-            Self {
-                status,
-                content_type: "application/json",
-                body: body.into(),
-            }
-        }
-
-        fn text(status: &'static str, body: impl Into<String>) -> Self {
-            Self {
-                status,
-                content_type: "text/plain",
-                body: body.into(),
-            }
-        }
-    }
-
-    /// Spawn a minimal HTTP server that routes requests by path.
-    async fn spawn_mock_server(
-        handler: impl Fn(&str) -> MockResponse + Send + Sync + 'static,
-    ) -> String {
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("mock server should bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handler = Arc::new(handler);
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let handler = Arc::clone(&handler);
-                tokio::spawn(async move {
-                    let mut buffer = [0u8; 8192];
-                    let Ok(read) = socket.read(&mut buffer).await else {
-                        return;
-                    };
-                    let request = String::from_utf8_lossy(&buffer[..read]);
-                    let path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/");
-                    let response = handler(path);
-                    let head = format!(
-                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        response.status,
-                        response.content_type,
-                        response.body.len()
-                    );
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(response.body.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-
-        base_url
-    }
 
     fn sample_request() -> ChatRequest {
         ChatRequest {

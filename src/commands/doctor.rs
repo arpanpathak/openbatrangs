@@ -1,4 +1,13 @@
-//! Doctor/health-check command.
+//! # Doctor/health-check command
+//!
+//! `doctor` verifies Ollama connectivity, scores installed models, and prints a
+//! human-readable recommendation. The pure report builder
+//! [`doctor_lines_from_tags`] is tested without network; the async wrapper is
+//! tested against the shared mock Ollama server.
+//!
+//! ## References
+//!
+//! - Ollama `/api/tags`: <https://github.com/ollama/ollama/blob/main/docs/api.md#list-local-models>
 
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::model_select::calculate_memory_budget;
@@ -101,5 +110,33 @@ mod tests {
         let tags = vec![model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000)];
         let lines = doctor_lines_from_tags("http://localhost:11434", &tags, 8_192);
         assert!(lines.iter().any(|line| line.contains("No model meets")));
+    }
+
+    #[tokio::test]
+    async fn doctor_lines_fetch_tags_from_server() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/tags");
+            MockResponse::json(
+                "200 OK",
+                r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#,
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let lines = doctor_lines(&client, 8_192).await.unwrap();
+        assert!(lines[0].contains("Ollama reachable"));
+        assert!(lines[1].contains("Installed models: 1"));
+    }
+
+    #[tokio::test]
+    async fn doctor_lines_propagate_tags_error() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url =
+            spawn_mock_server(|_| MockResponse::text("500 Internal Server Error", "boom")).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(doctor_lines(&client, 8_192).await.is_err());
     }
 }

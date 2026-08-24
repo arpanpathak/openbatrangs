@@ -1,4 +1,13 @@
-//! Model listing command.
+//! # Model listing command
+//!
+//! `list-models` prints a table of installed models sorted by agentic-coding
+//! score. The pure table builder is tested without network; the async wrapper
+//! is tested against the shared mock Ollama server.
+//!
+//! ## References
+//!
+//! - Ollama `/api/tags`: <https://github.com/ollama/ollama/blob/main/docs/api.md#list-local-models>
+//! - Model scoring heuristics: [`crate::models`]
 
 use crate::constants::models::{BYTES_PER_GIGABYTE, CONTEXT_LENGTH_KILO_DIVISOR};
 use crate::model_select::calculate_memory_budget;
@@ -92,5 +101,33 @@ mod tests {
         let lines = list_models_lines_from_tags(&tags, 8_192);
         // Header only, plus no rows for the excluded model.
         assert_eq!(lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_models_lines_fetch_tags_from_server() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url = spawn_mock_server(|path| {
+            assert_eq!(path, "/api/tags");
+            MockResponse::json(
+                "200 OK",
+                r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#,
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        let lines = list_models_lines(&client, 4_096).await.unwrap();
+        assert!(lines[0].contains("MODEL"));
+        assert!(lines.iter().any(|line| line.contains("qwen2.5-coder:3b")));
+    }
+
+    #[tokio::test]
+    async fn list_models_lines_propagate_tags_error() {
+        use crate::test_support::{spawn_mock_server, MockResponse};
+
+        let base_url =
+            spawn_mock_server(|_| MockResponse::text("500 Internal Server Error", "boom")).await;
+        let client = OllamaClient::new(&base_url).unwrap();
+        assert!(list_models_lines(&client, 8_192).await.is_err());
     }
 }
