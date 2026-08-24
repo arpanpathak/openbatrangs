@@ -285,6 +285,7 @@ fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequ
         model: model.to_string(),
         messages: messages.to_vec(),
         stream: false,
+        keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: Some(serde_json::Value::String("json".to_string())),
         options: Some(serde_json::json!({
             "temperature": AGENT_TEMPERATURE,

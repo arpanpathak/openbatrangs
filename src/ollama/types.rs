@@ -55,6 +55,9 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     /// Whether to stream the response as NDJSON.
     pub stream: bool,
+    /// How long to keep the model loaded after this request (Ollama `keep_alive`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<Value>,
     /// Optional response format hint (e.g. `json`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,

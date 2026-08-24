@@ -255,6 +255,7 @@ mod tests {
                 content: "hello".to_string(),
             }],
             stream: true,
+            keep_alive: None,
             format: None,
             options: Some(serde_json::json!({"temperature": 0.7})),
         };

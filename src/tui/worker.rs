@@ -134,6 +134,7 @@ async fn run_chat_worker(
         model: selected.name.clone(),
         messages,
         stream: true,
+        keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: None,
         options: Some(serde_json::json!({
             "temperature": CHAT_TEMPERATURE,
@@ -141,6 +142,12 @@ async fn run_chat_worker(
         })),
     };
 
+    // The first request after an idle period can take a while because Ollama
+    // has to load the model into memory. Tell the user what is happening
+    // instead of leaving them staring at "thinking...".
+    let _ = tx.send(UiEvent::Log(
+        "⏳ Loading model into Ollama (first reply may take a moment)...".to_string(),
+    ));
     let mut stream = Box::pin(client.chat_stream(request).await?);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
