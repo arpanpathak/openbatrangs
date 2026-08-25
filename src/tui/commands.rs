@@ -67,41 +67,27 @@ impl App {
             .push("  /help              — show this help".to_string());
         self.log
             .push("  /exit, /quit       — leave the TUI".to_string());
+        self.log
+            .push("  /status            — show current settings and model".to_string());
         self.log.push(
-            "  /status            — show current settings and model".to_string(),
+            "  /mode agent|plan|chat — agent=tools, plan=read-only, chat=no tools".to_string(),
         );
-        self.log.push(
-            "  /mode agent|plan|chat — agent=tools, plan=read-only, chat=no tools"
-                .to_string(),
-        );
-        self.log.push(
-            "  /model <tag>       — switch to a specific installed model"
-                .to_string(),
-        );
+        self.log
+            .push("  /model <tag>       — switch to a specific installed model".to_string());
         self.log
             .push("  /models            — open model picker".to_string());
         self.log
             .push("  /pull <tag>        — download a model from Ollama".to_string());
-        self.log.push(
-            "  /setup             — install/start Ollama + pull a model"
-                .to_string(),
-        );
-        self.log.push(
-            "  /doctor            — check Ollama + best model recommendation"
-                .to_string(),
-        );
-        self.log.push(
-            "  /read-only         — toggle read-only mode (no writes/commands)"
-                .to_string(),
-        );
-        self.log.push(
-            "  /confirm           — toggle confirm before writes/commands"
-                .to_string(),
-        );
-        self.log.push(
-            "  /yolo              — disable confirmations (careful!)"
-                .to_string(),
-        );
+        self.log
+            .push("  /setup             — install/start Ollama + pull a model".to_string());
+        self.log
+            .push("  /doctor            — check Ollama + best model recommendation".to_string());
+        self.log
+            .push("  /read-only         — toggle read-only mode (no writes/commands)".to_string());
+        self.log
+            .push("  /confirm           — toggle confirm before writes/commands".to_string());
+        self.log
+            .push("  /yolo              — disable confirmations (careful!)".to_string());
         self.log
             .push("  /thinking on|off   — show/hide model reasoning".to_string());
         self.log
@@ -110,21 +96,16 @@ impl App {
             .push("  /cwd <path>        — change workspace directory".to_string());
         self.log
             .push("  /perf              — toggle performance panel".to_string());
-        self.log.push(
-            "  /mouse on|off      — wheel/scrollbar (off = native select/copy)"
-                .to_string(),
-        );
+        self.log
+            .push("  /mouse on|off      — wheel/scrollbar (off = native select/copy)".to_string());
         self.log
             .push("  /clear             — clear chat log".to_string());
         self.log.push("".to_string());
         self.log.push("═══ Keys ═══".to_string());
-        self.log.push(
-            "  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel"
-                .to_string(),
-        );
         self.log
-            .push("  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete"
-                .to_string());
+            .push("  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel".to_string());
+        self.log
+            .push("  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete".to_string());
     }
 
     /// Print the current configuration and model status to the chat log.
@@ -144,10 +125,8 @@ impl App {
             self.log.push(format!("  Model info: {info}"));
         }
         self.log.push(format!("  Server:     {}", self.server_url));
-        self.log.push(format!(
-            "  Workspace:  {}",
-            self.run_config.cwd.display()
-        ));
+        self.log
+            .push(format!("  Workspace:  {}", self.run_config.cwd.display()));
         self.log
             .push(format!("  Max steps:  {}", self.run_config.max_steps));
         self.log.push(format!(
@@ -763,7 +742,10 @@ mod tests {
         let original_cwd = app.run_config.cwd.clone();
         app.log.clear();
         app.handle_cwd_command("");
-        assert!(app.log.text().contains(&format!("Workspace: {}", original_cwd.display())));
+        assert!(app
+            .log
+            .text()
+            .contains(&format!("Workspace: {}", original_cwd.display())));
     }
 
     #[test]
@@ -772,8 +754,14 @@ mod tests {
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         app.log.clear();
         app.handle_cwd_command("/tmp/new_workspace");
-        assert_eq!(app.run_config.cwd, std::path::PathBuf::from("/tmp/new_workspace"));
-        assert!(app.log.text().contains("Workspace set to /tmp/new_workspace"));
+        assert_eq!(
+            app.run_config.cwd,
+            std::path::PathBuf::from("/tmp/new_workspace")
+        );
+        assert!(app
+            .log
+            .text()
+            .contains("Workspace set to /tmp/new_workspace"));
     }
 
     #[test]

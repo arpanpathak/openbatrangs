@@ -156,12 +156,10 @@ impl App {
         let mut log = SessionLog::new(MAX_LOG_LINES);
         log.push(String::new());
         log.push(
-            "Agent mode active. Type a task to start coding, or /help for commands."
-                .to_string(),
+            "Agent mode active. Type a task to start coding, or /help for commands.".to_string(),
         );
         log.push(
-            "Use /mode chat for plain conversation, /mode plan for read-only planning."
-                .to_string(),
+            "Use /mode chat for plain conversation, /mode plan for read-only planning.".to_string(),
         );
         Self {
             log,
@@ -266,7 +264,11 @@ impl App {
     }
 
     /// Open a confirmation dialog, replacing any active modal.
-    pub(super) fn open_confirmation(&mut self, prompt: String, response: tokio::sync::oneshot::Sender<bool>) {
+    pub(super) fn open_confirmation(
+        &mut self,
+        prompt: String,
+        response: tokio::sync::oneshot::Sender<bool>,
+    ) {
         self.modal = Some(ActiveModal::Confirm(PendingConfirmation {
             prompt,
             response,

@@ -504,11 +504,26 @@ mod tests {
                 role: Role::User,
                 content: "task".to_string(),
             },
-            ChatMessage { role: Role::Assistant, content: "a1".to_string() },
-            ChatMessage { role: Role::User, content: "u1".to_string() },
-            ChatMessage { role: Role::Assistant, content: "a2".to_string() },
-            ChatMessage { role: Role::User, content: "u2".to_string() },
-            ChatMessage { role: Role::Assistant, content: "a3".to_string() },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "a1".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "u1".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "a2".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "u2".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "a3".to_string(),
+            },
         ];
         // max=4: system + first_user + 2 most recent
         trim_messages(&mut messages, 4);

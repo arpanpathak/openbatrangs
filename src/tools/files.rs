@@ -455,7 +455,11 @@ mod tests {
     #[test]
     fn grep_files_with_anchored_regex() {
         let root = temp_dir();
-        fs::write(root.join("a.txt"), "hello world\ngoodbye world\nhello again\n").unwrap();
+        fs::write(
+            root.join("a.txt"),
+            "hello world\ngoodbye world\nhello again\n",
+        )
+        .unwrap();
         let output = grep_files(&root, r"^hello", ".", 10).unwrap();
         assert!(output.contains("a.txt:1: hello world"));
         assert!(output.contains("a.txt:3: hello again"));
@@ -482,16 +486,9 @@ mod tests {
     #[test]
     fn grep_files_max_results_one_returns_single_match() {
         let root = temp_dir();
-        fs::write(
-            root.join("lines.txt"),
-            "aaa\nbbb\naaa\nccc\naaa\n",
-        )
-        .unwrap();
+        fs::write(root.join("lines.txt"), "aaa\nbbb\naaa\nccc\naaa\n").unwrap();
         let output = grep_files(&root, "aaa", ".", 1).unwrap();
-        let match_lines: Vec<&str> = output
-            .lines()
-            .filter(|l| l.contains("lines.txt"))
-            .collect();
+        let match_lines: Vec<&str> = output.lines().filter(|l| l.contains("lines.txt")).collect();
         assert_eq!(match_lines.len(), 1);
         assert!(output.contains("truncated at 1 match"));
         fs::remove_dir_all(root).unwrap();
@@ -533,7 +530,10 @@ mod tests {
         let result = write_file(&root, "a/b/c/d/e.txt", "deep").unwrap();
         assert!(result.contains("e.txt"));
         assert!(root.join("a/b/c/d/e.txt").exists());
-        assert_eq!(fs::read_to_string(root.join("a/b/c/d/e.txt")).unwrap(), "deep");
+        assert_eq!(
+            fs::read_to_string(root.join("a/b/c/d/e.txt")).unwrap(),
+            "deep"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -582,7 +582,10 @@ mod tests {
         fs::write(root.join("file.txt"), "original").unwrap();
         let result = write_file(&root, "file.txt", "replaced").unwrap();
         assert!(result.contains("file.txt"));
-        assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "replaced");
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).unwrap(),
+            "replaced"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

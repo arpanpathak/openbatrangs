@@ -270,7 +270,10 @@ fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else if !app.task_queue.is_empty() {
         format!("ready{safety_suffix} — {} queued", app.task_queue.len())
     } else {
-        format!("{}{mode_suffix}{safety_suffix} · PgUp/PgDn scroll", app.status)
+        format!(
+            "{}{mode_suffix}{safety_suffix} · PgUp/PgDn scroll",
+            app.status
+        )
     };
     let status_style = if app.is_running {
         Style::default().fg(Color::Yellow)
