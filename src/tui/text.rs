@@ -21,6 +21,15 @@ use std::process::Command;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Remove ANSI escape sequences (CSI, OSC) from a string, returning plain text.
+///
+/// # Parameters
+///
+/// - `s`: input string potentially containing terminal escape sequences.
+///
+/// # Returns
+///
+/// The input with all ANSI/OSC escape sequences removed.
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -33,6 +42,7 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Consume and discard one ANSI escape sequence after the initial ESC character.
 fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
     match chars.next() {
         // OSC: ESC ] ... BEL / ST
@@ -122,6 +132,15 @@ pub(crate) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec
     indices
 }
 
+/// Split a slash-command line into its name and argument parts.
+///
+/// # Parameters
+///
+/// - `line`: raw input line, e.g. `"/model qwen2.5-coder:7b"`.
+///
+/// # Returns
+///
+/// `(name, arg)` — both empty strings when the line does not start with `/`.
 pub(crate) fn split_command(line: &str) -> (&str, &str) {
     if !line.starts_with('/') {
         return ("", "");

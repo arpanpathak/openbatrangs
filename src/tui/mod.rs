@@ -66,6 +66,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Launch the interactive TUI: set up the terminal, run the event loop, restore.
+///
+/// # Parameters
+///
+/// - `cli`: parsed command-line arguments for initial app state.
+/// - `client`: Ollama client for model operations.
+///
+/// # Returns
+///
+/// `Ok(())` when the user exits normally, or an error if setup/teardown fails.
 pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let result = run_loop(&mut terminal, cli, client).await;
@@ -73,6 +83,7 @@ pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
     result
 }
 
+/// Configure the terminal for TUI mode: raw input, alternate screen, enhanced keys.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -92,6 +103,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     Ok(terminal)
 }
 
+/// Restore the terminal to its original state after the TUI exits.
 fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     terminal.show_cursor()?;
     execute!(
@@ -127,6 +139,11 @@ fn sync_mouse_capture(
     Ok(())
 }
 
+/// Main TUI event loop: render frames, process input, and dispatch background events.
+///
+/// Uses a biased `tokio::select!` to prioritize keyboard/mouse input over
+/// background stream events, keeping scroll and Ctrl+C responsive during
+/// model generation.
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     cli: &Cli,

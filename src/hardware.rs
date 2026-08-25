@@ -8,6 +8,11 @@ use crate::constants::models::{BYTES_PER_KIB, FALLBACK_SYSTEM_MEMORY_BYTES};
 
 /// Source of total physical memory for model-budget calculations.
 pub trait MemoryInfo {
+    /// Return total physical memory in bytes.
+    ///
+    /// # Returns
+    ///
+    /// Total system RAM in bytes, used to compute the model memory budget.
     fn total_memory_bytes(&self) -> u64;
 }
 
@@ -25,6 +30,14 @@ pub fn total_system_memory_bytes() -> u64 {
     ProcMemoryInfo.total_memory_bytes()
 }
 
+/// Parse `MemTotal` from `/proc/meminfo` and return total RAM in bytes.
+///
+/// Falls back to [`FALLBACK_SYSTEM_MEMORY_BYTES`] when the file is missing or
+/// the value cannot be parsed, so model selection always has a usable budget.
+///
+/// # Returns
+///
+/// Total physical memory in bytes.
 fn read_memtotal_from_proc() -> u64 {
     let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     for line in content.lines() {

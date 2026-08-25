@@ -45,13 +45,20 @@ use tool::{parse_agent_response, Tool, ToolCall};
 pub use confirm::{Confirmer, StdioConfirmer};
 pub use reporter::{Reporter, StdoutReporter};
 
+/// Immutable configuration for the agentic coding loop.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Working directory where the agent reads and writes files.
     pub cwd: PathBuf,
+    /// Maximum number of agent iterations before stopping.
     pub max_steps: usize,
+    /// When `true`, mutating tools (write, run command) are disabled.
     pub is_read_only: bool,
+    /// When `true`, the user must approve each write/command before execution.
     pub should_confirm: bool,
+    /// When `true`, the model's reasoning/thinking text is shown to the user.
     pub show_thinking: bool,
+    /// Maximum context window (tokens) sent to the model.
     pub max_ctx: u64,
 }
 
@@ -65,12 +72,32 @@ enum AgentStepOutcome {
 
 /// Immutable inputs shared by every agent step.
 struct AgentRunContext<'a> {
+    /// Agent configuration (cwd, limits, safety flags).
     config: &'a AgentConfig,
+    /// Ollama client for model API calls.
     client: &'a OllamaClient,
+    /// Name of the model being used.
     model: &'a str,
+    /// Context window size (tokens) sent to the model.
     num_ctx: u64,
 }
 
+/// Run the bounded agentic coding loop: plan, execute tools, iterate.
+///
+/// # Parameters
+///
+/// - `config`: agent runtime configuration.
+/// - `client`: Ollama client for model calls.
+/// - `model`: model name to use for completions.
+/// - `model_context`: model's native context window size.
+/// - `task`: user's task description.
+/// - `reporter`: output sink for status and results.
+/// - `confirmer`: human-in-the-loop confirmer for writes/commands.
+///
+/// # Returns
+///
+/// `Ok(())` when the agent finishes (with or without an answer), or an error
+/// if the model call fails.
 pub async fn run_agent<R: Reporter, C: Confirmer>(
     config: &AgentConfig,
     client: &OllamaClient,
@@ -203,7 +230,7 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
         // the model can decide what to do next.
         other => {
             messages.push(ChatMessage {
-                role: "assistant".to_string(),
+                role: crate::ollama::Role::Assistant,
                 content: content.to_string(),
             });
 
@@ -217,7 +244,7 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
             reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
 
             messages.push(ChatMessage {
-                role: "user".to_string(),
+                role: crate::ollama::Role::User,
                 content: format!("Tool result:\n{result_text}"),
             });
             trim_messages(messages, MAX_HISTORY_MESSAGES);
@@ -226,18 +253,21 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
     }
 }
 
+/// Print a step header with the step number, max steps, and model name.
 fn report_step_start<R: Reporter>(reporter: &mut R, step: usize, max_steps: usize, model: &str) {
     reporter.line(format!(
         "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max_steps}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}"
     ));
 }
 
+/// Report a JSON parse failure and show the raw model output as fallback.
 fn report_parse_error<R: Reporter>(reporter: &mut R, error: &anyhow::Error, content: &str) {
     reporter.line(format!("\n⚠️  Could not parse model JSON: {error}"));
     reporter.line("Showing raw model output as the final response.".to_string());
     reporter.line(format!("\n{content}"));
 }
 
+/// Verify the working directory exists before starting the agent.
 fn ensure_workspace_exists(cwd: &Path) -> Result<()> {
     if !cwd.is_dir() {
         bail!("working directory does not exist: {}", cwd.display());
@@ -300,16 +330,17 @@ fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
     let user_content = format!("{workspace_note}\n\nTask:\n{task}");
     vec![
         ChatMessage {
-            role: "system".to_string(),
+            role: crate::ollama::Role::System,
             content: SYSTEM_PROMPT.to_string(),
         },
         ChatMessage {
-            role: "user".to_string(),
+            role: crate::ollama::Role::User,
             content: user_content,
         },
     ]
 }
 
+/// Build an Ollama chat request with JSON output format and agent temperature.
 fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
@@ -324,6 +355,7 @@ fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequ
     }
 }
 
+/// Trim conversation history to `max` messages, preserving system and first user turn.
 fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
     if messages.len() <= max {
         return;
@@ -342,34 +374,35 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ollama::Role;
 
     #[test]
     fn trims_messages_but_keeps_system_and_first_user() {
         let mut messages = vec![
             ChatMessage {
-                role: "system".to_string(),
+                role: crate::ollama::Role::System,
                 content: "system".to_string(),
             },
             ChatMessage {
-                role: "user".to_string(),
+                role: crate::ollama::Role::User,
                 content: "task".to_string(),
             },
             ChatMessage {
-                role: "assistant".to_string(),
+                role: crate::ollama::Role::Assistant,
                 content: "a1".to_string(),
             },
             ChatMessage {
-                role: "user".to_string(),
+                role: crate::ollama::Role::User,
                 content: "u1".to_string(),
             },
             ChatMessage {
-                role: "assistant".to_string(),
+                role: crate::ollama::Role::Assistant,
                 content: "a2".to_string(),
             },
         ];
         trim_messages(&mut messages, 3);
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].content, "task");
         assert_eq!(messages[2].content, "a2");
     }
@@ -414,5 +447,128 @@ mod tests {
             "what files are in this project?"
         ));
         assert!(!task_requests_workspace_scan("write a unit test"));
+    }
+
+    #[test]
+    fn trim_messages_does_nothing_when_under_limit() {
+        let mut messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "system".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "answer".to_string(),
+            },
+        ];
+        let original_len = messages.len();
+        trim_messages(&mut messages, 10);
+        assert_eq!(messages.len(), original_len);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(messages[1].content, "task");
+        assert_eq!(messages[2].content, "answer");
+    }
+
+    #[test]
+    fn trim_messages_keeps_exact_count_when_at_limit() {
+        let mut messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "system".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "a1".to_string(),
+            },
+        ];
+        trim_messages(&mut messages, 3);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn trim_messages_keeps_most_recent_exchanges() {
+        let mut messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "system".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".to_string(),
+            },
+            ChatMessage { role: Role::Assistant, content: "a1".to_string() },
+            ChatMessage { role: Role::User, content: "u1".to_string() },
+            ChatMessage { role: Role::Assistant, content: "a2".to_string() },
+            ChatMessage { role: Role::User, content: "u2".to_string() },
+            ChatMessage { role: Role::Assistant, content: "a3".to_string() },
+        ];
+        // max=4: system + first_user + 2 most recent
+        trim_messages(&mut messages, 4);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].content, "task");
+        assert_eq!(messages[2].content, "u2");
+        assert_eq!(messages[3].content, "a3");
+    }
+
+    #[test]
+    fn ensure_workspace_exists_succeeds_for_valid_directory() {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-workspace-test");
+        assert!(ensure_workspace_exists(&root).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ensure_workspace_exists_fails_for_missing_directory() {
+        let missing = std::path::PathBuf::from("/tmp/openbatrangs-definitely-does-not-exist-12345");
+        let result = ensure_workspace_exists(&missing);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("does not exist"));
+    }
+
+    #[test]
+    fn chat_request_sets_json_format_and_temperature() {
+        let messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "system prompt".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".to_string(),
+            },
+        ];
+        let request = chat_request("test-model", &messages, 4096);
+        assert_eq!(request.model, "test-model");
+        assert_eq!(request.messages.len(), 2);
+        assert!(!request.stream);
+        assert!(request.format.is_some());
+        let options = request.options.unwrap();
+        assert_eq!(options["num_ctx"], 4096);
+    }
+
+    #[test]
+    fn initial_messages_always_contain_system_prompt_and_task() {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-init-msg-test");
+        std::fs::write(root.join("top.txt"), "hello").unwrap();
+
+        let messages = initial_messages(&root, "fix the bug");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert!(!messages[0].content.is_empty());
+        assert_eq!(messages[1].role, Role::User);
+        assert!(messages[1].content.contains("fix the bug"));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

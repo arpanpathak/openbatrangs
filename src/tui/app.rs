@@ -22,65 +22,145 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// Model picker popup state.
 pub(super) struct PickerState {
+    /// Available model tags to choose from.
     pub(super) models: Vec<String>,
+    /// Index of the currently highlighted model.
     pub(super) selected: usize,
 }
 
+/// Pending tool-confirmation dialog state.
 pub(super) struct PendingConfirmation {
+    /// Human-readable prompt shown to the user, e.g. `write file 'a.txt'?`.
     pub(super) prompt: String,
+    /// Channel to send the user's yes/no answer back to the agent worker.
     pub(super) response: tokio::sync::oneshot::Sender<bool>,
 }
 
+/// Mutually exclusive modal overlays.
+///
+/// Using an enum instead of two independent `Option` fields prevents the picker
+/// and the confirmation dialog from being open simultaneously — a state that
+/// caused subtle key-dispatch bugs where confirmation keys leaked into the
+/// picker or vice versa.
+pub(super) enum ActiveModal {
+    /// The model picker is open.
+    Picker(PickerState),
+    /// A tool-confirmation prompt is displayed.
+    Confirm(PendingConfirmation),
+}
+
+/// Central TUI application state.
+///
+/// Owns every piece of mutable state the event loop and renderer need: the
+/// chat log, input editing buffer, running agent handle, performance monitor,
+/// and modal overlays. Keeping all state in one struct lets the event loop
+/// borrow it mutably without interior-refcell gymnastics.
+///
+/// ## References
+///
+/// - Elm Architecture for UI state: <https://guide.elm-lang.org/architecture/>
 pub(super) struct App {
+    /// Bounded, disk-backed chat log that stores every message in the session.
     pub(super) log: SessionLog,
+    /// In-progress streaming output not yet flushed to the log.
     pub(super) live: String,
+    /// Current text in the input box being composed by the user.
     pub(super) input: String,
+    /// Byte offset of the text cursor within `input`.
     pub(super) cursor: usize,
+    /// Previously submitted input lines for Up/Down history navigation.
     pub(super) history: Vec<String>,
+    /// Index into `history` during navigation, or `None` when not navigating.
     pub(super) history_idx: Option<usize>,
+    /// Index of the currently highlighted suggestion in the autocomplete list.
     pub(super) selected: usize,
+    /// Whether an agent task or background operation is currently running.
     pub(super) is_running: bool,
+    /// Short status label shown in the status bar (e.g. "ready", "running").
     pub(super) status: String,
+    /// Description of the current agent action (e.g. "write file 'a.txt'").
     pub(super) last_action: String,
+    /// Whether the chat viewport auto-follows new output or preserves scroll.
     pub(super) scroll_mode: ScrollMode,
+    /// Vertical scroll offset in wrapped visual rows when in manual scroll mode.
     pub(super) chat_scroll_offset: usize,
+    /// Monotonically increasing counter used to cycle through spinner frames.
     pub(super) spinner_frame: u64,
+    /// FIFO queue of user tasks waiting to run after the current task finishes.
     pub(super) task_queue: VecDeque<String>,
+    /// Conversation history for chat-mode (no tools) interactions.
     pub(super) chat_history: Vec<ChatMessage>,
-    pub(super) picker: Option<PickerState>,
+    /// The currently active modal overlay (picker or confirmation).
+    /// Using `Option<ActiveModal>` ensures the two modals cannot overlap.
+    pub(super) modal: Option<ActiveModal>,
+    /// When `true`, the main event loop exits and the TUI shuts down.
     pub(super) should_quit: bool,
+    /// Ollama model tag currently selected, or `None` for auto-selection.
     pub(super) model: Option<String>,
+    /// URL of the Ollama server this app is connected to.
     pub(super) server_url: String,
+    /// Pre-formatted model metadata line (size, params, quant, context).
     pub(super) model_info: Option<String>,
+    /// The user's original task prompt, displayed in the banner area.
     pub(super) current_prompt: Option<String>,
+    /// Runtime configuration for the agent loop (mode, limits, safety flags).
     pub(super) run_config: AgentRunConfig,
+    /// Minimum context window (tokens) the user requires for model selection.
     pub(super) min_context: u64,
+    /// When `true`, the app will never auto-pull a model from the registry.
     pub(super) is_auto_pull_disabled: bool,
+    /// Whether the live performance panel (GPU/CPU/RAM) is visible.
     pub(super) show_perf: bool,
+    /// Whether crossterm mouse capture is active (wheel + scrollbar vs. native select).
     pub(super) mouse_capture: bool,
+    /// System performance sampler that reads CPU, RAM, and GPU metrics.
     pub(super) perf: PerfMonitor,
+    /// Most recently sampled system and GPU statistics.
     pub(super) system_stats: SystemStats,
+    /// Number of characters received in the current streaming response.
     pub(super) stream_chars: u64,
+    /// Timestamp of the first chunk in the current streaming response.
     pub(super) stream_started_at: Option<Instant>,
+    /// Estimated tokens per second based on streaming character rate.
     pub(super) tokens_per_sec: f64,
+    /// Handle to the currently spawned background Tokio task (agent/pull/setup).
     pub(super) current_task: Option<JoinHandle<()>>,
+    /// Pre-split banner text lines, with ANSI codes stripped for rendering.
     pub(super) banner_lines: Vec<String>,
+    /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
+    /// Characters accumulated in the current rate-measurement window.
     pub(super) rate_window_chars: u64,
+    /// Start time of the current rate-measurement window.
     pub(super) rate_window_start: Option<Instant>,
-    pub(super) pending_confirmation: Option<PendingConfirmation>,
+    /// Cache of the last syntax-highlighted chat rendering result.
     pub(super) chat_render: ChatRenderCache,
 }
 
 impl App {
+    /// Create a new `App` with default state from CLI arguments.
+    ///
+    /// # Parameters
+    ///
+    /// - `cli`: parsed command-line arguments providing initial model, server URL, etc.
+    /// - `tegrastats`: shared buffer for the background `tegrastats` reader thread.
+    ///
+    /// # Returns
+    ///
+    /// A fully initialized `App` ready for the event loop.
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
         let banner = strip_ansi(&crate::banner::banner_text());
         let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut log = SessionLog::new(MAX_LOG_LINES);
         log.push(String::new());
         log.push(
-            "Chat mode. Type a message, or /help. /mode agent enables the full agent tools."
+            "Agent mode active. Type a task to start coding, or /help for commands."
+                .to_string(),
+        );
+        log.push(
+            "Use /mode chat for plain conversation, /mode plan for read-only planning."
                 .to_string(),
         );
         Self {
@@ -99,7 +179,7 @@ impl App {
             spinner_frame: 0,
             task_queue: VecDeque::new(),
             chat_history: Vec::new(),
-            picker: None,
+            modal: None,
             should_quit: false,
             model: cli.model.clone(),
             server_url: cli.ollama_url.clone(),
@@ -110,7 +190,7 @@ impl App {
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
                 should_confirm: true,
-                mode: AgentMode::Chat,
+                mode: AgentMode::Agent,
                 show_thinking: true,
                 max_ctx: cli.max_ctx,
             },
@@ -131,11 +211,73 @@ impl App {
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,
-            pending_confirmation: None,
             chat_render: ChatRenderCache::new(),
         }
     }
 
+    /// True when a tool-confirmation dialog is displayed.
+    pub(super) fn is_confirming(&self) -> bool {
+        matches!(self.modal, Some(ActiveModal::Confirm(_)))
+    }
+
+    /// True when the model picker popup is displayed.
+    pub(super) fn is_showing_picker(&self) -> bool {
+        matches!(self.modal, Some(ActiveModal::Picker(_)))
+    }
+
+    /// Close any active modal overlay without taking any action.
+    pub(super) fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    /// Borrow the active picker state, if the model picker is open.
+    pub(super) fn picker(&self) -> Option<&PickerState> {
+        match &self.modal {
+            Some(ActiveModal::Picker(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// Mutably borrow the active picker state, if the model picker is open.
+    pub(super) fn picker_mut(&mut self) -> Option<&mut PickerState> {
+        match &mut self.modal {
+            Some(ActiveModal::Picker(picker)) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// Take the pending confirmation out of the modal, closing it.
+    pub(super) fn take_confirmation(&mut self) -> Option<PendingConfirmation> {
+        match self.modal.take() {
+            Some(ActiveModal::Confirm(pending)) => Some(pending),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
+    /// Open the model picker, replacing any active modal.
+    pub(super) fn open_picker(&mut self, models: Vec<String>) {
+        self.modal = Some(ActiveModal::Picker(PickerState {
+            models,
+            selected: 0,
+        }));
+    }
+
+    /// Open a confirmation dialog, replacing any active modal.
+    pub(super) fn open_confirmation(&mut self, prompt: String, response: tokio::sync::oneshot::Sender<bool>) {
+        self.modal = Some(ActiveModal::Confirm(PendingConfirmation {
+            prompt,
+            response,
+        }));
+    }
+
+    /// Build a one-line summary of the current model, mode, and server for the banner.
+    ///
+    /// # Returns
+    ///
+    /// A formatted string like `"model: qwen2.5-coder:7b · 7.6 GB · agent · server http://localhost:11434"`.
     pub(super) fn model_info_line(&self) -> String {
         let mode = match self.run_config.mode {
             AgentMode::Agent => "agent",
@@ -152,10 +294,20 @@ impl App {
         }
     }
 
+    /// Return the user's original task prompt for display in the banner.
+    ///
+    /// # Returns
+    ///
+    /// The stored prompt string, or `None` if no task has been submitted yet.
     pub(super) fn prompt_line(&self) -> Option<String> {
         self.current_prompt.clone()
     }
 
+    /// Re-query Ollama for the current model's metadata and update `model_info`.
+    ///
+    /// # Parameters
+    ///
+    /// - `client`: Ollama client used to fetch the installed model tags.
     pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
         let Ok(tags) = client.tags().await else {
             return;
@@ -189,12 +341,21 @@ impl App {
         ));
     }
 
+    /// Move any in-progress streaming text from `live` into the persistent log.
+    ///
+    /// Called before appending a new log line so the streaming output and the
+    /// new message appear in the correct order.
     pub(super) fn flush_live(&mut self) {
         if !self.live.is_empty() {
             self.log.push(std::mem::take(&mut self.live));
         }
     }
 
+    /// Return the current spinner glyph based on the animation frame counter.
+    ///
+    /// # Returns
+    ///
+    /// A static string slice containing the spinner character for the current frame.
     pub(super) fn spinner(&self) -> &'static str {
         SPINNER
             .get((self.spinner_frame as usize) % SPINNER.len())
@@ -202,6 +363,13 @@ impl App {
             .unwrap_or("")
     }
 
+    /// Spawn a background agent task and reset streaming metrics.
+    ///
+    /// # Parameters
+    ///
+    /// - `task`: the user's task description to send to the agent.
+    /// - `client`: Ollama client for the background worker.
+    /// - `tx`: channel for the worker to send UI events back to the event loop.
     pub(super) fn start_task(
         &mut self,
         task: String,
@@ -219,7 +387,7 @@ impl App {
         self.rate_window_start = None;
         if self.run_config.mode == AgentMode::Chat {
             self.chat_history.push(ChatMessage {
-                role: "user".to_string(),
+                role: crate::ollama::Role::User,
                 content: task.clone(),
             });
             self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
@@ -250,6 +418,13 @@ impl App {
         self.current_task = Some(handle);
     }
 
+    /// Process a UI event from a background worker (log, chunk, done, pull, confirm).
+    ///
+    /// # Parameters
+    ///
+    /// - `event`: the incoming event to handle.
+    /// - `client`: Ollama client, used to start queued tasks after completion.
+    /// - `tx`: channel for spawning follow-up tasks.
     pub(super) fn handle_event(
         &mut self,
         event: UiEvent,
@@ -301,7 +476,7 @@ impl App {
                     self.log.push(assistant_text.clone());
                     if self.run_config.mode == AgentMode::Chat {
                         self.chat_history.push(ChatMessage {
-                            role: "assistant".to_string(),
+                            role: crate::ollama::Role::Assistant,
                             content: assistant_text,
                         });
                         self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
@@ -358,24 +533,38 @@ impl App {
                 }
             }
             UiEvent::ConfirmRequest { prompt, response } => {
-                self.pending_confirmation = Some(PendingConfirmation { prompt, response });
+                self.open_confirmation(prompt, response);
                 self.status = "confirm".to_string();
             }
         }
     }
 
+    /// Dispatch a keyboard event to the appropriate handler.
+    ///
+    /// Confirmation and picker modals intercept keys before the main input
+    /// handler. Returns `true` when the app should quit.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: the crossterm key event to handle.
+    /// - `client`: Ollama client for submitting tasks.
+    /// - `tx`: channel for background task communication.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the TUI should exit, `Ok(false)` otherwise.
     pub(super) async fn handle_key(
         &mut self,
         key: event::KeyEvent,
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
-        if self.pending_confirmation.is_some() {
+        if self.is_confirming() {
             self.handle_confirmation_key(key, client, tx);
             return Ok(false);
         }
 
-        if self.picker.is_some() {
+        if self.is_showing_picker() {
             self.handle_picker_key(key, client).await;
             return Ok(false);
         }
@@ -430,6 +619,15 @@ impl App {
         Ok(self.should_quit)
     }
 
+    /// Abort the running task and resolve any pending confirmation.
+    ///
+    /// If tasks are queued behind the cancelled one, the next task starts
+    /// immediately so the queue is not stranded.
+    ///
+    /// # Parameters
+    ///
+    /// - `client`: Ollama client for starting the next queued task.
+    /// - `tx`: channel for the next queued task's events.
     pub(super) fn cancel_task(
         &mut self,
         client: &OllamaClient,
@@ -438,14 +636,14 @@ impl App {
         if let Some(handle) = self.current_task.take() {
             handle.abort();
         }
-        if let Some(pending) = self.pending_confirmation.take() {
+        if let Some(pending) = self.take_confirmation() {
             let _ = pending.response.send(false);
         }
         if self.run_config.mode == AgentMode::Chat
             && self
                 .chat_history
                 .last()
-                .is_some_and(|message| message.role == "user")
+                .is_some_and(|message| message.role == crate::ollama::Role::User)
         {
             self.chat_history.pop();
         }
@@ -464,8 +662,16 @@ impl App {
         }
     }
 
+    /// Handle a mouse event: scroll, scrollbar drag, or click-to-open file.
+    ///
+    /// Mouse events are ignored while a confirmation dialog is open to prevent
+    /// accidental interactions with the chat behind the modal.
+    ///
+    /// # Parameters
+    ///
+    /// - `event`: the crossterm mouse event to process.
     pub(super) fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
-        if self.pending_confirmation.is_some() {
+        if self.is_confirming() {
             return;
         }
         match event.kind {
@@ -483,7 +689,16 @@ impl App {
         }
     }
 
-    pub(super) fn open_clicked_file(&mut self, column: u16, row: u16) {
+    /// Open the file referenced in a clicked chat line in an external editor.
+    ///
+    /// Maps the mouse click coordinates to a visual line in the chat, extracts
+    /// any file path from that line, and opens it in vim.
+    ///
+    /// # Parameters
+    ///
+    /// - `column`: x coordinate of the click in terminal columns.
+    /// - `row`: y coordinate of the click in terminal rows.
+    pub(super) fn open_clicked_file(&mut self, _column: u16, row: u16) {
         let Some(area) = self.last_chat_area else {
             return;
         };
@@ -508,7 +723,9 @@ impl App {
         let Some(line) = lines.get(source_index) else {
             return;
         };
-        let _ = column;
+        // Column is intentionally unused: we open any file path found on the
+        // clicked source line rather than requiring the user to precisely hit
+        // the path token. Scrollbar clicks are already filtered by handle_mouse.
         if let Some(path) = super::extract_path_from_line(line, &self.run_config.cwd) {
             self.log
                 .push(format!("📂 Opening {} in vim...", path.display()));
@@ -516,6 +733,11 @@ impl App {
         }
     }
 
+    /// Assemble the full visible chat text from the log and any live streaming output.
+    ///
+    /// # Returns
+    ///
+    /// The complete chat text ready for rendering or scroll calculations.
     pub(super) fn chat_text(&self) -> String {
         let mut chat_text = self.log.text();
         if !self.live.is_empty() {
@@ -537,7 +759,7 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        let Some(pending) = self.pending_confirmation.take() else {
+        let Some(pending) = self.take_confirmation() else {
             return;
         };
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -551,7 +773,8 @@ impl App {
             _ => None,
         };
         let Some(answer) = answer else {
-            self.pending_confirmation = Some(pending);
+            // Unrelated key — put the confirmation back so the modal stays open.
+            self.open_confirmation(pending.prompt, pending.response);
             return;
         };
         if !answer {
@@ -560,8 +783,17 @@ impl App {
         let _ = pending.response.send(answer);
     }
 
+    /// Handle keyboard navigation within the model picker popup.
+    ///
+    /// Up/Down arrows move the selection, Enter confirms, Esc/Ctrl+C closes
+    /// the picker without changing the model.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: the key event to process.
+    /// - `client`: Ollama client for refreshing model info after selection.
     async fn handle_picker_key(&mut self, key: event::KeyEvent, client: &OllamaClient) {
-        let Some(picker) = &mut self.picker else {
+        let Some(picker) = self.picker_mut() else {
             return;
         };
         match key.code {
@@ -570,21 +802,34 @@ impl App {
                 picker.selected = (picker.selected + 1).min(picker.models.len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                if let Some(name) = picker.models.get(picker.selected) {
+                if let Some(name) = picker.models.get(picker.selected).cloned() {
                     self.model = Some(name.clone());
                     self.log.push(format!("✅ Model set to {name}"));
                     self.refresh_model_info(client).await;
                 }
-                self.picker = None;
+                self.close_modal();
             }
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc => self.close_modal(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.picker = None
+                self.close_modal();
             }
             _ => {}
         }
     }
 
+    /// Submit the current input line as a task or slash command.
+    ///
+    /// Slash commands are dispatched to `run_slash_command`; regular text
+    /// starts a new agent task (or queues it if one is already running).
+    ///
+    /// # Parameters
+    ///
+    /// - `client`: Ollama client for network-dependent commands and tasks.
+    /// - `tx`: channel for background task events.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the TUI should quit, `Ok(false)` otherwise.
     async fn submit_input(
         &mut self,
         client: &OllamaClient,
@@ -621,6 +866,11 @@ impl App {
         Ok(self.should_quit)
     }
 
+    /// Format the current system stats into display lines for the perf panel.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<String>` with GPU, CPU/tokens, and RAM lines for rendering.
     pub(super) fn perf_lines(&self) -> Vec<String> {
         let stats = &self.system_stats;
         let mut gpu_parts: Vec<String> = Vec::new();
@@ -757,9 +1007,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_defaults_to_chat_mode_with_mouse_capture() {
+    fn tui_defaults_to_agent_mode_with_mouse_capture() {
         let app = test_app();
-        assert_eq!(app.run_config.mode, AgentMode::Chat);
+        assert_eq!(app.run_config.mode, AgentMode::Agent);
         assert!(
             app.mouse_capture,
             "mouse wheel/scrollbar should be on by default"
@@ -836,13 +1086,13 @@ mod tests {
         let mut app = test_app();
         app.run_config.mode = AgentMode::Chat;
         app.chat_history.push(ChatMessage {
-            role: "user".to_string(),
+            role: crate::ollama::Role::User,
             content: "hello".to_string(),
         });
         app.live.push_str("world");
         app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
         assert_eq!(app.chat_history.len(), 2);
-        assert_eq!(app.chat_history[1].role, "assistant");
+        assert_eq!(app.chat_history[1].role, crate::ollama::Role::Assistant);
         assert_eq!(app.chat_history[1].content, "world");
     }
 
@@ -851,7 +1101,7 @@ mod tests {
         let mut app = test_app();
         app.current_prompt = Some("task".to_string());
         app.chat_history.push(ChatMessage {
-            role: "user".to_string(),
+            role: crate::ollama::Role::User,
             content: "task".to_string(),
         });
         app.scroll_mode = ScrollMode::Manual;
@@ -871,7 +1121,7 @@ mod tests {
         let mut app = test_app();
         app.run_config.mode = AgentMode::Chat;
         app.chat_history.push(ChatMessage {
-            role: "user".to_string(),
+            role: crate::ollama::Role::User,
             content: "question".to_string(),
         });
         app.cancel_task(&client, &tx);
@@ -893,7 +1143,7 @@ mod tests {
             &client,
             &tx,
         );
-        assert!(app.pending_confirmation.is_some());
+        assert!(app.is_confirming());
         assert_eq!(app.status, "confirm");
     }
 
@@ -903,16 +1153,13 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "write file 'a.txt'?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
             &client,
             &tx,
         );
-        assert!(app.pending_confirmation.is_none());
+        assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(true));
     }
 
@@ -922,16 +1169,13 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "run command: rm -rf /?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("run command: rm -rf /?".to_string(), response_tx);
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             &client,
             &tx,
         );
-        assert!(app.pending_confirmation.is_none());
+        assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(app.log.iter().any(|line| line.contains("aborted")));
     }
@@ -942,10 +1186,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "run command: make?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("run command: make?".to_string(), response_tx);
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &client,
@@ -960,16 +1201,13 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "write file 'a.txt'?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
         app.handle_confirmation_key(
             event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
             &client,
             &tx,
         );
-        assert!(app.pending_confirmation.is_some());
+        assert!(app.is_confirming());
         assert!(response_rx.try_recv().is_err());
     }
 
@@ -979,12 +1217,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "write file 'a.txt'?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
         app.cancel_task(&client, &tx);
-        assert!(app.pending_confirmation.is_none());
+        assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(false));
     }
 
@@ -1012,13 +1247,10 @@ mod tests {
         let mut app = test_app();
         app.is_running = true;
         let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "write file 'a.txt'?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         app.handle_confirmation_key(key, &client, &tx);
-        assert!(app.pending_confirmation.is_none());
+        assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(!app.is_running);
         assert!(app.log.iter().any(|line| line.contains("Cancelled")));
@@ -1067,13 +1299,10 @@ mod tests {
     async fn picker_ctrl_c_closes_picker() {
         let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let mut app = test_app();
-        app.picker = Some(PickerState {
-            models: vec!["qwen2.5-coder:7b".to_string()],
-            selected: 0,
-        });
+        app.open_picker(vec!["qwen2.5-coder:7b".to_string()]);
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         app.handle_picker_key(key, &client).await;
-        assert!(app.picker.is_none());
+        assert!(!app.is_showing_picker());
         assert!(
             app.model.is_none(),
             "closing picker must not change the model"

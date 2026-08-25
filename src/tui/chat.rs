@@ -35,11 +35,15 @@ enum CodeFenceState<'a> {
     InCode(Box<HighlightLines<'a>>),
 }
 
+/// Lazily-initialized syntect highlighter shared across all chat rendering calls.
 struct Highlighter {
+    /// Loaded syntax definitions used to resolve language hints to grammars.
     syntaxes: SyntaxSet,
+    /// Color theme applied during syntax highlighting (base16-ocean.dark).
     theme: Theme,
 }
 
+/// Return the process-wide highlighter singleton, initializing it on first call.
 fn highlighter() -> &'static Highlighter {
     static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
     HIGHLIGHTER.get_or_init(|| {
@@ -54,6 +58,7 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
+/// Convert a syntect `Style` (foreground color) to a ratatui `Style`.
 fn syn_style_to_ratatui(style: SynStyle) -> Style {
     let fg = style.foreground;
     Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b))
@@ -68,9 +73,11 @@ fn code_syntax<'a>(h: &'a Highlighter, lang: &str) -> &'a syntect::parsing::Synt
         .unwrap_or_else(|| h.syntaxes.find_syntax_plain_text())
 }
 
-/// Above this size, skip syntect highlighting entirely and render plain lines.
-/// This keeps long streaming output usable on Jetson-class devices.
+/// Maximum character count before syntect highlighting is skipped entirely.
+/// This keeps long streaming output responsive on Jetson-class devices.
 const FAST_PATH_MAX_CHARS: usize = 50_000;
+/// Maximum line count before syntect highlighting is skipped entirely.
+/// Prevents the highlighter from stalling on very long outputs.
 const FAST_PATH_MAX_LINES: usize = 2_000;
 
 /// Render chat text with syntax highlighting inside ``` code fences.
@@ -145,11 +152,14 @@ fn render_chat_line<'a>(
 
 /// Cache of the last highlighted chat log.
 pub(super) struct ChatRenderCache {
+    /// Raw text that produced the cached `lines`; used to detect changes.
     last_text: String,
+    /// Cached highlighted lines, or `None` before the first render.
     lines: Option<Vec<Line<'static>>>,
 }
 
 impl ChatRenderCache {
+    /// Create an empty cache that will build on the first `lines` call.
     pub(super) fn new() -> Self {
         Self {
             last_text: String::new(),

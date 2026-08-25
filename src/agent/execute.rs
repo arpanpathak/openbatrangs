@@ -29,6 +29,9 @@ use crate::tools;
 use anyhow::{bail, Result};
 use std::path::Path;
 
+/// Execute a tool call, returning its output or a formatted error message.
+///
+/// Wraps [`execute_tool`] so the caller always gets a displayable string.
 pub(super) async fn execute_tool_or_report_error<C: Confirmer>(
     config: &AgentConfig,
     cwd: &Path,
@@ -42,6 +45,10 @@ pub(super) async fn execute_tool_or_report_error<C: Confirmer>(
     }
 }
 
+/// Execute a typed tool call and return its text result.
+///
+/// Mutating tools (write, run command) are guarded by read-only mode and
+/// user confirmation.
 pub(super) async fn execute_tool<C: Confirmer>(
     config: &AgentConfig,
     cwd: &Path,
@@ -76,6 +83,7 @@ pub(super) async fn execute_tool<C: Confirmer>(
     }
 }
 
+/// Bail if the agent is in read-only mode.
 fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
     if config.is_read_only {
         bail!("this tool is disabled in read-only mode");
@@ -83,6 +91,7 @@ fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
+/// Ask the confirmer for approval, bailing if the user denies or confirm is off.
 async fn confirm_or_abort<C: Confirmer>(
     config: &AgentConfig,
     confirmer: &mut C,
@@ -120,6 +129,7 @@ fn sanitize_terminal_text(text: &str) -> String {
         .collect()
 }
 
+/// Print clickable OSC 8 links for each file changed during the agent session.
 pub(super) fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
     if files.is_empty() {
         return;

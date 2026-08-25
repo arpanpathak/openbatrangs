@@ -54,6 +54,7 @@ pub(crate) struct Cli {
     #[arg(long = "max-ctx", global = true, default_value_t = MAX_CONTEXT_TOKENS)]
     pub(crate) max_ctx: u64,
 
+    /// Optional subcommand (agent, list-models, doctor, setup, pull).
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }

@@ -86,3 +86,142 @@ impl App {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use ratatui::layout::Rect;
+    use std::sync::{Arc, Mutex};
+
+    fn test_app() -> App {
+        let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
+        App::new(&cli, Arc::new(Mutex::new(None)))
+    }
+
+    #[test]
+    fn scroll_chat_negative_delta_does_not_go_below_zero() {
+        let mut app = test_app();
+        app.chat_scroll_offset = 0;
+        app.scroll_chat(-5);
+        assert_eq!(app.chat_scroll_offset, 0);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+    }
+
+    #[test]
+    fn scroll_chat_positive_delta_increases_offset() {
+        let mut app = test_app();
+        app.chat_scroll_offset = 0;
+        app.scroll_chat(10);
+        assert_eq!(app.chat_scroll_offset, 10);
+    }
+
+    #[test]
+    fn scroll_chat_always_sets_manual_mode() {
+        let mut app = test_app();
+        app.scroll_mode = ScrollMode::Follow;
+        app.scroll_chat(5);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+    }
+
+    #[test]
+    fn scroll_chat_page_without_measured_area_uses_step() {
+        let mut app = test_app();
+        app.last_chat_area = None;
+        app.scroll_chat_page(1);
+        // Without measured area, falls back to CHAT_SCROLL_STEP
+        assert_eq!(app.chat_scroll_offset, CHAT_SCROLL_STEP);
+    }
+
+    #[test]
+    fn scroll_chat_page_with_measured_area() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        app.scroll_chat_page(1);
+        // Page height = 20 - 2 = 18
+        assert_eq!(app.chat_scroll_offset, 18);
+    }
+
+    #[test]
+    fn scroll_chat_page_up_goes_negative_but_clamped_to_zero() {
+        let mut app = test_app();
+        app.chat_scroll_offset = 0;
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        app.scroll_chat_page(-1);
+        assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn handle_scrollbar_click_without_area_returns_false() {
+        let mut app = test_app();
+        app.last_chat_area = None;
+        assert!(!app.handle_scrollbar_click(79, 10));
+    }
+
+    #[test]
+    fn handle_scrollbar_click_outside_scrollbar_column_returns_false() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        // Click in the middle of the content, not on the scrollbar
+        assert!(!app.handle_scrollbar_click(40, 10));
+    }
+
+    #[test]
+    fn handle_scrollbar_click_at_top_border_returns_false() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        let scrollbar_col = 80 - 2;
+        // Click on the top border row (y=0, which is not > area.y=0)
+        assert!(!app.handle_scrollbar_click(scrollbar_col, 0));
+    }
+
+    #[test]
+    fn handle_scrollbar_click_at_bottom_border_returns_false() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        let scrollbar_col = 80 - 2;
+        // Click on the bottom border (row 19, which is not < 0 + 20 - 1 = 19)
+        assert!(!app.handle_scrollbar_click(scrollbar_col, 19));
+    }
+
+    #[test]
+    fn handle_scrollbar_click_inside_track_returns_true() {
+        let mut app = test_app();
+        // Fill the log with enough content so max_scroll > 0
+        for i in 0..50 {
+            app.log.push(format!("line {i}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        let scrollbar_col = 80 - 2;
+        assert!(app.handle_scrollbar_click(scrollbar_col, 10));
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+    }
+
+    #[test]
+    fn handle_scrollbar_click_at_bottom_of_track_switches_to_follow() {
+        let mut app = test_app();
+        // Need content taller than viewport for Follow to kick in
+        for i in 0..100 {
+            app.log.push(format!("line {i}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        let scrollbar_col = 80 - 2;
+        // Click at the last valid track row
+        assert!(app.handle_scrollbar_click(scrollbar_col, 18));
+        // At the bottom of the scrollbar, should be Follow mode
+        assert_eq!(app.scroll_mode, ScrollMode::Follow);
+    }
+
+    #[test]
+    fn handle_scrollbar_click_with_offset_area() {
+        let mut app = test_app();
+        for i in 0..50 {
+            app.log.push(format!("line {i}"));
+        }
+        // Area offset from (0,0) to (5,3)
+        app.last_chat_area = Some(Rect::new(5, 3, 75, 17));
+        let scrollbar_col = 5 + 75 - 2;
+        // Row 10 is within track: 10 > 3 and 10 < 3+17-1=19
+        assert!(app.handle_scrollbar_click(scrollbar_col, 10));
+    }
+}

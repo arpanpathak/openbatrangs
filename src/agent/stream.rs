@@ -77,13 +77,23 @@ enum FieldState {
 
 /// Tracks incremental extraction of a JSON string field from a streaming buffer.
 pub(super) struct StreamState {
+    /// JSON key being extracted (e.g. "thought" or "answer").
     key: &'static str,
+    /// Current lifecycle state of this field.
     state: FieldState,
+    /// Whether the visual prefix (emoji + label) has been emitted.
     has_printed_prefix: bool,
+    /// Number of characters already forwarded to the reporter.
     printed_length: usize,
 }
 
 impl StreamState {
+    /// Create a new stream tracker for the given JSON key.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: the JSON field name to extract (e.g. "thought", "answer").
+    /// - `enabled`: when `false` and key is "thought", output is suppressed.
     pub(super) fn new(key: &'static str, enabled: bool) -> Self {
         let state = if key == "thought" && !enabled {
             FieldState::Skipped
@@ -98,20 +108,27 @@ impl StreamState {
         }
     }
 
+    /// Feed a new buffer snapshot and forward any new text to the reporter.
+    ///
+    /// # Parameters
+    ///
+    /// - `reporter`: output sink for streaming chunks.
+    /// - `buffer`: the accumulated raw JSON response so far.
     pub(super) fn feed<R: Reporter>(&mut self, reporter: &mut R, buffer: &str) -> Result<()> {
         match self.state {
             FieldState::Skipped | FieldState::Complete => return Ok(()),
             FieldState::Active => {}
         }
 
-        // If a top-level tool call exists before this field, don't stream it —
-        // it might be text inside tool arguments rather than the real field.
-        let shadowed_by_tool = match (find_key_pos(buffer, self.key), find_key_pos(buffer, "tool"))
+        // With depth-aware key finding, extract_json_string only matches
+        // top-level keys, so nested keys inside tool arguments are already
+        // excluded. The only remaining case to guard against is when the
+        // response contains a `"tool"` key at the top level but the field
+        // we're looking for hasn't appeared yet — in that case the model
+        // is calling a tool and won't produce an `answer` field.
+        if find_toplevel_key(buffer, "tool").is_some()
+            && find_toplevel_key(buffer, self.key).is_none()
         {
-            (Some(field_pos), Some(tool_pos)) => tool_pos < field_pos,
-            _ => false,
-        };
-        if shadowed_by_tool {
             self.state = FieldState::Skipped;
             return Ok(());
         }
@@ -134,6 +151,7 @@ impl StreamState {
         Ok(())
     }
 
+    /// Visual prefix (emoji + label) for this field's output.
     fn prefix(&self) -> String {
         match self.key {
             "thought" => format!("{COLOR_CYAN}🧠 {COLOR_RESET}"),
@@ -142,21 +160,71 @@ impl StreamState {
         }
     }
 
+    /// Whether any text was forwarded to the reporter for this field.
     pub(super) fn did_print(&self) -> bool {
         self.has_printed_prefix
     }
 }
 
-fn find_key_pos(buffer: &str, key: &str) -> Option<usize> {
-    buffer.find(&format!("\"{key}\""))
+/// Find the position of a key at the top level of a (possibly partial) JSON object.
+///
+/// Tracks brace depth and string boundaries so that a key like `"answer"`
+/// nested inside `"tool": {"arguments": {"answer": ...}}` is skipped.
+/// Only matches keys at depth 1 (direct children of the root object).
+fn find_toplevel_key(buffer: &str, key: &str) -> Option<usize> {
+    let key_pattern = format!("\"{key}\"");
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = buffer.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+
+        if in_string {
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => {
+                if buffer[index..].starts_with(&key_pattern) && depth == 1 {
+                    return Some(index);
+                }
+                in_string = true;
+            }
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Extract the current value of a JSON string field from a partial JSON buffer.
+///
+/// Only matches the key at the top level of the JSON object (depth 1), so
+/// nested keys inside tool arguments are never confused with the real
+/// `thought` or `answer` fields.
+///
 /// Returns `(value_so_far, is_complete)`.
 fn extract_json_string(buffer: &str, key: &str) -> Option<(String, bool)> {
-    let key_pattern = format!("\"{key}\"");
-    let start = buffer.find(&key_pattern)?;
-    let after_key = &buffer[start + key_pattern.len()..];
+    let start = find_toplevel_key(buffer, key)?;
+    let key_pattern_len = key.len() + 2; // `"key"`
+    let after_key = &buffer[start + key_pattern_len..];
     let after_key = after_key.trim_start();
     let after_key = after_key.strip_prefix(':')?.trim_start();
     let after_key = after_key.strip_prefix('"')?;
@@ -316,6 +384,51 @@ mod tests {
         assert_eq!(unescape_json_string(r#"quote\"x"#), "quote\"x");
         assert_eq!(unescape_json_string(r#"back\\slash"#), "back\\slash");
         assert_eq!(unescape_json_string(r#"unicode\u0041"#), "unicodeA");
+    }
+
+    #[test]
+    fn find_toplevel_key_skips_nested_keys() {
+        // "answer" inside tool.arguments must NOT match at top level.
+        let buffer = r#"{"thought":"thinking","tool":{"name":"write_file","arguments":{"path":"foo","content":"answer"}}}"#;
+        assert!(
+            find_toplevel_key(buffer, "answer").is_none(),
+            "nested 'answer' inside tool.arguments must not match"
+        );
+        assert!(find_toplevel_key(buffer, "thought").is_some());
+        assert!(find_toplevel_key(buffer, "tool").is_some());
+    }
+
+    #[test]
+    fn find_toplevel_key_matches_top_level() {
+        let buffer = r#"{"thought":"hi","answer":"hello"}"#;
+        assert!(find_toplevel_key(buffer, "answer").is_some());
+        assert!(find_toplevel_key(buffer, "thought").is_some());
+    }
+
+    #[test]
+    fn find_toplevel_key_handles_key_inside_string_value() {
+        // The string value contains the literal text "answer" — must not match.
+        let buffer = r#"{"thought":"the answer is 42","tool":{"name":"finish"}}"#;
+        assert!(
+            find_toplevel_key(buffer, "answer").is_none(),
+            "key inside a string value must not match"
+        );
+    }
+
+    #[test]
+    fn extract_json_string_ignores_nested_answer() {
+        let buffer = r#"{"thought":"calling tool","tool":{"name":"write_file","arguments":{"answer":"nested"}}}"#;
+        assert!(
+            extract_json_string(buffer, "answer").is_none(),
+            "nested 'answer' inside tool.arguments must not be extracted"
+        );
+    }
+
+    #[test]
+    fn extract_json_string_handles_partial_with_tool() {
+        // Partial buffer: tool key seen but answer hasn't arrived yet.
+        let buffer = r#"{"thought":"thinking","tool":{"name":"read_file""#;
+        assert!(extract_json_string(buffer, "answer").is_none());
     }
 
     #[test]

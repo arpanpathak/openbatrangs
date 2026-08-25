@@ -13,6 +13,11 @@ use super::app::App;
 use crate::constants::tui::{COMMANDS, PREFIXED_COMMANDS};
 
 impl App {
+    /// Compute slash-command autocomplete suggestions for the current input.
+    ///
+    /// # Returns
+    ///
+    /// Matching command strings (e.g. `["/mode plan"]`), empty if no prefix match.
     pub(super) fn suggestions(&self) -> Vec<String> {
         if !self.input.starts_with('/') {
             return vec![];
@@ -48,14 +53,27 @@ impl App {
         }
     }
 
+    /// Insert a single character at the cursor position and advance the cursor.
+    ///
+    /// # Parameters
+    ///
+    /// - `character`: the character to insert.
     pub(super) fn insert_char(&mut self, character: char) {
         self.clamp_cursor_to_boundary();
         self.input.insert(self.cursor, character);
         self.cursor += character.len_utf8();
     }
 
+    /// Insert a block of text (typically from a paste event) at the cursor.
+    ///
+    /// CRLF/CR line endings are normalized to LF so multiline paste behaves
+    /// consistently across terminals.
+    ///
+    /// # Parameters
+    ///
+    /// - `text`: the pasted text to insert.
     pub(super) fn insert_text(&mut self, text: &str) {
-        if self.pending_confirmation.is_some() {
+        if self.is_confirming() {
             return;
         }
         self.clamp_cursor_to_boundary();
@@ -66,12 +84,14 @@ impl App {
         self.cursor += text.len();
     }
 
+    /// Insert a newline character at the cursor (Shift+Enter or Ctrl+J).
     pub(super) fn insert_newline(&mut self) {
         self.clamp_cursor_to_boundary();
         self.input.insert(self.cursor, '\n');
         self.cursor += 1;
     }
 
+    /// Delete the character before the cursor (Backspace key).
     pub(super) fn backspace(&mut self) {
         self.clamp_cursor_to_boundary();
         if self.cursor > 0 {
@@ -84,6 +104,7 @@ impl App {
         }
     }
 
+    /// Delete the character at the cursor (Delete key).
     pub(super) fn delete(&mut self) {
         self.clamp_cursor_to_boundary();
         if self.cursor < self.input.len() {
@@ -91,6 +112,7 @@ impl App {
         }
     }
 
+    /// Move the cursor one character to the left (Left arrow key).
     pub(super) fn move_left(&mut self) {
         self.clamp_cursor_to_boundary();
         if self.cursor > 0 {
@@ -102,6 +124,7 @@ impl App {
         }
     }
 
+    /// Move the cursor one character to the right (Right arrow key).
     pub(super) fn move_right(&mut self) {
         self.clamp_cursor_to_boundary();
         if self.cursor < self.input.len() {
@@ -110,6 +133,7 @@ impl App {
         }
     }
 
+    /// Navigate up: cycle suggestions or recall older history entries.
     pub(super) fn move_up(&mut self) {
         let suggestions = self.suggestions();
         if !suggestions.is_empty() {
@@ -129,6 +153,7 @@ impl App {
         }
     }
 
+    /// Navigate down: cycle suggestions or recall newer history entries.
     pub(super) fn move_down(&mut self) {
         let suggestions = self.suggestions();
         if !suggestions.is_empty() {
@@ -146,6 +171,7 @@ impl App {
         }
     }
 
+    /// Accept the currently highlighted autocomplete suggestion (Tab key).
     pub(super) fn accept_suggestion(&mut self) {
         let suggestions = self.suggestions();
         let selected = self.selected.min(suggestions.len().saturating_sub(1));

@@ -363,4 +363,77 @@ mod tests {
             32_768
         );
     }
+
+    #[test]
+    fn needs_fallback_true_when_score_below_threshold() {
+        let best = crate::models::ModelScore {
+            name: "weak-model".to_string(),
+            score: 40.0,
+            size_bytes: 1_000_000_000,
+            parameter_size: "7B".to_string(),
+            context_length: 8192,
+            quantization: "Q4_K_M".to_string(),
+            reasons: Vec::new(),
+        };
+        let p = prefs(None, false);
+        assert!(needs_fallback(&best, &p));
+    }
+
+    #[test]
+    fn needs_fallback_false_when_score_above_threshold() {
+        let best = crate::models::ModelScore {
+            name: "strong-model".to_string(),
+            score: 80.0,
+            size_bytes: 1_000_000_000,
+            parameter_size: "7B".to_string(),
+            context_length: 32768,
+            quantization: "Q4_K_M".to_string(),
+            reasons: Vec::new(),
+        };
+        let p = prefs(None, false);
+        assert!(!needs_fallback(&best, &p));
+    }
+
+    #[test]
+    fn needs_fallback_false_when_auto_pull_disabled() {
+        let best = crate::models::ModelScore {
+            name: "weak-model".to_string(),
+            score: 40.0,
+            size_bytes: 1_000_000_000,
+            parameter_size: "7B".to_string(),
+            context_length: 8192,
+            quantization: "Q4_K_M".to_string(),
+            reasons: Vec::new(),
+        };
+        let p = prefs(None, true);
+        assert!(!needs_fallback(&best, &p));
+    }
+
+    #[test]
+    fn needs_fallback_at_threshold_boundary() {
+        // At exactly the threshold, should not need fallback
+        let best = crate::models::ModelScore {
+            name: "boundary-model".to_string(),
+            score: GOOD_MODEL_SCORE_THRESHOLD,
+            size_bytes: 1_000_000_000,
+            parameter_size: "7B".to_string(),
+            context_length: 16384,
+            quantization: "Q4_K_M".to_string(),
+            reasons: Vec::new(),
+        };
+        let p = prefs(None, false);
+        assert!(!needs_fallback(&best, &p));
+
+        // Just below threshold should need fallback
+        let below = crate::models::ModelScore {
+            name: "below-model".to_string(),
+            score: GOOD_MODEL_SCORE_THRESHOLD - 0.1,
+            size_bytes: 1_000_000_000,
+            parameter_size: "7B".to_string(),
+            context_length: 16384,
+            quantization: "Q4_K_M".to_string(),
+            reasons: Vec::new(),
+        };
+        assert!(needs_fallback(&below, &p));
+    }
 }

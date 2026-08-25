@@ -12,24 +12,35 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// Messages sent from background workers to the TUI event loop.
 pub(crate) enum UiEvent {
+    /// A complete log line to append to the chat (e.g. tool output, status).
     Log(String),
+    /// A streaming text chunk to append to the live output area.
     Chunk(String),
+    /// The agent task finished, either successfully or with an error message.
     Done(Result<(), String>),
+    /// A background model pull completed with the given name and result.
     PullDone {
+        /// The Ollama model tag that was being pulled.
         name: String,
+        /// Pull outcome: `Ok(())` on success or `Err(message)` on failure.
         result: Result<(), String>,
     },
+    /// The `/setup` background task completed with the given result.
     SetupDone(Result<(), String>),
     /// The agent worker needs a y/n decision from the TUI user.
     ConfirmRequest {
+        /// Human-readable prompt describing the action to confirm.
         prompt: String,
+        /// One-shot channel for sending the user's yes/no answer back.
         response: oneshot::Sender<bool>,
     },
 }
 
 /// TUI-side confirmation: sends the prompt to the UI and waits for the keypress.
 struct ChannelConfirmer {
+    /// Channel for sending confirmation requests to the TUI event loop.
     tx: mpsc::UnboundedSender<UiEvent>,
 }
 
@@ -46,7 +57,9 @@ impl Confirmer for ChannelConfirmer {
     }
 }
 
+/// Bridges agent output (lines and chunks) to the TUI event channel.
 struct ChannelReporter {
+    /// Channel for forwarding agent output to the TUI event loop.
     tx: mpsc::UnboundedSender<UiEvent>,
 }
 
@@ -60,6 +73,24 @@ impl Reporter for ChannelReporter {
     }
 }
 
+/// Run the agentic coding loop in the background, streaming events to the TUI.
+///
+/// Dispatches to [`run_chat_worker`] for chat mode or runs the full
+/// tool-using agent for agent/plan modes.
+///
+/// # Parameters
+///
+/// - `client`: Ollama client for model calls.
+/// - `config`: agent runtime configuration (mode, limits, safety flags).
+/// - `model_slot`: explicit model tag or `None` for auto-selection.
+/// - `prefs`: model preferences for auto-selection (min context, auto-pull).
+/// - `task`: the user's task description.
+/// - `chat_history`: prior conversation messages for chat mode.
+/// - `tx`: channel for sending UI events back to the event loop.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if the agent encounters an unrecoverable failure.
 pub(crate) async fn run_agent_worker(
     client: OllamaClient,
     config: AgentRunConfig,
@@ -128,7 +159,7 @@ async fn run_chat_worker(
         .clamp(MIN_CONTEXT_TOKENS, max_ctx);
 
     let mut messages = vec![ChatMessage {
-        role: "system".to_string(),
+        role: crate::ollama::Role::System,
         content: CHAT_SYSTEM_PROMPT.to_string(),
     }];
     messages.extend(history);

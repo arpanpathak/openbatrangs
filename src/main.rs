@@ -2,6 +2,14 @@
 //!
 //! Parses arguments, creates the Ollama client, and dispatches to the
 //! command/TUI implementations in `commands` and `tui`.
+//!
+//! ## References
+//!
+//! - Clap derive API: <https://docs.rs/clap/latest/clap/_derive/index.html>
+//! - Tokio async runtime: <https://docs.rs/tokio/latest/tokio/>
+
+#![warn(missing_docs)]
+#![warn(clippy::missing_docs_in_private_items)]
 
 mod agent;
 mod banner;

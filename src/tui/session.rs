@@ -27,9 +27,16 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Bounded, disk-backed chat log that keeps only a recent window in RAM.
+///
+/// Older lines are evicted to a temporary file and reloaded on demand when the
+/// user scrolls up, keeping memory usage constant regardless of session length.
 pub(super) struct SessionLog {
+    /// Path to the temporary file where evicted lines are appended.
     path: PathBuf,
+    /// In-memory ring of the most recent chat lines (the "live window").
     memory: Vec<String>,
+    /// Maximum number of lines kept in the in-memory window before eviction.
     max_memory: usize,
     /// Maximum number of disk-backed lines kept in the visible prefix window.
     /// Older lines are dropped from the front of the window and reloaded on
@@ -47,6 +54,15 @@ pub(super) struct SessionLog {
 }
 
 impl SessionLog {
+    /// Create a new session log with the given in-memory capacity.
+    ///
+    /// # Parameters
+    ///
+    /// - `max_memory`: maximum lines kept in RAM before evicting to disk.
+    ///
+    /// # Returns
+    ///
+    /// A new `SessionLog` backed by a unique temporary file.
     pub(super) fn new(max_memory: usize) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -68,6 +84,11 @@ impl SessionLog {
         }
     }
 
+    /// Append a line, evicting the oldest in-memory line to disk when full.
+    ///
+    /// # Parameters
+    ///
+    /// - `line`: the chat line to store.
     pub(super) fn push(&mut self, line: String) {
         self.memory.push(line);
         if self.memory.len() <= self.max_memory {
@@ -88,6 +109,7 @@ impl SessionLog {
         }
     }
 
+    /// Discard all in-memory and disk-backed history, resetting the log.
     pub(super) fn clear(&mut self) {
         self.memory.clear();
         self.prefix.clear();
@@ -321,6 +343,93 @@ mod tests {
         // remain visible instead of being dropped by the cap.
         assert!(log.load_more(100));
         assert!(log.text().starts_with("line 0"));
+        assert!(!log.has_more_history());
+    }
+
+    #[test]
+    fn has_more_history_false_when_fresh() {
+        let log = SessionLog::new(10);
+        assert!(!log.has_more_history());
+    }
+
+    #[test]
+    fn has_more_history_true_after_eviction() {
+        let mut log = SessionLog::new(2);
+        for i in 0..5 {
+            log.push(format!("line {i}"));
+        }
+        assert!(log.has_more_history());
+    }
+
+    #[test]
+    fn has_more_history_false_after_loading_all() {
+        let mut log = SessionLog::new(2);
+        for i in 0..5 {
+            log.push(format!("line {i}"));
+        }
+        log.load_more(100);
+        assert!(!log.has_more_history());
+    }
+
+    #[test]
+    fn clear_after_loading_resets_everything() {
+        let mut log = SessionLog::new(2);
+        for i in 0..10 {
+            log.push(format!("line {i}"));
+        }
+        log.load_more(5);
+        assert!(!log.prefix.is_empty());
+        log.clear();
+        assert!(log.is_empty());
+        assert!(!log.has_more_history());
+        assert_eq!(log.text(), "");
+    }
+
+    #[test]
+    fn text_output_with_empty_log() {
+        let log = SessionLog::new(10);
+        assert_eq!(log.text(), "");
+    }
+
+    #[test]
+    fn text_output_with_only_memory() {
+        let mut log = SessionLog::new(10);
+        log.push("first".to_string());
+        log.push("second".to_string());
+        assert_eq!(log.text(), "first\nsecond");
+    }
+
+    #[test]
+    fn large_number_of_lines_causes_eviction() {
+        let mut log = SessionLog::new(5);
+        for i in 0..100 {
+            log.push(format!("line {i}"));
+        }
+        // Memory should be bounded at max_memory
+        assert_eq!(log.memory.len(), 5);
+        // The last 5 lines should be in memory
+        assert_eq!(log.memory[0], "line 95");
+        assert_eq!(log.memory[4], "line 99");
+        // History should exist
+        assert!(log.has_more_history());
+    }
+
+    #[test]
+    fn load_more_returns_false_when_nothing_to_load() {
+        let mut log = SessionLog::new(10);
+        assert!(!log.load_more(5));
+    }
+
+    #[test]
+    fn push_after_clear_starts_fresh() {
+        let mut log = SessionLog::new(3);
+        for i in 0..5 {
+            log.push(format!("line {i}"));
+        }
+        log.clear();
+        log.push("new line".to_string());
+        assert_eq!(log.memory.len(), 1);
+        assert_eq!(log.memory[0], "new line");
         assert!(!log.has_more_history());
     }
 }

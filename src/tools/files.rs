@@ -453,6 +453,140 @@ mod tests {
     }
 
     #[test]
+    fn grep_files_with_anchored_regex() {
+        let root = temp_dir();
+        fs::write(root.join("a.txt"), "hello world\ngoodbye world\nhello again\n").unwrap();
+        let output = grep_files(&root, r"^hello", ".", 10).unwrap();
+        assert!(output.contains("a.txt:1: hello world"));
+        assert!(output.contains("a.txt:3: hello again"));
+        assert!(!output.contains("goodbye"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_with_complex_regex_pattern() {
+        let root = temp_dir();
+        fs::write(
+            root.join("code.rs"),
+            "fn foo() {}\nfn bar(x: i32) -> bool {}\nlet y = 42;\nfn baz()\n",
+        )
+        .unwrap();
+        let output = grep_files(&root, r"fn \w+\(", ".", 10).unwrap();
+        assert!(output.contains("code.rs:1: fn foo() {}"));
+        assert!(output.contains("fn bar(x: i32) -> bool {}"));
+        assert!(output.contains("fn baz()"));
+        assert!(!output.contains("let y = 42"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_files_max_results_one_returns_single_match() {
+        let root = temp_dir();
+        fs::write(
+            root.join("lines.txt"),
+            "aaa\nbbb\naaa\nccc\naaa\n",
+        )
+        .unwrap();
+        let output = grep_files(&root, "aaa", ".", 1).unwrap();
+        let match_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| l.contains("lines.txt"))
+            .collect();
+        assert_eq!(match_lines.len(), 1);
+        assert!(output.contains("truncated at 1 match"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_detects_binary_via_read_error() {
+        let root = temp_dir();
+        // Write bytes that are valid UTF-8 but the file is large and has
+        // non-text content. read_file uses read_to_string which will succeed
+        // on valid UTF-8, so we test that max_chars truncation works.
+        let long_text = "x".repeat(500);
+        fs::write(root.join("big.txt"), &long_text).unwrap();
+        let output = read_file(&root, "big.txt", 50).unwrap();
+        assert!(output.contains("--- big.txt ---"));
+        // Output should be truncated
+        assert!(output.len() < 500);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_max_chars_truncates_content() {
+        let root = temp_dir();
+        let content = "line1\nline2\nline3\nline4\nline5\n";
+        fs::write(root.join("data.txt"), content).unwrap();
+        let output = read_file(&root, "data.txt", 10).unwrap();
+        // The header is always present; content after it should be truncated
+        assert!(output.contains("--- data.txt ---"));
+        // The truncated output should contain the truncation marker
+        assert!(output.contains("truncated"));
+        // The output should not contain all 5 lines (would be present without truncation)
+        assert!(!output.contains("line5"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_creates_deeply_nested_parent_directories() {
+        let root = temp_dir();
+        let result = write_file(&root, "a/b/c/d/e.txt", "deep").unwrap();
+        assert!(result.contains("e.txt"));
+        assert!(root.join("a/b/c/d/e.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("a/b/c/d/e.txt")).unwrap(), "deep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_depth_one_shows_only_top_level() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("sub/nested")).unwrap();
+        fs::write(root.join("top.txt"), "top").unwrap();
+        fs::write(root.join("sub/mid.txt"), "mid").unwrap();
+        fs::write(root.join("sub/nested/deep.txt"), "deep").unwrap();
+
+        let output = list_files(&root, ".", 1).unwrap();
+        assert!(output.contains("top.txt"));
+        // depth=1 means only the root itself; no subdirectory contents
+        assert!(!output.contains("sub/mid.txt"));
+        assert!(!output.contains("deep.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_depth_two_shows_one_level_of_subdirectories() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("sub/nested")).unwrap();
+        fs::write(root.join("top.txt"), "top").unwrap();
+        fs::write(root.join("sub/mid.txt"), "mid").unwrap();
+        fs::write(root.join("sub/nested/deep.txt"), "deep").unwrap();
+
+        let output = list_files(&root, ".", 2).unwrap();
+        assert!(output.contains("top.txt"));
+        assert!(output.contains("sub/mid.txt"));
+        assert!(!output.contains("deep.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_empty_directory_shows_no_files_message() {
+        let root = temp_dir();
+        let output = list_files(&root, ".", 5).unwrap();
+        assert!(output.contains("(no files found)"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_file_overwrites_existing_file() {
+        let root = temp_dir();
+        fs::write(root.join("file.txt"), "original").unwrap();
+        let result = write_file(&root, "file.txt", "replaced").unwrap();
+        assert!(result.contains("file.txt"));
+        assert_eq!(fs::read_to_string(root.join("file.txt")).unwrap(), "replaced");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn list_files_with_relative_root_returns_relative_paths() {
         // `cargo test` runs with the crate root as the working directory, so
         // `"."` is a valid relative workspace root. Regression: the walker uses

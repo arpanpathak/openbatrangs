@@ -33,6 +33,14 @@ use ratatui::widgets::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Top-level rendering function: compose and draw the full TUI frame.
+///
+/// Called by ratatui's `Terminal::draw` on every frame.
+///
+/// # Parameters
+///
+/// - `f`: the ratatui frame to render into.
+/// - `app`: mutable reference to app state (used for render caching).
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
     render_banner(f, app, chunks[0]);
@@ -48,10 +56,12 @@ pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     render_confirmation(f, app);
 }
 
+/// Whether the perf panel should be shown given current app state and terminal height.
 fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
+/// Banner height: compact when the terminal is tall enough, smaller otherwise.
 fn banner_height(area_height: u16) -> u16 {
     if area_height >= FULL_BANNER_MIN_TERMINAL_HEIGHT {
         COMPACT_BANNER_HEIGHT
@@ -60,6 +70,7 @@ fn banner_height(area_height: u16) -> u16 {
     }
 }
 
+/// Height of the suggestion list based on the number of matching commands.
 fn suggestions_height(app: &App) -> u16 {
     let count = app.suggestions().len();
     match count {
@@ -68,12 +79,14 @@ fn suggestions_height(app: &App) -> u16 {
     }
 }
 
+/// Dynamic perf panel height based on wrapped text content.
 fn perf_height(app: &App, width: u16) -> u16 {
     let max_text_width = (width as usize).saturating_sub(2).max(1);
     let rows = text_wrapped_height(&app.perf_lines().join("\n"), max_text_width);
     (rows as u16 + 2).clamp(PERF_PANEL_HEIGHT, PERF_MAX_PANEL_HEIGHT)
 }
 
+/// Split the terminal area into vertical chunks for each UI region.
 fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
@@ -94,6 +107,7 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         .to_vec()
 }
 
+/// Render the ASCII art banner with model info and optional prompt display.
 fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -142,6 +156,7 @@ fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render the chat scrollback area with optional syntax highlighting and scrollbar.
 fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
@@ -206,6 +221,7 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Inner width of the chat area in character cells (excluding borders).
 fn chat_inner_width(area_width: u16) -> usize {
     (area_width as usize).saturating_sub(2).max(1)
 }
@@ -226,13 +242,21 @@ fn chat_scroll(app: &App, area: Rect, content_height: usize) -> usize {
     }
 }
 
+/// Render the status bar showing the current state, mode, and key hints.
 fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let mode_suffix = match app.run_config.mode {
         AgentMode::Plan => " · plan",
         AgentMode::Chat => " · chat",
         AgentMode::Agent => "",
     };
-    let status_line = if app.pending_confirmation.is_some() {
+    let safety_suffix = if app.run_config.is_read_only {
+        " · 🔒 read-only"
+    } else if !app.run_config.should_confirm {
+        " · ⚠️ yolo"
+    } else {
+        ""
+    };
+    let status_line = if app.is_confirming() {
         "❓ y = confirm · n / Esc = abort".to_string()
     } else if app.is_running {
         let spin = app.spinner();
@@ -241,12 +265,12 @@ fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
         } else {
             format!("{spin} {}{} — {}", app.status, mode_suffix, app.last_action)
         }
-    } else if app.picker.is_some() {
+    } else if app.is_showing_picker() {
         "↑↓ select · Enter confirm · Esc cancel".to_string()
     } else if !app.task_queue.is_empty() {
-        format!("ready — {} queued", app.task_queue.len())
+        format!("ready{safety_suffix} — {} queued", app.task_queue.len())
     } else {
-        format!("{}{} · PgUp/PgDn scroll", app.status, mode_suffix)
+        format!("{}{mode_suffix}{safety_suffix} · PgUp/PgDn scroll", app.status)
     };
     let status_style = if app.is_running {
         Style::default().fg(Color::Yellow)
@@ -276,6 +300,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Render the GPU/CPU/RAM performance panel with live stats.
 fn render_perf_panel(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let content = app.perf_lines().join("\n");
     let panel = Paragraph::new(content)
@@ -285,6 +310,7 @@ fn render_perf_panel(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(panel, area);
 }
 
+/// Render the slash-command autocomplete suggestion list.
 fn render_suggestions(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -315,6 +341,7 @@ fn render_suggestions(f: &mut ratatui::Frame, app: &App, area: Rect) {
     );
 }
 
+/// Render the user input box with wrapped text and scrolling.
 fn render_input_box(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = wrap_text_to_lines(&app.input, input_inner_width(area.width))
         .into_iter()
@@ -326,10 +353,12 @@ fn render_input_box(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(input_paragraph, area);
 }
 
+/// Inner width of the input box in character cells (excluding borders).
 fn input_inner_width(area_width: u16) -> usize {
     (area_width as usize).saturating_sub(2).max(1)
 }
 
+/// Vertical scroll offset for the input box so the cursor stays visible.
 fn input_scroll_y(app: &App, area: Rect) -> u16 {
     let Some((cursor_line, _)) = input_cursor_position(app, area.width) else {
         return 0;
@@ -347,6 +376,7 @@ fn input_cursor_position(app: &App, area_width: u16) -> Option<(usize, u16)> {
     Some((line, column))
 }
 
+/// Position the terminal cursor at the user's text insertion point in the input box.
 fn render_cursor(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some((cursor_line, column)) = input_cursor_position(app, area.width) else {
         return;
@@ -359,8 +389,9 @@ fn render_cursor(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
 }
 
+/// Render the model picker popup overlay when active.
 fn render_model_picker(f: &mut ratatui::Frame, app: &App) {
-    let Some(picker) = &app.picker else {
+    let Some(picker) = app.picker() else {
         return;
     };
     let area = centered_rect(
@@ -400,9 +431,11 @@ fn render_model_picker(f: &mut ratatui::Frame, app: &App) {
     );
 }
 
+/// Render the tool-confirmation popup overlay when active.
 fn render_confirmation(f: &mut ratatui::Frame, app: &App) {
-    let Some(pending) = &app.pending_confirmation else {
-        return;
+    let pending = match &app.modal {
+        Some(super::app::ActiveModal::Confirm(pending)) => pending,
+        _ => return,
     };
     let area = centered_rect(60, 35, f.area());
     let lines = vec![
@@ -437,6 +470,7 @@ fn render_confirmation(f: &mut ratatui::Frame, app: &App) {
     );
 }
 
+/// Compute a centered rectangle as a percentage of the parent area.
 fn centered_rect(
     percent_x: u16,
     percent_y: u16,
@@ -460,6 +494,7 @@ fn centered_rect(
         .split(popup[1])[1]
 }
 
+/// Compute the input box height based on wrapped text content and available space.
 fn input_height(app: &App, width: u16, area_height: u16) -> usize {
     let text_lines = wrap_text_to_lines(&app.input, input_inner_width(width)).len();
     let desired = (text_lines.min(MAX_INPUT_LINES) + INPUT_BOX_PADDING).max(MIN_INPUT_BOX_HEIGHT);
@@ -564,16 +599,11 @@ mod tests {
 
     #[test]
     fn confirmation_popup_renders_prompt() {
-        use crate::tui::app::PendingConfirmation;
-
         let cli = Cli::parse_from(["openbatrangs"]);
         let shared = Arc::new(Mutex::new(None));
         let mut app = App::new(&cli, shared);
         let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
-        app.pending_confirmation = Some(PendingConfirmation {
-            prompt: "write file 'a.txt'?".to_string(),
-            response: response_tx,
-        });
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test backend");

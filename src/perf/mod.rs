@@ -51,10 +51,12 @@ pub struct SystemStats {
 
 /// Tracks the previous `/proc/stat` sample so CPU utilization is a delta.
 struct CpuSampler {
+    /// Previous sample's (idle_total, total) tick counts from `/proc/stat`.
     previous: Option<(u64, u64)>,
 }
 
 impl CpuSampler {
+    /// Create a new sampler and prime the delta so the first real sample is usable.
     fn new() -> Self {
         let mut sampler = Self { previous: None };
         // Prime the delta so the first visible sample is meaningful.
@@ -62,6 +64,11 @@ impl CpuSampler {
         sampler
     }
 
+    /// Take a new CPU utilization sample as a percentage (0–100).
+    ///
+    /// # Returns
+    ///
+    /// CPU utilization percentage, or `None` if `/proc/stat` is unreadable.
     fn sample(&mut self) -> Option<f64> {
         let current = read_cpu_times()?;
         let utilization = match self.previous {
@@ -83,13 +90,22 @@ impl CpuSampler {
 
 /// Monitors system stats and the latest `tegrastats` line.
 pub struct PerfMonitor {
+    /// Shared buffer containing the latest `tegrastats` output line.
     tegrastats: Arc<Mutex<Option<String>>>,
+    /// Delta-based CPU utilization sampler.
     cpu: CpuSampler,
+    /// Timestamp of the last completed sample, for rate-limiting.
     last_sample: Option<Instant>,
+    /// Cached `nvidia-smi` result with its timestamp, to avoid frequent subprocess calls.
     gpu_cache: Option<(Instant, GpuStats)>,
 }
 
 impl PerfMonitor {
+    /// Create a new performance monitor backed by the given `tegrastats` buffer.
+    ///
+    /// # Parameters
+    ///
+    /// - `tegrastats`: shared buffer for the background `tegrastats` reader.
     pub fn new(tegrastats: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             tegrastats,
@@ -112,6 +128,7 @@ impl PerfMonitor {
         Some(self.sample())
     }
 
+    /// Collect a full system snapshot from tegrastats/nvidia-smi and /proc.
     fn sample(&mut self) -> SystemStats {
         let latest_tegrastats = self
             .tegrastats
@@ -145,7 +162,7 @@ impl PerfMonitor {
             cpu_util_percent: self.cpu.sample(),
             cpu_cores: std::thread::available_parallelism()
                 .map(|count| count.get())
-                .unwrap_or(0),
+                .unwrap_or(1),
             memory_used_mb: memory.used_mb,
             memory_total_mb: memory.total_mb,
             memory_shared_mb: memory.shared_mb,
@@ -194,6 +211,11 @@ pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<std::proce
 pub struct TegrastatsGuard(Option<std::process::Child>);
 
 impl TegrastatsGuard {
+    /// Spawn `tegrastats` and return a guard that kills it on drop.
+    ///
+    /// # Parameters
+    ///
+    /// - `shared`: buffer where the latest `tegrastats` line is stored.
     pub fn start(shared: Arc<Mutex<Option<String>>>) -> Self {
         Self(start_tegrastats(shared))
     }
@@ -210,14 +232,21 @@ impl Drop for TegrastatsGuard {
 
 /// System memory breakdown matching jtop's RAM page.
 struct MemoryStats {
+    /// Green "used" memory in MiB (excludes shared GPU memory).
     used_mb: u64,
+    /// Total physical memory in MiB.
     total_mb: u64,
+    /// GPU-shared memory in MiB (NvMapMemUsed on Jetson).
     shared_mb: u64,
+    /// Kernel buffers in MiB.
     buffers_mb: u64,
+    /// Page cache + SReclaimable in MiB.
     cached_mb: u64,
+    /// Completely unused memory in MiB.
     free_mb: u64,
 }
 
+/// Parse `/proc/meminfo` into a structured memory breakdown.
 fn read_memory_mb() -> MemoryStats {
     let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mut total_kb = 0u64;
@@ -257,6 +286,7 @@ fn read_memory_mb() -> MemoryStats {
     }
 }
 
+/// Parse a numeric value followed by a unit from a `/proc` line (e.g. "12345 kB").
 fn parse_kibibytes(rest: &str) -> u64 {
     rest.split_whitespace()
         .next()
@@ -264,6 +294,11 @@ fn parse_kibibytes(rest: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Read aggregate CPU tick counts from `/proc/stat`.
+///
+/// # Returns
+///
+/// `(idle_total, total)` tick counts, or `None` if the file is unreadable.
 fn read_cpu_times() -> Option<(u64, u64)> {
     let content = std::fs::read_to_string("/proc/stat").ok()?;
     let line = content.lines().next()?;

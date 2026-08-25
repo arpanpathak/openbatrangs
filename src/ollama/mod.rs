@@ -18,7 +18,7 @@
 mod stream;
 mod types;
 
-pub(crate) use types::{ChatMessage, ChatRequest, OllamaModel, PullRequest, TagsResponse};
+pub(crate) use types::{ChatMessage, ChatRequest, OllamaModel, PullRequest, Role, TagsResponse};
 
 use crate::constants::ollama::{
     API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
@@ -261,7 +261,7 @@ mod tests {
         let request = ChatRequest {
             model: "qwen2.5-coder:3b".to_string(),
             messages: vec![ChatMessage {
-                role: "user".to_string(),
+                role: Role::User,
                 content: "hello".to_string(),
             }],
             stream: true,
@@ -307,7 +307,7 @@ mod tests {
         ChatRequest {
             model: "qwen2.5-coder:3b".to_string(),
             messages: vec![ChatMessage {
-                role: "user".to_string(),
+                role: Role::User,
                 content: "hello".to_string(),
             }],
             stream: false,

@@ -3,6 +3,7 @@
 /// Slash commands recognized by the TUI.
 pub const COMMANDS: &[&str] = &[
     "help",
+    "status",
     "exit",
     "quit",
     "setup",
