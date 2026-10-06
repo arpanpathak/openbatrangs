@@ -32,7 +32,8 @@ esac
 case "${OS}" in
   Linux) ;;
   Darwin)
-    echo "❌ macOS is not supported by the prebuilt release yet."
+    echo "❌ There is no prebuilt macOS binary yet. Build it from source (needs Rust):"
+    echo "     cargo install --git https://github.com/${REPO} --locked"
     exit 1
     ;;
   *)

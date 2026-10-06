@@ -16,7 +16,7 @@ pub trait MemoryInfo {
     fn total_memory_bytes(&self) -> u64;
 }
 
-/// Reads total memory from `/proc/meminfo` (Linux).
+/// Reads total memory from `/proc/meminfo` (Linux), or `sysctl` (macOS).
 pub struct ProcMemoryInfo;
 
 impl MemoryInfo for ProcMemoryInfo {
@@ -50,7 +50,16 @@ fn read_memtotal_from_proc() -> u64 {
             return kilobytes * BYTES_PER_KIB;
         }
     }
-    FALLBACK_SYSTEM_MEMORY_BYTES
+    read_memsize_from_sysctl().unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES)
+}
+
+/// Total RAM on macOS, which has no `/proc`: `sysctl -n hw.memsize`.
+fn read_memsize_from_sysctl() -> Option<u64> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]
