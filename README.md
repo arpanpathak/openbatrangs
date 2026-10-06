@@ -59,7 +59,8 @@ to see which model your hardware scores best for this workload.
 
 ## Requirements
 
-- [Ollama](https://ollama.com) installed (the CLI auto-starts `ollama serve` if it is installed but not running).
+- [Ollama](https://ollama.com) installed (the CLI auto-starts `ollama serve` if it is installed but not running),
+  or an OpenAI-compatible server such as llama-server, vLLM or trtllm-serve (see "Other servers" below).
 - If Ollama is not installed at all, run `openbatrangs setup` once — it installs Ollama and pulls a coding model for you.
 - If no suitable model is installed, openBatarangs auto-pulls a recommended coding model unless you pass `--no-auto-pull`.
 
@@ -77,6 +78,18 @@ cargo install --path .
 ```
 
 The binary is at `target/release/openbatrangs` (or `~/.cargo/bin/openbatrangs`).
+
+### macOS
+
+There is no prebuilt macOS binary yet. Build from source (Intel or Apple silicon):
+
+```sh
+xcode-select --install                 # C compiler for the TLS library; skip if installed
+curl https://sh.rustup.rs -sSf | sh    # skip if you have Rust
+cargo install --git https://github.com/arpanpathak/openbatrangs --locked
+```
+
+The GPU panel stays empty on macOS (it reads `tegrastats` or `nvidia-smi`).
 
 ### Prebuilt binaries (easiest)
 
@@ -130,6 +143,29 @@ openbatrangs --read-only "suggest a refactor plan"
 # Ask before every write/command
 openbatrangs --confirm "update the CLI docs"
 ```
+
+## Other servers: llama-server, vLLM, Nemotron on a Jetson Thor
+
+Any OpenAI-compatible server works instead of Ollama:
+
+```sh
+openbatrangs --openai-url http://127.0.0.1:8079/v1 --api-key-file ~/.config/thor-chat/api-key
+openbatrangs --thor          # shortcut for the two options above
+openbatrangs --thor --no-think "fix the failing test"
+```
+
+- `--openai-url` takes the base URL including `/v1`; `--api-key-file` is
+  optional and sends the file's contents as a bearer key.
+- Thinking models (Nemotron, Qwen3) think before each step by default; the
+  reasoning is shown dimmed after 💭. `--no-think` turns it off.
+- `/models` and `list-models` show what the server serves; there is nothing
+  to pull.
+
+Measured with Nemotron 3 Nano 30B-A3B on a Jetson AGX Thor (llama-server,
+thinking on): a cargo project with a stack, a queue, a linked list, binary
+search and quicksort, each with tests, took 14 steps and 293 s, and its 14
+tests pass. Setup for the Thor's shared server, including keys:
+[Bring your own agent](https://arpanpathak.github.io/thor-thunder-tigress-platform/ch16-bring-your-own-agent.html).
 
 ### Interactive REPL commands
 
@@ -194,11 +230,15 @@ If nothing suitable is installed, it can automatically pull a recommended model
 --ollama-url <URL>   Ollama server URL (default http://localhost:11434)
 --model <TAG>        Use a specific Ollama model tag
 --cwd <DIR>          Workspace directory (default .)
---max-steps <N>      Max agent iterations (default 12)
+--max-steps <N>      Max agent iterations (default 40)
 --min-context <N>    Minimum context window for auto-selection (default 8192)
 --read-only          Disable writes and shell commands
 --confirm            Ask before writes/commands
 --no-auto-pull       Never auto-pull models
+--openai-url <URL>   Use an OpenAI-compatible server instead of Ollama
+--api-key-file <P>   Bearer key file for --openai-url
+--thor               Nemotron on a Jetson Thor (127.0.0.1:8079/v1, ~/.config/thor-chat/api-key)
+--no-think           Turn thinking off (OpenAI-compatible servers)
 ```
 
 ## Roadmap
@@ -207,7 +247,6 @@ This is the first working version. Future steps for standalone distribution:
 
 - Prebuilt binaries for `aarch64` and `x86_64`
 - `cargo install` from crates.io
-- Support OpenAI-compatible remote endpoints in addition to Ollama
 - Optional direct GGUF fallback via `mistralrs` or `llama.cpp`
 - Better token budgeting / context compression for long agent sessions
 - Installer script that checks for Ollama and installs a recommended model
