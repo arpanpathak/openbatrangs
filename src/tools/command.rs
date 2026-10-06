@@ -116,8 +116,15 @@ fn create_sandbox_dirs(root: &Path) {
 }
 
 /// Environment overrides that keep agent commands inside the workspace.
+///
+/// The paths are absolute: with a relative workspace such as `.`, a command
+/// that changes directory (`cd dsa && cargo test`) would otherwise point
+/// `TMPDIR` at a folder that does not exist, and rustdoc fails with
+/// "failed to create temporary directory".
 fn agent_sandbox_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
-    let agent_dir = root.join(".agent");
+    let agent_dir = std::path::absolute(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(".agent");
     vec![
         ("HOME", agent_dir.join("home")),
         ("XDG_CACHE_HOME", agent_dir.join("cache")),
@@ -256,5 +263,11 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sandbox_paths_are_absolute_for_a_relative_root() {
+        let env = agent_sandbox_env(&PathBuf::from("."));
+        assert!(env.iter().all(|(_, path)| path.is_absolute()));
     }
 }

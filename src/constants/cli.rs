@@ -11,7 +11,7 @@ pub const THOR_OPENAI_URL: &str = "http://127.0.0.1:8079/v1";
 pub const THOR_KEY_FILE: &str = ".config/thor-chat/api-key";
 
 /// Default maximum agent iterations.
-pub const DEFAULT_MAX_STEPS: usize = 12;
+pub const DEFAULT_MAX_STEPS: usize = 40;
 
 /// Default minimum acceptable context window for auto model selection.
 pub const DEFAULT_MIN_CONTEXT: usize = 8_192;
