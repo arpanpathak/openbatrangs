@@ -23,7 +23,9 @@
 //! - JSON Schema for strict tool-call responses: <https://json-schema.org/>
 
 mod confirm;
+mod context;
 mod execute;
+mod quality;
 mod reporter;
 mod stream;
 mod tool;
@@ -38,11 +40,13 @@ use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
 use anyhow::{bail, Context, Result};
 use execute::{execute_tool_or_report_error, print_changed_files};
+use quality::{requires_file_work, FileWorkGate};
 use std::path::{Path, PathBuf};
 use stream::stream_model_response;
 use tool::{parse_agent_response, Tool, ToolCall};
 
 pub use confirm::{Confirmer, StdioConfirmer};
+pub(crate) use context::{compact_context, max_output_tokens};
 pub use reporter::{Reporter, StdoutReporter};
 
 /// Immutable configuration for the agentic coding loop.
@@ -58,8 +62,9 @@ pub struct AgentConfig {
     pub should_confirm: bool,
     /// When `true`, the model's reasoning/thinking text is shown to the user.
     pub show_thinking: bool,
-    /// Maximum context window (tokens) sent to the model.
-    pub max_ctx: u64,
+    /// Upper limit on the context window (tokens); `None` uses the model's
+    /// own context length in full.
+    pub max_ctx: Option<u64>,
 }
 
 /// The outcome of one agent iteration.
@@ -80,6 +85,18 @@ struct AgentRunContext<'a> {
     model: &'a str,
     /// Context window size (tokens) sent to the model.
     num_ctx: u64,
+    /// Whether the original task asks for file output rather than just a chat answer.
+    requires_file_work: bool,
+}
+
+/// Mutable state that persists across agent steps.
+struct AgentStepState<'a> {
+    /// Conversation history sent to the model.
+    messages: &'a mut Vec<ChatMessage>,
+    /// Files written successfully during the task.
+    changed_files: &'a mut Vec<String>,
+    /// Gate that rejects shallow finish calls.
+    file_work_gate: &'a mut FileWorkGate,
 }
 
 /// Run the bounded agentic coding loop: plan, execute tools, iterate.
@@ -109,28 +126,26 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
 
-    let max_ctx = config.max_ctx.max(MIN_CONTEXT_TOKENS);
-    let num_ctx = model_context.clamp(MIN_CONTEXT_TOKENS, max_ctx);
+    let num_ctx = effective_context(model_context, config.max_ctx);
     let mut messages = initial_messages(&config.cwd, task);
     let mut changed_files: Vec<String> = Vec::new();
+    let mut file_work_gate = FileWorkGate::default();
 
     let step_context = AgentRunContext {
         config,
         client,
         model,
         num_ctx,
+        requires_file_work: requires_file_work(task),
     };
 
     for step in 1..=config.max_steps {
-        let outcome = run_agent_step(
-            &step_context,
-            &mut messages,
-            &mut changed_files,
-            reporter,
-            confirmer,
-            step,
-        )
-        .await?;
+        let mut state = AgentStepState {
+            messages: &mut messages,
+            changed_files: &mut changed_files,
+            file_work_gate: &mut file_work_gate,
+        };
+        let outcome = run_agent_step(&step_context, &mut state, reporter, confirmer, step).await?;
         match outcome {
             AgentStepOutcome::Finished => return Ok(()),
             AgentStepOutcome::Continue => {}
@@ -147,13 +162,23 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
 /// Run one agent iteration: stream a response, parse it, and act on it.
 async fn run_agent_step<R: Reporter, C: Confirmer>(
     context: &AgentRunContext<'_>,
-    messages: &mut Vec<ChatMessage>,
-    changed_files: &mut Vec<String>,
+    state: &mut AgentStepState<'_>,
     reporter: &mut R,
     confirmer: &mut C,
     step: usize,
 ) -> Result<AgentStepOutcome> {
+    let AgentStepState {
+        messages,
+        changed_files,
+        file_work_gate,
+    } = &mut *state;
+
     report_step_start(reporter, step, context.config.max_steps, context.model);
+
+    // Auto rolling context: keep the system prompt, original task, and the
+    // newest tool exchange verbatim; older tool calls/output are rolled into a
+    // short note so the prompt always fits the safe per-device `num_ctx`.
+    compact_context(messages, context.num_ctx);
 
     let request = chat_request(context.model, messages, context.num_ctx);
     let (content, answer_was_streamed) = stream_model_response(
@@ -179,6 +204,22 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
         // A final answer ends the loop. If it was already streamed live, do
         // not print it a second time.
         (Some(answer), _) => {
+            if file_work_gate.should_block_finish(
+                context.requires_file_work,
+                context.config.is_read_only,
+                changed_files.len(),
+            ) {
+                file_work_gate.record_retry();
+                messages.push(ChatMessage {
+                    role: crate::ollama::Role::User,
+                    content: FileWorkGate::feedback().to_string(),
+                });
+                reporter.line(format!(
+                    "\n{COLOR_DIM}⚠️  Shallow finish blocked: no files were written.{COLOR_RESET}"
+                ));
+                return Ok(AgentStepOutcome::Continue);
+            }
+
             if !answer_was_streamed {
                 reporter.line(format!("\n{ANSI_GREEN_CHECK} {answer}"));
             }
@@ -187,40 +228,94 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
         }
         // A tool call continues the loop: execute, append the result, repeat.
         (None, Some(tool_call)) => {
-            handle_tool_call(
-                context.config,
-                messages,
-                changed_files,
-                reporter,
-                confirmer,
-                &content,
-                tool_call,
-            )
-            .await
+            handle_tool_call(context, state, reporter, confirmer, &content, tool_call).await
         }
         // Neither field is a model failure; surface it and stop cleanly.
         (None, None) => {
-            reporter.line("\n⚠️  Model returned neither an answer nor a tool call.".to_string());
+            reporter.line(format!(
+                "\n⚠️  Model returned neither an answer nor a tool call.\n   model sent: {}",
+                content.trim()
+            ));
+            if matches!(content.trim(), "" | "{}") {
+                reporter.line(format!(
+                    "   An empty reply usually means the context window ran out while the \
+                     model was thinking; the window was {} tokens.",
+                    context.num_ctx
+                ));
+            }
             Ok(AgentStepOutcome::Finished)
         }
     }
 }
 
+/// The context window for a request: the model's own context length, lowered
+/// to `cap` when one is given, and never below [`MIN_CONTEXT_TOKENS`].
+pub fn effective_context(model_context: u64, cap: Option<u64>) -> u64 {
+    let limited = cap.map_or(model_context, |cap| model_context.min(cap));
+    limited.max(MIN_CONTEXT_TOKENS)
+}
+
 /// Execute a parsed tool call and append the assistant/tool messages.
 async fn handle_tool_call<R: Reporter, C: Confirmer>(
-    config: &AgentConfig,
-    messages: &mut Vec<ChatMessage>,
-    changed_files: &mut Vec<String>,
+    context: &AgentRunContext<'_>,
+    state: &mut AgentStepState<'_>,
     reporter: &mut R,
     confirmer: &mut C,
     content: &str,
     tool_call: ToolCall,
 ) -> Result<AgentStepOutcome> {
-    let tool = Tool::from_call(tool_call)?;
+    let AgentStepState {
+        messages,
+        changed_files,
+        file_work_gate,
+    } = &mut *state;
+    let config = context.config;
+    let requires_file_work = context.requires_file_work;
+
+    let tool = match Tool::from_call(tool_call) {
+        Ok(tool) => tool,
+        Err(error) => {
+            // A malformed call is the model's mistake, not a reason to end the
+            // run: show what it sent, tell it what was wrong, and let it retry.
+            reporter.line(format!(
+                "\n{COLOR_DIM}⚠️  Tool call rejected: {error}\n   model sent: {}{COLOR_RESET}",
+                content.trim()
+            ));
+            messages.push(ChatMessage {
+                role: crate::ollama::Role::Assistant,
+                content: content.to_string(),
+            });
+            messages.push(ChatMessage {
+                role: crate::ollama::Role::User,
+                content: format!(
+                    "That tool call was rejected: {error}. Reply again with one JSON object \
+                     using the exact argument names, e.g. \
+                     {{\"tool\":{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"Cargo.toml\"}}}}}}"
+                ),
+            });
+            return Ok(AgentStepOutcome::Continue);
+        }
+    };
     match tool {
         // `finish` is the model's way of saying "done": report the summary,
         // list changed files, and stop the loop.
         Tool::Finish { summary } => {
+            if file_work_gate.should_block_finish(
+                requires_file_work,
+                config.is_read_only,
+                changed_files.len(),
+            ) {
+                file_work_gate.record_retry();
+                messages.push(ChatMessage {
+                    role: crate::ollama::Role::User,
+                    content: FileWorkGate::feedback().to_string(),
+                });
+                reporter.line(format!(
+                    "\n{COLOR_DIM}⚠️  Shallow finish blocked: no files were written.{COLOR_RESET}"
+                ));
+                return Ok(AgentStepOutcome::Continue);
+            }
+
             reporter.line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
             print_changed_files(&config.cwd, changed_files, reporter);
             Ok(AgentStepOutcome::Finished)
@@ -351,6 +446,9 @@ fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequ
         options: Some(serde_json::json!({
             "temperature": AGENT_TEMPERATURE,
             "num_ctx": num_ctx,
+            // Never let a model stop after a few lazy tokens. The value is
+            // computed from the compacted prompt so it still fits num_ctx.
+            "num_predict": max_output_tokens(num_ctx, messages),
         })),
     }
 }
@@ -374,6 +472,13 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_the_full_model_context_unless_capped() {
+        assert_eq!(effective_context(262_144, None), 262_144);
+        assert_eq!(effective_context(262_144, Some(32_768)), 32_768);
+        assert_eq!(effective_context(2_048, None), MIN_CONTEXT_TOKENS);
+    }
     use crate::ollama::Role;
 
     #[test]

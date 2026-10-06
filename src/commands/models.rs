@@ -29,6 +29,12 @@ pub(crate) async fn list_models_lines(
     min_context: u64,
 ) -> Result<Vec<String>> {
     let tags = client.tags().await?;
+    if client.is_openai() {
+        return Ok(tags
+            .iter()
+            .map(|model| format!("{}  (served by {})", model.name, client.base_url))
+            .collect());
+    }
     Ok(list_models_lines_from_tags(&tags, min_context))
 }
 

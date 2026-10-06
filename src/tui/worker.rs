@@ -1,12 +1,11 @@
 //! Background agent/chat workers for the TUI.
 
 use super::text::strip_ansi;
-use crate::agent::{AgentConfig, Confirmer, Reporter};
+use crate::agent::{compact_context, max_output_tokens, AgentConfig, Confirmer, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
-use crate::constants::agent::MIN_CONTEXT_TOKENS;
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE, MAX_CHAT_HISTORY_MESSAGES};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
-use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
+use crate::ollama::{ChatMessage, ChatRequest, Delta, OllamaClient};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -153,10 +152,10 @@ async fn run_chat_worker(
         let _ = progress_tx.send(UiEvent::Log(msg.to_string()));
     };
     let selected = resolve_model(&client, &model_slot, &prefs, mem_budget, &on_status).await?;
-    let max_ctx = config.max_ctx.max(MIN_CONTEXT_TOKENS);
-    let num_ctx = resolve_model_context(&client, &selected.name)
-        .await?
-        .clamp(MIN_CONTEXT_TOKENS, max_ctx);
+    let num_ctx = crate::agent::effective_context(
+        resolve_model_context(&client, &selected.name).await?,
+        config.max_ctx,
+    );
 
     let mut messages = vec![ChatMessage {
         role: crate::ollama::Role::System,
@@ -165,6 +164,11 @@ async fn run_chat_worker(
     messages.extend(history);
     messages.truncate(MAX_CHAT_HISTORY_MESSAGES + 1);
 
+    // Auto rolling context for plain chat too: page out old turns when the
+    // estimated prompt would otherwise overflow the safe per-device window.
+    compact_context(&mut messages, num_ctx);
+
+    let num_predict = max_output_tokens(num_ctx, &messages);
     let request = ChatRequest {
         model: selected.name.clone(),
         messages,
@@ -174,19 +178,31 @@ async fn run_chat_worker(
         options: Some(serde_json::json!({
             "temperature": CHAT_TEMPERATURE,
             "num_ctx": num_ctx,
+            "num_predict": num_predict,
         })),
     };
 
     // The first request after an idle period can take a while because Ollama
     // has to load the model into memory. Tell the user what is happening
     // instead of leaving them staring at "thinking...".
-    let _ = tx.send(UiEvent::Log(
-        "⏳ Loading model into Ollama (first reply may take a moment)...".to_string(),
-    ));
-    let mut stream = Box::pin(client.chat_stream(request).await?);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let _ = tx.send(UiEvent::Chunk(chunk));
+    if !client.is_openai() {
+        let _ = tx.send(UiEvent::Log(
+            "⏳ Loading model into Ollama (first reply may take a moment)...".to_string(),
+        ));
+    }
+    let mut stream = client.chat_stream(request).await?;
+    let mut has_noted_thinking = false;
+    while let Some(delta) = stream.next().await {
+        match delta? {
+            Delta::Content(chunk) => {
+                let _ = tx.send(UiEvent::Chunk(chunk));
+            }
+            Delta::Thinking(_) if !has_noted_thinking => {
+                has_noted_thinking = true;
+                let _ = tx.send(UiEvent::Log("💭 thinking...".to_string()));
+            }
+            Delta::Thinking(_) => {}
+        }
     }
     Ok(())
 }

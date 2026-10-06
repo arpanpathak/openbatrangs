@@ -95,22 +95,26 @@ impl Tool {
         let args = &call.arguments;
         match call.name.as_str() {
             "list_files" => Ok(Self::ListFiles {
-                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
+                path: path_arg(args)?.unwrap_or(".").to_string(),
             }),
             "read_file" => Ok(Self::ReadFile {
-                path: required_string_arg(args, "path", "read_file")?.to_string(),
+                path: path_arg(args)?
+                    .ok_or_else(|| anyhow!("read_file requires 'path'"))?
+                    .to_string(),
                 max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
                     as usize,
             }),
             "grep_files" => Ok(Self::GrepFiles {
                 pattern: required_string_arg(args, "pattern", "grep_files")?.to_string(),
-                path: string_arg(args, "path")?.unwrap_or(".").to_string(),
+                path: path_arg(args)?.unwrap_or(".").to_string(),
                 max_results: optional_u64_arg(args, "max_results")?
                     .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
                     as usize,
             }),
             "write_file" => Ok(Self::WriteFile {
-                path: required_string_arg(args, "path", "write_file")?.to_string(),
+                path: path_arg(args)?
+                    .ok_or_else(|| anyhow!("write_file requires 'path'"))?
+                    .to_string(),
                 content: required_string_arg(args, "content", "write_file")?.to_string(),
             }),
             "run_command" => Ok(Self::RunCommand {
@@ -169,8 +173,28 @@ pub(super) fn parse_agent_response(content: &str) -> Result<AgentResponse> {
         .trim();
     let value: Value = serde_json::from_str(cleaned)
         .with_context(|| format!("invalid JSON from model: {content}"))?;
-    serde_json::from_value(value)
+    serde_json::from_value(nest_flat_tool_call(value))
         .with_context(|| format!("JSON did not match agent schema: {content}"))
+}
+
+/// Rewrites the flat shape some models use,
+/// `{"tool": "read_file", "arguments": {...}}`, into the documented
+/// `{"tool": {"name": "read_file", "arguments": {...}}}`. `args` and
+/// `parameters` are accepted in place of `arguments`. Anything else is
+/// returned unchanged.
+fn nest_flat_tool_call(mut value: Value) -> Value {
+    let Some(name) = value
+        .get("tool")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return value;
+    };
+    let arguments = ["arguments", "args", "parameters"]
+        .iter()
+        .find_map(|key| value.get_mut(*key).map(Value::take))
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    serde_json::json!({ "tool": { "name": name, "arguments": arguments } })
 }
 
 /// Require a string argument; error when it is missing or not a string.
@@ -180,6 +204,20 @@ pub(super) fn required_string_arg<'a>(
     tool_name: &str,
 ) -> Result<&'a str> {
     string_arg(args, key)?.ok_or_else(|| anyhow!("{tool_name} requires '{key}'"))
+}
+
+/// Names models use for a path argument besides the documented `path`.
+const PATH_ALIASES: [&str; 5] = ["path", "file_path", "filepath", "file", "filename"];
+
+/// Read the path argument under `path` or one of the names models commonly
+/// use instead, so a `file_path` from the model does not fail the call.
+pub(super) fn path_arg(args: &Value) -> Result<Option<&str>> {
+    for key in PATH_ALIASES {
+        if let Some(value) = string_arg(args, key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 /// Read an optional string argument.
@@ -233,6 +271,25 @@ mod tests {
     #[test]
     fn rejects_invalid_agent_response() {
         assert!(parse_agent_response("not json").is_err());
+    }
+
+    #[test]
+    fn parses_the_flat_tool_call_shape() {
+        let response =
+            parse_agent_response(r#"{"tool": "read_file", "arguments": {"path": "Cargo.toml"}}"#)
+                .expect("flat tool call should parse");
+        let tool = Tool::from_call(response.tool.expect("tool call")).expect("valid tool");
+        assert_eq!(tool.describe(), "read_file → Cargo.toml");
+    }
+
+    #[test]
+    fn accepts_file_path_as_the_path_argument() {
+        let call = ToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"file_path": "Cargo.toml"}),
+        };
+        let tool = Tool::from_call(call).expect("file_path should be accepted");
+        assert_eq!(tool.describe(), "read_file → Cargo.toml");
     }
 
     #[test]

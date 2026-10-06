@@ -48,6 +48,9 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
     for (key, value) in agent_sandbox_env(root) {
         process.env(key, value);
     }
+    for (key, value) in host_tool_env() {
+        process.env(key, value);
+    }
     let output = tokio::time::timeout(timeout, process.output())
         .await
         .map_err(|_| anyhow!("command timed out after {timeout_secs}s"))?
@@ -66,6 +69,39 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
         .unwrap_or_else(|| "signal".to_string());
     text.push_str(&format!("\n[exit code {exit_code}]\n"));
     Ok(truncate(text))
+}
+
+/// Keeps the user's installed toolchains visible inside the sandbox.
+///
+/// `$HOME` points into the workspace, so a login shell would no longer find
+/// `~/.cargo/bin`, and rustup would look for toolchains under the sandbox. The
+/// model then tries to install Rust again (1.6 GB per workspace). This puts
+/// the real `~/.cargo/bin` and `~/.local/bin` first on `PATH` and points
+/// `RUSTUP_HOME` at the real `~/.rustup`, so installed tools just work while
+/// caches and new installs still land in the sandbox.
+fn host_tool_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = [".cargo/bin", ".local/bin"]
+        .iter()
+        .map(|dir| home.join(dir))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    paths.extend(
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let mut env = Vec::new();
+    if let Ok(path) = std::env::join_paths(paths) {
+        env.push(("PATH", path));
+    }
+    let rustup = home.join(".rustup");
+    if rustup.is_dir() {
+        env.push(("RUSTUP_HOME", rustup.into_os_string()));
+    }
+    env
 }
 
 /// Create every sandbox directory before a command runs.
@@ -178,6 +214,23 @@ mod tests {
         assert!(output.contains(&expected_cache.to_string_lossy().to_string()));
         assert!(output.contains(&expected_cargo.to_string_lossy().to_string()));
         assert!(output.contains(&expected_tmp.to_string_lossy().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_rust_stays_visible_in_the_sandbox() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        if !home.join(".cargo/bin/rustc").exists() {
+            return;
+        }
+        let root = temp_dir();
+        let output = run_command(&root, "command -v rustc && rustc --version", 30)
+            .await
+            .unwrap();
+        assert!(output.contains(".cargo/bin/rustc"), "{output}");
+        assert!(output.contains("[exit code 0]"), "{output}");
         fs::remove_dir_all(root).unwrap();
     }
 

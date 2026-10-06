@@ -28,6 +28,9 @@ pub(crate) async fn resolve_model(
     mem_budget: u64,
     on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<ModelScore> {
+    if client.is_openai() {
+        return select_served_model(client, model_slot.as_ref().or(prefs.model.as_ref())).await;
+    }
     match model_slot {
         Some(name) => {
             let explicit = ModelPrefs {
@@ -38,6 +41,31 @@ pub(crate) async fn resolve_model(
         }
         None => select_model(client, prefs, mem_budget, on_status).await,
     }
+}
+
+/// Pick a model on an OpenAI-compatible server: the requested one, or the
+/// first the server lists. The server owns its models, so nothing is scored
+/// or pulled.
+async fn select_served_model(client: &OllamaClient, wanted: Option<&String>) -> Result<ModelScore> {
+    let served = client.tags().await?;
+    let model = match wanted {
+        Some(name) => served.iter().find(|model| &model.name == name).ok_or_else(|| {
+            let names: Vec<&str> = served.iter().map(|model| model.name.as_str()).collect();
+            anyhow!("'{name}' is not served at {}; it serves: {}", client.base_url, names.join(", "))
+        })?,
+        None => served
+            .first()
+            .ok_or_else(|| anyhow!("{} serves no models", client.base_url))?,
+    };
+    Ok(ModelScore {
+        name: model.name.clone(),
+        size_bytes: 0,
+        parameter_size: "served".to_string(),
+        context_length: resolve_model_context(client, &model.name).await?,
+        quantization: "served".to_string(),
+        score: 100.0,
+        reasons: vec![format!("served by {}", client.base_url)],
+    })
 }
 
 /// Select the best model, auto-pulling a fallback when needed.

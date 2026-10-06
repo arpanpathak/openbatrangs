@@ -23,8 +23,8 @@
 //! - Ollama `/api/chat` streaming API: <https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion>
 
 use super::reporter::Reporter;
-use crate::constants::ansi::{ANSI_GREEN_CHECK, COLOR_CYAN, COLOR_RESET};
-use crate::ollama::{ChatRequest, OllamaClient};
+use crate::constants::ansi::{ANSI_GREEN_CHECK, COLOR_CYAN, COLOR_DIM, COLOR_RESET};
+use crate::ollama::{ChatRequest, Delta, OllamaClient};
 use anyhow::Result;
 use futures_util::StreamExt;
 
@@ -36,8 +36,8 @@ use futures_util::StreamExt;
 /// - `client`: Ollama client used to open the chat stream.
 /// - `request`: chat request; `stream` is forced to `true` by the client.
 /// - `reporter`: receives streaming chunks and final lines.
-/// - `show_thinking`: when `false`, the `thought` field is extracted but not
-///   printed to the user.
+/// - `show_thinking`: when `false`, the `thought` field and the model's own
+///   reasoning (thinking models) are not printed to the user.
 ///
 /// # Returns
 ///
@@ -48,16 +48,38 @@ pub(super) async fn stream_model_response<R: Reporter>(
     reporter: &mut R,
     show_thinking: bool,
 ) -> Result<(String, bool)> {
-    let mut stream = Box::pin(client.chat_stream(request).await?);
+    let mut stream = client.chat_stream(request).await?;
     let mut buffer = String::new();
     let mut thought = StreamState::new("thought", show_thinking);
     let mut answer = StreamState::new("answer", true);
+    let mut is_reasoning = false;
 
     while let Some(delta) = stream.next().await {
-        let delta = delta?;
-        buffer.push_str(&delta);
-        thought.feed(reporter, &buffer)?;
-        answer.feed(reporter, &buffer)?;
+        match delta? {
+            Delta::Thinking(text) => {
+                if show_thinking {
+                    if !is_reasoning {
+                        reporter.chunk(&format!("💭 {COLOR_DIM}"));
+                        is_reasoning = true;
+                    }
+                    reporter.chunk(&text);
+                }
+            }
+            Delta::Content(text) => {
+                if is_reasoning {
+                    reporter.chunk(COLOR_RESET);
+                    reporter.line(String::new());
+                    is_reasoning = false;
+                }
+                buffer.push_str(&text);
+                thought.feed(reporter, &buffer)?;
+                answer.feed(reporter, &buffer)?;
+            }
+        }
+    }
+    if is_reasoning {
+        reporter.chunk(COLOR_RESET);
+        reporter.line(String::new());
     }
 
     let answer_was_streamed = answer.did_print();

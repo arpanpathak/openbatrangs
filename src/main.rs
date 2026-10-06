@@ -27,7 +27,7 @@ mod tui;
 #[cfg(test)]
 mod test_support;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
 use ollama::OllamaClient;
@@ -35,7 +35,7 @@ use ollama::OllamaClient;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = OllamaClient::new(&cli.ollama_url)?;
+    let client = build_client(&cli)?;
 
     match &cli.command {
         Some(Commands::Setup) => commands::setup(&client).await?,
@@ -62,4 +62,28 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create the model client: an OpenAI-compatible server when `--thor` or
+/// `--openai-url` is given, Ollama otherwise.
+fn build_client(cli: &Cli) -> Result<OllamaClient> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let (url, key_file) = match (&cli.openai_url, cli.thor) {
+        (Some(url), _) => (url.clone(), cli.api_key_file.clone()),
+        (None, true) => (
+            constants::cli::THOR_OPENAI_URL.to_string(),
+            cli.api_key_file
+                .clone()
+                .or_else(|| home.map(|home| home.join(constants::cli::THOR_KEY_FILE))),
+        ),
+        (None, false) => return OllamaClient::new(&cli.ollama_url),
+    };
+    let key = key_file
+        .map(|path| {
+            std::fs::read_to_string(&path)
+                .map(|key| key.trim().to_string())
+                .with_context(|| format!("cannot read the access key from {}", path.display()))
+        })
+        .transpose()?;
+    OllamaClient::openai(&url, key, !cli.is_thinking_disabled)
 }

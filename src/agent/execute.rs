@@ -19,6 +19,7 @@
 //! - Human-in-the-loop safety: <https://en.wikipedia.org/wiki/Human-in-the-loop>
 
 use super::confirm::Confirmer;
+use super::quality::placeholder_reason;
 use super::reporter::Reporter;
 use super::tool::Tool;
 use super::AgentConfig;
@@ -69,6 +70,11 @@ pub(super) async fn execute_tool<C: Confirmer>(
         } => tools::grep_files(cwd, pattern, path, *max_results),
         Tool::WriteFile { path, content } => {
             ensure_not_read_only(config)?;
+            if let Some(reason) = placeholder_reason(content) {
+                bail!(
+                    "quality gate: refusing to write '{path}' because the content looks like a placeholder ({reason}). Write the complete implementation."
+                );
+            }
             confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
             let result = tools::write_file(cwd, path, content)?;
             changed_files.push(path.clone());
@@ -172,7 +178,7 @@ mod tests {
             is_read_only: false,
             should_confirm: false,
             show_thinking: true,
-            max_ctx: 8_192,
+            max_ctx: Some(8_192),
         };
         let mut changed = Vec::new();
         let mut confirmer = StdioConfirmer;
@@ -204,6 +210,32 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn execute_tool_rejects_placeholder_write() {
+        let root = temp_root();
+        let config = test_config(&root, false);
+        let mut changed = Vec::new();
+        let mut confirmer = StdioConfirmer;
+
+        let result = execute_tool(
+            &config,
+            &root,
+            &Tool::WriteFile {
+                path: "README.md".to_string(),
+                content: "This is a placeholder for the full answer.".to_string(),
+            },
+            &mut changed,
+            &mut confirmer,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("quality gate"));
+        assert!(!root.join("README.md").exists());
+        assert!(changed.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_config(root: &std::path::Path, is_read_only: bool) -> AgentConfig {
         AgentConfig {
             cwd: root.to_path_buf(),
@@ -211,7 +243,7 @@ mod tests {
             is_read_only,
             should_confirm: false,
             show_thinking: true,
-            max_ctx: 8_192,
+            max_ctx: Some(8_192),
         }
     }
 
@@ -238,7 +270,7 @@ mod tests {
             is_read_only: false,
             should_confirm: true,
             show_thinking: true,
-            max_ctx: 8_192,
+            max_ctx: Some(8_192),
         }
     }
 

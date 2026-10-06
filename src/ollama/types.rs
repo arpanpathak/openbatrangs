@@ -93,6 +93,15 @@ pub struct PullRequest {
     pub stream: bool,
 }
 
+/// One piece of a streamed reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// Reply text.
+    Content(String),
+    /// The model's reasoning before the reply (thinking models only).
+    Thinking(String),
+}
+
 /// A meaningful event extracted from one Ollama NDJSON stream line.
 pub enum StreamLine {
     /// Assistant content delta.

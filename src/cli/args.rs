@@ -1,6 +1,5 @@
 //! Clap argument definitions and default values.
 
-use crate::constants::agent::MAX_CONTEXT_TOKENS;
 use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -21,6 +20,24 @@ pub(crate) struct Cli {
     /// Ollama server URL.
     #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
     pub(crate) ollama_url: String,
+
+    /// Use Nemotron on the Thor: same as
+    /// `--openai-url http://127.0.0.1:8079/v1 --api-key-file ~/.config/thor-chat/api-key`.
+    #[arg(long, global = true)]
+    pub(crate) thor: bool,
+
+    /// Use an OpenAI-compatible server (llama-server, vLLM, trtllm-serve)
+    /// instead of Ollama, e.g. `http://127.0.0.1:8079/v1`.
+    #[arg(long, global = true, value_name = "URL")]
+    pub(crate) openai_url: Option<String>,
+
+    /// File holding the bearer key for `--openai-url`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) api_key_file: Option<PathBuf>,
+
+    /// Turn the model's thinking off (OpenAI-compatible servers only).
+    #[arg(long = "no-think", global = true)]
+    pub(crate) is_thinking_disabled: bool,
 
     /// Model to use; auto-discovered when omitted.
     #[arg(short, long, global = true)]
@@ -50,9 +67,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value_t = DEFAULT_MIN_CONTEXT)]
     pub(crate) min_context: usize,
 
-    /// Maximum context window sent to the model (lower uses less memory).
-    #[arg(long = "max-ctx", global = true, default_value_t = MAX_CONTEXT_TOKENS)]
-    pub(crate) max_ctx: u64,
+    /// Upper limit on the context window sent to the model; by default the
+    /// model's own context length is used in full (lower uses less memory).
+    #[arg(long = "max-ctx", global = true)]
+    pub(crate) max_ctx: Option<u64>,
 
     /// Optional subcommand (agent, list-models, doctor, setup, pull).
     #[command(subcommand)]
@@ -94,7 +112,7 @@ mod tests {
         assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
         assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
         assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
-        assert_eq!(cli.max_ctx, MAX_CONTEXT_TOKENS);
+        assert_eq!(cli.max_ctx, None);
         assert_eq!(cli.cwd, PathBuf::from("."));
         assert!(!cli.is_read_only);
         assert!(!cli.should_confirm);

@@ -104,10 +104,19 @@ pub const LOG_LOAD_CHUNK: usize = 500;
 pub const RAW_CHAT_RENDER_THRESHOLD: usize = 50_000;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
-pub const CHAT_SYSTEM_PROMPT: &str = "You are openBatarangs, an expert coding assistant in chat mode. Answer coding questions and write complete, production-quality code when asked. Never give hello-world stubs, placeholders, or toy examples: implement the requested feature in full with real logic, proper error handling, and idiomatic code. Write clean code: use guard clauses and early returns, avoid deeply nested conditionals, keep functions focused, and use descriptive names. Match the user's language and project context, be practical and concise, and do not mention tools.";
+pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a coding assistant.
+
+- Implement complete code; no stubs, placeholders, or toy examples unless explicitly requested.
+- For design/docs requests, write structured documents covering architecture, data flow, interfaces, trade-offs, and implementation steps.
+- Use any project context the user provides.
+"#;
 
 /// Sampling temperature for plain chat completions.
-pub const CHAT_TEMPERATURE: f64 = 0.7;
+///
+/// Lower than the old default so small local models produce longer, more
+/// coherent code and documentation instead of drifting after a few hundred
+/// tokens.
+pub const CHAT_TEMPERATURE: f64 = 0.3;
 
 /// Terminal emulators tried, in order, when opening a file in `vim`.
 pub const VIM_TERMINALS: &[&str] = &[

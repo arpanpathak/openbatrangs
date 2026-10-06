@@ -42,6 +42,13 @@ pub(crate) async fn ensure_ollama(client: &OllamaClient) -> Result<()> {
     if client.is_available().await {
         return Ok(());
     }
+    if client.is_openai() {
+        bail!(
+            "Cannot reach the model server at {}, or the access key was refused.\n\
+             On yahboom check the tunnel: `systemctl --user status thor-model-tunnel`.",
+            client.base_url
+        );
+    }
 
     if has_ollama_binary() {
         println!("🔄 Ollama server is not running — starting `ollama serve`...");
