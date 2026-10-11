@@ -129,7 +129,13 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
 
     if client.is_openai() {
         return native::run_native_agent(
-            config, client, model, model_context, task, reporter, confirmer,
+            config,
+            client,
+            model,
+            model_context,
+            task,
+            reporter,
+            confirmer,
         )
         .await;
     }

@@ -2,9 +2,7 @@
 
 use super::chat::ChatRenderCache;
 use super::session::SessionLog;
-use super::{
-    chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, ScrollMode, UiEvent,
-};
+use super::{chat_visual_line_indices, open_in_vim, run_agent_worker, ScrollMode, UiEvent};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
@@ -127,8 +125,6 @@ pub(super) struct App {
     pub(super) tokens_per_sec: f64,
     /// Handle to the currently spawned background Tokio task (agent/pull/setup).
     pub(super) current_task: Option<JoinHandle<()>>,
-    /// Pre-split banner text lines, with ANSI codes stripped for rendering.
-    pub(super) banner_lines: Vec<String>,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
     /// Characters accumulated in the current rate-measurement window.
@@ -151,8 +147,6 @@ impl App {
     ///
     /// A fully initialized `App` ready for the event loop.
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
-        let banner = strip_ansi(&crate::banner::banner_text());
-        let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut log = SessionLog::new(MAX_LOG_LINES);
         log.push(String::new());
         log.push(
@@ -205,7 +199,6 @@ impl App {
             stream_started_at: None,
             tokens_per_sec: 0.0,
             current_task: None,
-            banner_lines,
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,

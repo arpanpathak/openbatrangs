@@ -221,8 +221,12 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
             "data: [DONE]\n\n",
         ));
-        assert!(matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Thinking(text)) if text == "hmm"));
-        assert!(matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Content(text)) if text == "{}"));
+        assert!(
+            matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Thinking(text)) if text == "hmm")
+        );
+        assert!(
+            matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Content(text)) if text == "{}")
+        );
         assert!(matches!(drain_events(&mut buffer), EventDrain::Done));
     }
 
@@ -241,20 +245,32 @@ mod tests {
     #[test]
     fn model_list_keeps_file_names() {
         let body = json!({"data": [{"id": "/home/a/models/Nemotron-Q8_0.gguf"}, {"id": "plain"}]});
-        let names: Vec<String> = models_from_list(&body).into_iter().map(|m| m.name).collect();
+        let names: Vec<String> = models_from_list(&body)
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
         assert_eq!(names, vec!["Nemotron-Q8_0", "plain"]);
     }
 
     #[test]
     fn props_become_context_length() {
         let props = json!({"default_generation_settings": {"n_ctx": 1_048_576}});
-        assert_eq!(show_from_props(&props)["details"]["context_length"], 1_048_576);
+        assert_eq!(
+            show_from_props(&props)["details"]["context_length"],
+            1_048_576
+        );
         assert_eq!(show_from_props(&json!({})), json!({}));
     }
 
     #[test]
     fn root_drops_v1() {
-        assert_eq!(server_root("http://127.0.0.1:8079/v1"), "http://127.0.0.1:8079");
-        assert_eq!(server_root("http://127.0.0.1:8079"), "http://127.0.0.1:8079");
+        assert_eq!(
+            server_root("http://127.0.0.1:8079/v1"),
+            "http://127.0.0.1:8079"
+        );
+        assert_eq!(
+            server_root("http://127.0.0.1:8079"),
+            "http://127.0.0.1:8079"
+        );
     }
 }

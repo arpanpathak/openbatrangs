@@ -110,6 +110,16 @@ impl OllamaClient {
         matches!(self.api, Api::OpenAi { .. })
     }
 
+    /// Whether the model is asked to think before answering.
+    ///
+    /// Only an OpenAI-compatible server takes this flag, and only `--no-think`
+    /// clears it. Showing or hiding the reasoning is a separate concern: the
+    /// model must keep thinking for its instructions to hold, so a display
+    /// toggle never changes what is sent.
+    pub fn requests_thinking(&self) -> bool {
+        matches!(self.api, Api::OpenAi { think: true, .. })
+    }
+
     /// Attach the bearer token, if any.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api {
@@ -287,7 +297,8 @@ impl OllamaClient {
         request: &ChatRequest,
         think: bool,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
-        self.chat_stream_body(openai::chat_body(request, think)).await
+        self.chat_stream_body(openai::chat_body(request, think))
+            .await
     }
 
     /// Stream a chat completion from an OpenAI-compatible server using a
@@ -659,5 +670,19 @@ mod tests {
         let tags = client.tags().await.unwrap();
         assert_eq!(tags[0].name, "Nemotron-Q8_0");
         assert!(client.pull("x", &|_| {}).await.is_err());
+    }
+
+    #[test]
+    fn only_the_openai_flag_decides_whether_the_model_thinks() {
+        let openai = |think| {
+            OllamaClient::openai("http://127.0.0.1:8079/v1", None, think)
+                .unwrap()
+                .requests_thinking()
+        };
+        assert!(openai(true));
+        assert!(!openai(false));
+        assert!(!OllamaClient::new("http://127.0.0.1:11434")
+            .unwrap()
+            .requests_thinking());
     }
 }

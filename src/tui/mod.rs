@@ -27,7 +27,7 @@ mod ui;
 mod worker;
 
 pub(super) use text::{
-    chat_visual_line_indices, extract_path_from_line, open_in_vim, split_command, strip_ansi,
+    chat_visual_line_indices, extract_path_from_line, open_in_vim, split_command,
     text_wrapped_height, wrap_text_to_lines,
 };
 pub(super) use worker::{run_agent_worker, run_pull_worker, run_setup_worker, UiEvent};
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn stripped_banner_has_content_for_tui() {
-        let banner = strip_ansi(&banner::banner_text());
+        let banner = text::strip_ansi(&banner::banner_text());
         assert!(!banner.contains('\x1b'));
         assert!(banner.lines().count() > 5);
         assert!(banner.contains('⣿') || banner.contains('█'));

@@ -151,6 +151,8 @@ struct Run<'a, R, C> {
     model: &'a str,
     /// Context window, in tokens.
     num_ctx: u64,
+    /// Whether the model is asked to think, from `--no-think` on the client.
+    think: bool,
     /// Whether the task asks for file changes.
     needs_files: bool,
     /// Conversation sent to the model.
@@ -189,12 +191,7 @@ where
         self.reporter
             .line(step_header(step, self.config.max_steps, self.model));
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
-        let body = request_body(
-            self.model,
-            &self.messages,
-            self.num_ctx,
-            self.config.show_thinking,
-        );
+        let body = request_body(self.model, &self.messages, self.num_ctx, self.think);
         let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
             .await
             .with_context(|| format!("model call failed at step {step}"))?;
@@ -276,7 +273,10 @@ where
                 )
                 .await;
                 self.reporter.line(result.clone());
-                self.messages.push(Message::Tool { id, content: result });
+                self.messages.push(Message::Tool {
+                    id,
+                    content: result,
+                });
                 None
             }
         }
@@ -342,15 +342,17 @@ where
     R: Reporter,
     C: Confirmer,
 {
+    let think = client.requests_thinking();
     let run = Run {
         config,
         client,
         model,
         num_ctx: effective_context(model_context, config.max_ctx),
+        think,
         needs_files: requires_file_work(task),
         messages: vec![
             Message::System(NATIVE_SYSTEM_PROMPT.to_string()),
-            Message::User(initial_user_message(config, task)),
+            Message::User(initial_user_message(config, task, think)),
         ],
         changed: Vec::new(),
         gate: FileWorkGate::default(),
@@ -361,8 +363,18 @@ where
 }
 
 /// The user turn that opens the conversation.
-fn initial_user_message(config: &AgentConfig, task: &str) -> String {
-    format!("Workspace root: {}\n\nTask:\n{task}", config.cwd.display())
+///
+/// A model told not to think stops honouring rules that only live in the
+/// system turn: with `enable_thinking: false`, Nemotron-3-Nano writes to the
+/// workspace root although the system prompt says to use `out/`, and it obeys
+/// again the moment the same words arrive in the user turn. So the task
+/// carries the instructions whenever thinking is off.
+fn initial_user_message(config: &AgentConfig, task: &str, think: bool) -> String {
+    let task = format!("Workspace root: {}\n\nTask:\n{task}", config.cwd.display());
+    match think {
+        true => task,
+        false => format!("Instructions (highest priority):\n{NATIVE_SYSTEM_PROMPT}\n\n{task}"),
+    }
 }
 
 /// Header printed before each model turn.
@@ -594,6 +606,7 @@ fn tools_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn assembles_tool_call_fragments_by_index() {
@@ -690,5 +703,39 @@ mod tests {
         };
         assert_eq!(message.to_json()["role"].as_str(), Some("tool"));
         assert_eq!(message.to_json()["tool_call_id"].as_str(), Some("call_1"));
+    }
+
+    fn config() -> AgentConfig {
+        AgentConfig {
+            cwd: PathBuf::from("/tmp/workspace"),
+            max_steps: 4,
+            is_read_only: false,
+            should_confirm: false,
+            show_thinking: false,
+            max_ctx: None,
+        }
+    }
+
+    #[test]
+    fn the_task_carries_the_rules_only_when_thinking_is_off() {
+        let config = config();
+        let thinking = initial_user_message(&config, "write it", true);
+        assert!(thinking.starts_with("Workspace root: /tmp/workspace"));
+        assert!(!thinking.contains(NATIVE_SYSTEM_PROMPT));
+
+        let not_thinking = initial_user_message(&config, "write it", false);
+        assert!(not_thinking.contains(NATIVE_SYSTEM_PROMPT));
+        assert!(not_thinking.ends_with("Task:\nwrite it"));
+    }
+
+    #[test]
+    fn the_request_carries_the_thinking_flag_it_was_given() {
+        let messages = vec![Message::System("rules".to_string())];
+        let flag = |think| {
+            request_body("m", &messages, 8192, think)["chat_template_kwargs"]["enable_thinking"]
+                .clone()
+        };
+        assert_eq!(flag(false), json!(false));
+        assert_eq!(flag(true), json!(true));
     }
 }
