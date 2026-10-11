@@ -128,9 +128,11 @@ struct Turn {
 impl Turn {
     /// Merge one incremental tool-call chunk into the turn.
     fn absorb(&mut self, delta: ToolCallDelta) {
-        self.calls
-            .resize_with(delta.index as usize + 1, Invocation::default);
-        let call = &mut self.calls[delta.index as usize];
+        let index = delta.index as usize;
+        if self.calls.len() <= index {
+            self.calls.resize_with(index + 1, Invocation::default);
+        }
+        let call = &mut self.calls[index];
         if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
             call.id = id;
         }
@@ -645,6 +647,22 @@ mod tests {
         assert_eq!(turn.calls.len(), 2);
         assert_eq!(turn.calls[1].name, "run_command");
         assert_eq!(turn.calls[0].name, "");
+    }
+
+    #[test]
+    fn a_piece_of_an_earlier_call_keeps_the_later_ones() {
+        let mut turn = Turn::default();
+        let piece = |index, arguments: &str| ToolCallDelta {
+            index,
+            arguments: arguments.to_string(),
+            ..ToolCallDelta::default()
+        };
+        turn.absorb(piece(0, "{\"path\":"));
+        turn.absorb(piece(1, "{}"));
+        turn.absorb(piece(0, "\"a.rs\"}"));
+        assert_eq!(turn.calls.len(), 2);
+        assert_eq!(turn.calls[0].arguments, "{\"path\":\"a.rs\"}");
+        assert_eq!(turn.calls[1].arguments, "{}");
     }
 
     #[test]

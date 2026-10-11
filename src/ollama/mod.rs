@@ -194,6 +194,25 @@ impl OllamaClient {
         Ok(body.models)
     }
 
+    /// Metadata for a model on an OpenAI-compatible server: its entry in
+    /// `/models` when that carries the context window (TensorRT Edge-LLM),
+    /// else `/props` (llama-server), else nothing.
+    async fn show_openai(&self, name: &str) -> Value {
+        let listed = self
+            .get_openai_json(format!("{}/models", self.base_url))
+            .await
+            .ok()
+            .and_then(|list| openai::show_from_models(&list, name));
+        if let Some(show) = listed {
+            return show;
+        }
+        let root = openai::server_root(&self.base_url);
+        match self.get_openai_json(format!("{root}/props")).await {
+            Ok(props) => openai::show_from_props(&props),
+            Err(_) => serde_json::json!({}),
+        }
+    }
+
     /// Fetch detailed metadata for a single model.
     ///
     /// # Arguments
@@ -203,11 +222,7 @@ impl OllamaClient {
     /// Raw JSON metadata from `/api/show`.
     pub async fn show(&self, name: &str) -> Result<Value> {
         if self.is_openai() {
-            let root = openai::server_root(&self.base_url);
-            return match self.get_openai_json(format!("{root}/props")).await {
-                Ok(props) => Ok(openai::show_from_props(&props)),
-                Err(_) => Ok(serde_json::json!({})),
-            };
+            return Ok(self.show_openai(name).await);
         }
         let response = self
             .http
@@ -670,6 +685,33 @@ mod tests {
         let tags = client.tags().await.unwrap();
         assert_eq!(tags[0].name, "Nemotron-Q8_0");
         assert!(client.pull("x", &|_| {}).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn openai_show_reads_the_context_from_the_list_then_from_props() {
+        let base_url = spawn_mock_server(|path| match path {
+            "/v1/models" => MockResponse::json(
+                "200 OK",
+                r#"{"data":[{"id":"qwen","max_model_len":65536},{"id":"gguf"}]}"#,
+            ),
+            "/props" => MockResponse::json(
+                "200 OK",
+                r#"{"default_generation_settings":{"n_ctx":4096}}"#,
+            ),
+            _ => MockResponse::text("404 Not Found", "no"),
+        })
+        .await;
+        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
+        let context = |show: Value| show["details"]["context_length"].clone();
+        assert_eq!(context(client.show("qwen").await.unwrap()), 65_536);
+        assert_eq!(context(client.show("gguf").await.unwrap()), 4_096);
+    }
+
+    #[tokio::test]
+    async fn openai_show_is_empty_when_the_server_says_nothing() {
+        let base_url = spawn_mock_server(|_| MockResponse::text("404 Not Found", "no")).await;
+        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
+        assert_eq!(client.show("qwen").await.unwrap(), serde_json::json!({}));
     }
 
     #[test]
