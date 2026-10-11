@@ -129,9 +129,11 @@ impl Turn {
     /// Merge one incremental tool-call chunk into the turn.
     fn absorb(&mut self, delta: ToolCallDelta) {
         let index = delta.index as usize;
+
         if self.calls.len() <= index {
             self.calls.resize_with(index + 1, Invocation::default);
         }
+
         let call = &mut self.calls[index];
         if let Some(id) = delta.id.filter(|id| !id.is_empty()) {
             call.id = id;
@@ -657,9 +659,11 @@ mod tests {
             arguments: arguments.to_string(),
             ..ToolCallDelta::default()
         };
+
         turn.absorb(piece(0, "{\"path\":"));
         turn.absorb(piece(1, "{}"));
         turn.absorb(piece(0, "\"a.rs\"}"));
+
         assert_eq!(turn.calls.len(), 2);
         assert_eq!(turn.calls[0].arguments, "{\"path\":\"a.rs\"}");
         assert_eq!(turn.calls[1].arguments, "{}");

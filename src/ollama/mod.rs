@@ -203,9 +203,11 @@ impl OllamaClient {
             .await
             .ok()
             .and_then(|list| openai::show_from_models(&list, name));
+
         if let Some(show) = listed {
             return show;
         }
+
         let root = openai::server_root(&self.base_url);
         match self.get_openai_json(format!("{root}/props")).await {
             Ok(props) => openai::show_from_props(&props),
@@ -703,6 +705,7 @@ mod tests {
         .await;
         let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
         let context = |show: Value| show["details"]["context_length"].clone();
+
         assert_eq!(context(client.show("qwen").await.unwrap()), 65_536);
         assert_eq!(context(client.show("gguf").await.unwrap()), 4_096);
     }
@@ -711,6 +714,7 @@ mod tests {
     async fn openai_show_is_empty_when_the_server_says_nothing() {
         let base_url = spawn_mock_server(|_| MockResponse::text("404 Not Found", "no")).await;
         let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
+
         assert_eq!(client.show("qwen").await.unwrap(), serde_json::json!({}));
     }
 

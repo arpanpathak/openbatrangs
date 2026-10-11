@@ -272,6 +272,7 @@ mod tests {
             {"id": "qwen", "max_model_len": 65_536},
             {"id": "plain"}
         ]});
+
         assert_eq!(
             show_from_models(&list, "qwen"),
             Some(json!({"details": {"context_length": 65_536}}))

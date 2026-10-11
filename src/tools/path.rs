@@ -30,10 +30,12 @@ use std::path::{Component, Path, PathBuf};
 pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
     let requested = Path::new(path);
     let canonical = canonical_root(root).ok();
+
     let inside = requested
         .strip_prefix(root)
         .ok()
         .or_else(|| requested.strip_prefix(canonical.as_deref()?).ok());
+
     let relative = match (inside, requested.is_absolute()) {
         (Some(inside), _) => inside,
         (None, false) => requested,
@@ -41,12 +43,14 @@ pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
             bail!("that path is outside the workspace; use paths relative to the workspace")
         }
     };
+
     if relative
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
         bail!("'..' is not allowed in tool paths");
     }
+
     Ok(root.join(relative))
 }
 
@@ -85,6 +89,7 @@ mod tests {
     #[test]
     fn reads_an_absolute_path_inside_the_workspace_as_relative() {
         let root = Path::new("/tmp/project");
+
         assert_eq!(
             resolve_in_root(root, "/tmp/project/src/main.rs").unwrap(),
             Path::new("/tmp/project/src/main.rs")
@@ -98,10 +103,13 @@ mod tests {
     fn reads_the_canonical_form_of_a_relative_root() {
         let base = crate::test_support::unique_temp_dir("openbatrangs-path-canonical");
         fs::create_dir_all(base.join("src")).unwrap();
+
         let canonical = fs::canonicalize(&base).unwrap();
         let dotted = base.join("src").join("..");
         let resolved = resolve_in_root(&dotted, canonical.join("a.rs").to_str().unwrap());
+
         assert_eq!(resolved.unwrap(), dotted.join("a.rs"));
+
         fs::remove_dir_all(&base).unwrap();
     }
 
