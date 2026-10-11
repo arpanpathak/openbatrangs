@@ -21,8 +21,8 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
     pub(crate) ollama_url: String,
 
-    /// Use Nemotron on the Thor: same as
-    /// `--openai-url http://127.0.0.1:8079/v1 --api-key-file ~/.config/thor-chat/api-key`.
+    /// Use the models on the Thor over Tailscale: same as
+    /// `--openai-url https://arpanpathak.taildb9a39.ts.net/v1 --api-key-file ~/.config/thor-chat/api-key`.
     #[arg(long, global = true)]
     pub(crate) thor: bool,
 

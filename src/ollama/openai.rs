@@ -158,6 +158,20 @@ pub(super) fn server_root(base_url: &str) -> &str {
     base_url.strip_suffix("/v1").unwrap_or(base_url)
 }
 
+/// Shape one model's entry in a `/models` body like Ollama's `/api/show`.
+///
+/// TensorRT Edge-LLM has no `/props`; it reports each model's context window
+/// in the list, as `max_model_len`.
+pub(super) fn show_from_models(list: &Value, name: &str) -> Option<Value> {
+    list.get("data")?
+        .as_array()?
+        .iter()
+        .find(|model| model.get("id").and_then(Value::as_str) == Some(name))?
+        .get("max_model_len")
+        .and_then(Value::as_u64)
+        .map(|context| json!({ "details": { "context_length": context } }))
+}
+
 /// Shape a `/props` body like Ollama's `/api/show`, so context lookup works
 /// for both servers.
 pub(super) fn show_from_props(props: &Value) -> Value {
@@ -250,6 +264,22 @@ mod tests {
             .map(|m| m.name)
             .collect();
         assert_eq!(names, vec!["Nemotron-Q8_0", "plain"]);
+    }
+
+    #[test]
+    fn a_listed_model_reports_its_context_length() {
+        let list = json!({"data": [
+            {"id": "qwen", "max_model_len": 65_536},
+            {"id": "plain"}
+        ]});
+
+        assert_eq!(
+            show_from_models(&list, "qwen"),
+            Some(json!({"details": {"context_length": 65_536}}))
+        );
+        assert_eq!(show_from_models(&list, "plain"), None);
+        assert_eq!(show_from_models(&list, "other"), None);
+        assert_eq!(show_from_models(&json!({}), "qwen"), None);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! The model can ask the agent to read, write, list, or grep files. Because
 //! the model is an untrusted input, every path must be validated before it
-//! touches the filesystem: absolute paths and `..` traversal are rejected, and
-//! symlinks are canonicalized so they cannot escape the workspace.
+//! touches the filesystem: paths outside the workspace and `..` traversal are
+//! rejected, and symlinks are canonicalized so they cannot escape the workspace.
 //!
 //! ## References
 //!
@@ -16,23 +16,42 @@ use std::path::{Component, Path, PathBuf};
 
 /// Resolve a model-supplied path safely inside `root`.
 ///
+/// The prompt tells the model the workspace root, and models hand that
+/// absolute path straight back, so an absolute path inside the workspace is
+/// read as the relative path it stands for.
+///
 /// # Arguments
 /// - `root`: workspace root directory.
-/// - `path`: relative path supplied by the model.
+/// - `path`: path supplied by the model.
 ///
 /// # Returns
-/// The joined `PathBuf`, or an error if the path is absolute or contains `..`.
+/// The joined `PathBuf`, or an error if the path is outside the workspace or
+/// contains `..`.
 pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
     let requested = Path::new(path);
-    if requested.is_absolute() {
-        bail!("absolute paths are not allowed; use paths relative to the workspace");
-    }
-    for component in requested.components() {
-        if matches!(component, Component::ParentDir) {
-            bail!("'..' is not allowed in tool paths");
+    let canonical = canonical_root(root).ok();
+
+    let inside = requested
+        .strip_prefix(root)
+        .ok()
+        .or_else(|| requested.strip_prefix(canonical.as_deref()?).ok());
+
+    let relative = match (inside, requested.is_absolute()) {
+        (Some(inside), _) => inside,
+        (None, false) => requested,
+        (None, true) => {
+            bail!("that path is outside the workspace; use paths relative to the workspace")
         }
+    };
+
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("'..' is not allowed in tool paths");
     }
-    Ok(root.join(requested))
+
+    Ok(root.join(relative))
 }
 
 /// Canonicalize the workspace root once so relative roots (`"."`, `"./src"`)
@@ -65,6 +84,33 @@ mod tests {
     fn rejects_absolute_paths() {
         let root = Path::new("/tmp/project");
         assert!(resolve_in_root(root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn reads_an_absolute_path_inside_the_workspace_as_relative() {
+        let root = Path::new("/tmp/project");
+
+        assert_eq!(
+            resolve_in_root(root, "/tmp/project/src/main.rs").unwrap(),
+            Path::new("/tmp/project/src/main.rs")
+        );
+        assert_eq!(resolve_in_root(root, "/tmp/project").unwrap(), root);
+        assert!(resolve_in_root(root, "/tmp/project/../secret").is_err());
+        assert!(resolve_in_root(root, "/tmp/project-other/x").is_err());
+    }
+
+    #[test]
+    fn reads_the_canonical_form_of_a_relative_root() {
+        let base = crate::test_support::unique_temp_dir("openbatrangs-path-canonical");
+        fs::create_dir_all(base.join("src")).unwrap();
+
+        let canonical = fs::canonicalize(&base).unwrap();
+        let dotted = base.join("src").join("..");
+        let resolved = resolve_in_root(&dotted, canonical.join("a.rs").to_str().unwrap());
+
+        assert_eq!(resolved.unwrap(), dotted.join("a.rs"));
+
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
