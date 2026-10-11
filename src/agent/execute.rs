@@ -80,6 +80,18 @@ pub(super) async fn execute_tool<C: Confirmer>(
             changed_files.push(path.clone());
             Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
         }
+        Tool::EditFile {
+            path,
+            old_string,
+            new_string,
+            replace_all,
+        } => {
+            ensure_not_read_only(config)?;
+            confirm_or_abort(config, confirmer, &format!("edit file '{path}'?")).await?;
+            let result = tools::edit_file(cwd, path, old_string, new_string, *replace_all)?;
+            changed_files.push(path.clone());
+            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
+        }
         Tool::RunCommand { command } => {
             ensure_not_read_only(config)?;
             confirm_or_abort(config, confirmer, &format!("run command: {command}")).await?;

@@ -25,6 +25,7 @@
 mod confirm;
 mod context;
 mod execute;
+mod native;
 mod quality;
 mod reporter;
 mod stream;
@@ -125,6 +126,13 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
     confirmer: &mut C,
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
+
+    if client.is_openai() {
+        return native::run_native_agent(
+            config, client, model, model_context, task, reporter, confirmer,
+        )
+        .await;
+    }
 
     let num_ctx = effective_context(model_context, config.max_ctx);
     let mut messages = initial_messages(&config.cwd, task);

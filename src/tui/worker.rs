@@ -202,6 +202,7 @@ async fn run_chat_worker(
                 let _ = tx.send(UiEvent::Log("💭 thinking...".to_string()));
             }
             Delta::Thinking(_) => {}
+            Delta::ToolCalls(_) => {}
         }
     }
     Ok(())

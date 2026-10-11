@@ -10,7 +10,7 @@
 //! - OpenAI chat completions streaming: <https://platform.openai.com/docs/api-reference/chat-streaming>
 //! - llama-server API: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
-use super::types::{ChatRequest, Delta, OllamaModel, Role};
+use super::types::{ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
 use serde_json::{json, Value};
 
 /// Result of draining complete server-sent event lines from the buffer.
@@ -78,10 +78,14 @@ pub(super) fn drain_events(buffer: &mut String) -> EventDrain {
     EventDrain::NeedMore
 }
 
-/// Parse one `data:` payload into a content or reasoning delta.
+/// Parse one `data:` payload into a content, reasoning, or tool-call delta.
 fn parse_event(data: &str) -> Option<Delta> {
     let value = serde_json::from_str::<Value>(data).ok()?;
     let delta = value.pointer("/choices/0/delta")?;
+    let calls = parse_tool_calls(delta);
+    if !calls.is_empty() {
+        return Some(Delta::ToolCalls(calls));
+    }
     let text = |key: &str| {
         delta
             .get(key)
@@ -92,6 +96,33 @@ fn parse_event(data: &str) -> Option<Delta> {
     text("content")
         .map(Delta::Content)
         .or_else(|| text("reasoning_content").map(Delta::Thinking))
+}
+
+/// Extract the incremental `tool_calls` array of one streamed delta.
+fn parse_tool_calls(delta: &Value) -> Vec<ToolCallDelta> {
+    delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| calls.iter().map(parse_tool_call).collect())
+        .unwrap_or_default()
+}
+
+/// Map one `tool_calls` entry to its incremental delta.
+fn parse_tool_call(call: &Value) -> ToolCallDelta {
+    let function = call.get("function");
+    ToolCallDelta {
+        index: call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32,
+        id: string_at(call, "id"),
+        name: function.and_then(|function| string_at(function, "name")),
+        arguments: function
+            .and_then(|function| string_at(function, "arguments"))
+            .unwrap_or_default(),
+    }
+}
+
+/// Read an optional string field from a JSON object.
+fn string_at(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 /// Turn a `GET /models` body into model entries.

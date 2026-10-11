@@ -23,7 +23,7 @@ mod stream;
 mod types;
 
 pub(crate) use types::{
-    ChatMessage, ChatRequest, Delta, OllamaModel, PullRequest, Role, TagsResponse,
+    ChatMessage, ChatRequest, Delta, OllamaModel, PullRequest, Role, TagsResponse, ToolCallDelta,
 };
 
 use crate::constants::ollama::{
@@ -287,10 +287,30 @@ impl OllamaClient {
         request: &ChatRequest,
         think: bool,
     ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
+        self.chat_stream_body(openai::chat_body(request, think)).await
+    }
+
+    /// Stream a chat completion from an OpenAI-compatible server using a
+    /// fully-formed request body.
+    ///
+    /// The native tool-calling loop builds its own body (a `tools` array,
+    /// `tool_choice`, and `tool`/`tool_call_id` messages) instead of going
+    /// through [`ChatRequest`], so this is the shared transport for both paths.
+    ///
+    /// # Arguments
+    /// - `body`: the complete `/chat/completions` JSON body, `stream: true`.
+    ///
+    /// # Returns
+    /// A stream of [`Delta`]s, or an error if the server cannot be reached or
+    /// answers with a non-success status.
+    pub async fn chat_stream_body(
+        &self,
+        body: Value,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
         let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .authorize(self.http.post(&url))
-            .json(&openai::chat_body(request, think))
+            .json(&body)
             .send()
             .await
             .with_context(|| format!("failed to call {url}"))?;
@@ -301,6 +321,14 @@ impl OllamaClient {
             return Err(anyhow!("{url} returned HTTP {status}: {text}"));
         }
 
+        Ok(self.openai_delta_stream(response))
+    }
+
+    /// Wrap a server-sent-event response in a stream of [`Delta`]s.
+    fn openai_delta_stream(
+        &self,
+        response: reqwest::Response,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>> {
         let byte_stream = response.bytes_stream();
         let stream = futures_util::stream::unfold(
             (byte_stream, String::new()),
@@ -328,7 +356,7 @@ impl OllamaClient {
                 }
             },
         );
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 
     /// Download a model from the Ollama registry.

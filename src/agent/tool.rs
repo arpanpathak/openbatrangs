@@ -68,6 +68,17 @@ pub(super) enum Tool {
         /// Full file contents.
         content: String,
     },
+    /// Replace a literal string inside an existing file.
+    EditFile {
+        /// Relative file path inside the workspace.
+        path: String,
+        /// Exact text to find.
+        old_string: String,
+        /// Replacement text.
+        new_string: String,
+        /// Replace every occurrence instead of requiring a unique match.
+        replace_all: bool,
+    },
     /// Run a shell command in the workspace.
     RunCommand {
         /// Shell command line, executed with `bash -lc`.
@@ -117,6 +128,14 @@ impl Tool {
                     .to_string(),
                 content: required_string_arg(args, "content", "write_file")?.to_string(),
             }),
+            "edit_file" => Ok(Self::EditFile {
+                path: path_arg(args)?
+                    .ok_or_else(|| anyhow!("edit_file requires 'path'"))?
+                    .to_string(),
+                old_string: required_string_arg(args, "old_string", "edit_file")?.to_string(),
+                new_string: required_string_arg(args, "new_string", "edit_file")?.to_string(),
+                replace_all: optional_bool_arg(args, "replace_all")?.unwrap_or(false),
+            }),
             "run_command" => Ok(Self::RunCommand {
                 command: required_string_arg(args, "command", "run_command")?.to_string(),
             }),
@@ -134,6 +153,7 @@ impl Tool {
             Self::ReadFile { path, .. } => format!("read_file → {path}"),
             Self::GrepFiles { pattern, path, .. } => format!("grep_files → {pattern:?} in {path}"),
             Self::WriteFile { path, .. } => format!("write_file → {path}"),
+            Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),
             Self::Finish { .. } => "finish".to_string(),
         }
@@ -229,6 +249,17 @@ pub(super) fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a st
         Some(Value::String(value)) => Ok(Some(value)),
         Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("argument '{key}' must be a string"),
+    }
+}
+
+/// Read an optional boolean argument.
+///
+/// `null` and missing keys both produce `None`; any other JSON type is an error.
+pub(super) fn optional_bool_arg(args: &Value, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => bail!("argument '{key}' must be a boolean"),
     }
 }
 

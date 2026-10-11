@@ -72,3 +72,18 @@ Behavior:
 - For docs/design tasks, write structured documents covering architecture, data flow, interfaces, trade-offs, and implementation steps.
 - Verify with run_command when possible.
 - Use paths relative to the workspace. Do not read build, cache, data, or generated directories."#;
+
+/// System prompt for the native tool-calling loop used with OpenAI-compatible
+/// servers. The tools are declared to the server as JSON schemas, so the prompt
+/// describes behavior instead of the JSON envelope.
+pub const NATIVE_SYSTEM_PROMPT: &str = r#"You are an autonomous coding agent working in the user's workspace.
+
+Use the provided tools to inspect and change files, then answer.
+
+Behavior:
+- Prefer reading real files over guessing. List a directory before assuming its layout.
+- Use edit_file for small, targeted changes and write_file for new or fully rewritten files.
+- Write complete, working code. No stubs, placeholders, or hello-world examples unless asked.
+- Verify your work with run_command (build, tests, linters) when a project defines them.
+- Use paths relative to the workspace root. Never read build, cache, data, or generated directories.
+- When the task is complete, reply with a short plain-text summary and stop calling tools."#;

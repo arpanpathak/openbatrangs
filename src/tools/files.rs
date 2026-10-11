@@ -15,6 +15,7 @@ use super::text::{truncate, truncate_to};
 use crate::constants::tools::{BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, HEAVY_DIRS, MAX_LISTED_FILES};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -163,6 +164,67 @@ pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<Strin
         file.display(),
         content.len()
     ))
+}
+
+/// Replace a literal string inside an existing file.
+///
+/// A coding agent makes most edits by changing a few lines, not by rewriting a
+/// whole file, so this is the tool models reach for most. The match is literal
+/// (no regex) and must be unique unless `replace_all` is set, which prevents an
+/// ambiguous `old_string` from silently editing the wrong place.
+///
+/// # Arguments
+/// - `root`: workspace root used for path safety.
+/// - `path`: relative file path.
+/// - `old_string`: exact text to find.
+/// - `new_string`: replacement text.
+/// - `replace_all`: replace every occurrence instead of requiring a unique match.
+///
+/// # Returns
+/// A confirmation string with how many replacements were made.
+pub(crate) fn edit_file(
+    root: &Path,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String> {
+    if old_string.is_empty() {
+        bail!("old_string must not be empty; use write_file to create or rewrite a file");
+    }
+    let file = resolve_in_root(root, path)?;
+    if !file.is_file() {
+        bail!("not a file: {}", file.display());
+    }
+    let file = ensure_canonical_within_root(root, &file)?;
+    match fs::symlink_metadata(&file) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to edit through symlink: {}", file.display())
+        }
+        _ => {}
+    }
+    let content = fs::read_to_string(&file).context("failed to read file (may be binary)")?;
+    let occurrences = content.matches(old_string).count();
+    if occurrences == 0 {
+        bail!("old_string was not found in {path}; re-read the file and copy the exact text");
+    }
+    if occurrences > 1 && !replace_all {
+        bail!(
+            "old_string appears {occurrences} times in {path}; add surrounding context or pass replace_all=true"
+        );
+    }
+    let updated = if replace_all {
+        content.replace(old_string, new_string)
+    } else {
+        content.replacen(old_string, new_string, 1)
+    };
+    fs::write(&file, &updated).with_context(|| format!("failed to write {}", file.display()))?;
+    let replaced = if replace_all { occurrences } else { 1 };
+    let plural = match replaced {
+        1 => "",
+        _ => "s",
+    };
+    Ok(format!("✅ edited {path} ({replaced} replacement{plural})"))
 }
 
 /// Regex-search file contents in a directory.

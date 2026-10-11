@@ -75,6 +75,7 @@ pub(super) async fn stream_model_response<R: Reporter>(
                 thought.feed(reporter, &buffer)?;
                 answer.feed(reporter, &buffer)?;
             }
+            Delta::ToolCalls(_) => {}
         }
     }
     if is_reasoning {
