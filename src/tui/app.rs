@@ -3,9 +3,9 @@
 use super::chat::ChatRenderCache;
 use super::session::SessionLog;
 use super::{
-    chat_visual_line_indices, open_in_vim, run_agent_worker, strip_ansi, ScrollMode, UiEvent,
+    chat_visual_line_indices, open_in_vim, run_agent_worker, ScrollMode, UiEvent, WorkerHistory,
 };
-use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs};
+use crate::cli::{searxng_url, AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
@@ -16,6 +16,7 @@ use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
 use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -88,8 +89,9 @@ pub(super) struct App {
     pub(super) chat_scroll_offset: usize,
     /// Monotonically increasing counter used to cycle through spinner frames.
     pub(super) spinner_frame: u64,
-    /// FIFO queue of user tasks waiting to run after the current task finishes.
-    pub(super) task_queue: VecDeque<String>,
+    /// FIFO queue of user tasks waiting to run after the current task
+    /// finishes, each with the conversation snapshot to resume from, if any.
+    pub(super) task_queue: VecDeque<(String, Option<Vec<Value>>)>,
     /// Conversation history for chat-mode (no tools) interactions.
     pub(super) chat_history: Vec<ChatMessage>,
     /// The currently active modal overlay (picker or confirmation).
@@ -105,6 +107,12 @@ pub(super) struct App {
     pub(super) model_info: Option<String>,
     /// The user's original task prompt, displayed in the banner area.
     pub(super) current_prompt: Option<String>,
+    /// Agent task retained when Ctrl+C is followed by corrective steering.
+    pub(super) interrupted_task: Option<String>,
+    /// Last conversation snapshot from the native agent loop, kept so an
+    /// interrupted run resumes with its context instead of starting over.
+    pub(super) agent_conversation: Option<Vec<Value>>,
+
     /// Runtime configuration for the agent loop (mode, limits, safety flags).
     pub(super) run_config: AgentRunConfig,
     /// Minimum context window (tokens) the user requires for model selection.
@@ -127,8 +135,6 @@ pub(super) struct App {
     pub(super) tokens_per_sec: f64,
     /// Handle to the currently spawned background Tokio task (agent/pull/setup).
     pub(super) current_task: Option<JoinHandle<()>>,
-    /// Pre-split banner text lines, with ANSI codes stripped for rendering.
-    pub(super) banner_lines: Vec<String>,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
     /// Characters accumulated in the current rate-measurement window.
@@ -151,8 +157,6 @@ impl App {
     ///
     /// A fully initialized `App` ready for the event loop.
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
-        let banner = strip_ansi(&crate::banner::banner_text());
-        let banner_lines = banner.lines().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut log = SessionLog::new(MAX_LOG_LINES);
         log.push(String::new());
         log.push(
@@ -183,6 +187,8 @@ impl App {
             server_url: cli.ollama_url.clone(),
             model_info: None,
             current_prompt: None,
+            interrupted_task: None,
+            agent_conversation: None,
             run_config: AgentRunConfig {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
@@ -191,6 +197,7 @@ impl App {
                 mode: AgentMode::Agent,
                 show_thinking: true,
                 max_ctx: cli.max_ctx,
+                searxng_url: searxng_url(cli),
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
@@ -205,7 +212,6 @@ impl App {
             stream_started_at: None,
             tokens_per_sec: 0.0,
             current_task: None,
-            banner_lines,
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,
@@ -370,11 +376,14 @@ impl App {
     /// # Parameters
     ///
     /// - `task`: the user's task description to send to the agent.
+    /// - `resume`: prior conversation to continue, when the task is a
+    ///   correction of an interrupted run.
     /// - `client`: Ollama client for the background worker.
     /// - `tx`: channel for the worker to send UI events back to the event loop.
     pub(super) fn start_task(
         &mut self,
         task: String,
+        resume: Option<Vec<Value>>,
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
@@ -394,6 +403,7 @@ impl App {
             });
             self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
         }
+
         let chat_history = self.chat_history.clone();
         let tx2 = tx.clone();
         let client2 = client.clone();
@@ -405,16 +415,12 @@ impl App {
             min_context: self.min_context,
         };
         let handle = tokio::spawn(async move {
-            let result = run_agent_worker(
-                client2,
-                run_config,
-                model,
-                prefs,
-                task,
-                chat_history,
-                tx2.clone(),
-            )
-            .await;
+            let prior = WorkerHistory {
+                chat: chat_history,
+                resume,
+            };
+            let result =
+                run_agent_worker(client2, run_config, model, prefs, task, prior, tx2.clone()).await;
             let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
         });
         self.current_task = Some(handle);
@@ -471,8 +477,12 @@ impl App {
                     self.log.push("… (output continued)".to_string());
                 }
             }
+            UiEvent::History(messages) => {
+                self.agent_conversation = Some(messages);
+            }
             UiEvent::Done(result) => {
                 self.current_task = None;
+                self.agent_conversation = None;
                 let assistant_text = std::mem::take(&mut self.live);
                 if !assistant_text.is_empty() {
                     self.log.push(assistant_text.clone());
@@ -495,9 +505,9 @@ impl App {
                 }
                 self.is_running = false;
                 self.last_action.clear();
-                if let Some(next) = self.task_queue.pop_front() {
+                if let Some((next, resume)) = self.task_queue.pop_front() {
                     self.log.push("▶️  Starting next queued task.".to_string());
-                    self.start_task(next, client, tx);
+                    self.start_task(next, resume, client, tx);
                 } else {
                     self.status = "ready".to_string();
                 }
@@ -641,6 +651,9 @@ impl App {
         if let Some(pending) = self.take_confirmation() {
             let _ = pending.response.send(false);
         }
+        if self.run_config.mode != AgentMode::Chat && self.is_running {
+            self.interrupted_task = self.current_prompt.clone();
+        }
         if self.run_config.mode == AgentMode::Chat
             && self
                 .chat_history
@@ -655,9 +668,9 @@ impl App {
         self.log.push("⛔ Cancelled.".to_string());
         // Keep the queue moving: cancelling the active task should not strand
         // tasks the user already queued behind it.
-        if let Some(next) = self.task_queue.pop_front() {
+        if let Some((next, resume)) = self.task_queue.pop_front() {
             self.log.push("▶️  Starting next queued task.".to_string());
-            self.start_task(next, client, tx);
+            self.start_task(next, resume, client, tx);
         } else {
             self.is_running = false;
             self.status = "ready".to_string();
@@ -837,7 +850,11 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
-        let task = self.input.trim().to_string();
+        let submitted = self.input.trim().to_string();
+        let had_interrupted = self.interrupted_task.is_some();
+        let (interrupted, mut task) =
+            continue_interrupted_task(self.interrupted_task.take(), submitted.clone());
+        self.interrupted_task = interrupted;
         self.input.clear();
         self.cursor = 0;
         self.history_idx = None;
@@ -845,6 +862,20 @@ impl App {
         if task.is_empty() {
             return Ok(false);
         }
+
+        // A correction of an interrupted run resumes the stored conversation:
+        // the correction becomes the next user turn instead of a restated
+        // task blob. Without a snapshot, or for slash commands, the merged
+        // prompt above is the fallback.
+        let resuming =
+            had_interrupted && !task.starts_with('/') && self.agent_conversation.is_some();
+        let resume = if resuming {
+            task = submitted;
+            self.agent_conversation.take()
+        } else {
+            None
+        };
+
         self.history.push(task.clone());
         self.scroll_mode = ScrollMode::Follow;
         if !task.starts_with('/') {
@@ -859,11 +890,11 @@ impl App {
                 self.log.push(format!("⚠️ {error:#}"));
             }
         } else if self.is_running {
-            self.task_queue.push_back(task);
+            self.task_queue.push_back((task, resume));
             self.log
                 .push("⏳ Queued — will run after the current task.".to_string());
         } else {
-            self.start_task(task, client, tx);
+            self.start_task(task, resume, client, tx);
         }
         Ok(self.should_quit)
     }
@@ -918,9 +949,50 @@ impl App {
     }
 }
 
+/// Fold a corrective steering message into the interrupted task's prompt.
+///
+/// Without a stored conversation snapshot the correction must carry the
+/// original task text with it; with one, [`App::submit_input`] replaces the
+/// merged prompt with the raw correction and resumes the conversation.
+fn continue_interrupted_task(
+    interrupted: Option<String>,
+    submitted: String,
+) -> (Option<String>, String) {
+    match (interrupted, submitted.starts_with('/')) {
+        (Some(previous), false) => (
+            None,
+            format!(
+                "Continue the interrupted task below. Preserve its original goal and existing workspace changes; treat the new user message as corrective steering. Inspect the workspace before acting; do not restart from scratch or repeat rejected work.\n\nOriginal task: {previous}\n\nUser correction / next instruction: {submitted}"
+            ),
+        ),
+        (interrupted, _) => (interrupted, submitted),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_up_after_ctrl_c_keeps_original_task_and_adds_correction() {
+        let (interrupted, prompt) = continue_interrupted_task(
+            Some("write a stable softmax kernel".to_string()),
+            "use CUDA Oxide, not CUDA C++".to_string(),
+        );
+        assert!(interrupted.is_none());
+        assert!(prompt.contains("write a stable softmax kernel"));
+        assert!(prompt.contains("use CUDA Oxide, not CUDA C++"));
+        assert!(prompt.contains("Inspect the workspace"));
+    }
+
+    #[test]
+    fn slash_command_does_not_consume_interrupted_task() {
+        let (interrupted, command) =
+            continue_interrupted_task(Some("original task".to_string()), "/help".to_string());
+        assert_eq!(interrupted.as_deref(), Some("original task"));
+        assert_eq!(command, "/help");
+    }
+
     use clap::Parser;
 
     #[test]
@@ -1231,7 +1303,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
-        app.task_queue.push_back("next task".to_string());
+        app.task_queue.push_back(("next task".to_string(), None));
         app.cancel_task(&client, &tx);
         assert!(app.task_queue.is_empty());
         assert!(app.is_running, "queued task should start immediately");
@@ -1240,6 +1312,62 @@ mod tests {
             .log
             .iter()
             .any(|line| line.contains("Starting next queued task")));
+    }
+
+    #[test]
+    fn history_snapshot_is_stored_and_cleared_on_done() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let snapshot = vec![serde_json::json!({"role": "user", "content": "task"})];
+
+        app.handle_event(UiEvent::History(snapshot.clone()), &client, &tx);
+        assert_eq!(app.agent_conversation, Some(snapshot));
+
+        app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
+        assert_eq!(app.agent_conversation, None);
+    }
+
+    #[tokio::test]
+    async fn a_correction_after_interrupt_carries_the_conversation() {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.interrupted_task = Some("write a softmax kernel".to_string());
+        app.current_prompt = Some("write a softmax kernel".to_string());
+        app.agent_conversation = Some(vec![serde_json::json!({"role": "user", "content": "task"})]);
+        app.input = "use cuda oxide instead".to_string();
+        app.submit_input(&client, &tx).await.unwrap();
+
+        let Some((queued, resume)) = app.task_queue.pop_front() else {
+            panic!("expected the correction to queue behind the running task");
+        };
+        assert_eq!(queued, "use cuda oxide instead");
+        assert!(
+            resume.is_some(),
+            "the interrupted conversation must ride with the correction"
+        );
+        assert_eq!(app.agent_conversation, None);
+    }
+
+    #[tokio::test]
+    async fn a_correction_without_a_snapshot_falls_back_to_the_merged_prompt() {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.interrupted_task = Some("write a softmax kernel".to_string());
+        app.current_prompt = Some("write a softmax kernel".to_string());
+        app.input = "use cuda oxide instead".to_string();
+        app.submit_input(&client, &tx).await.unwrap();
+
+        let Some((queued, resume)) = app.task_queue.pop_front() else {
+            panic!("expected the correction to queue behind the running task");
+        };
+        assert!(queued.contains("Original task: write a softmax kernel"));
+        assert!(queued.contains("use cuda oxide instead"));
+        assert_eq!(resume, None);
     }
 
     #[test]

@@ -64,7 +64,9 @@ async fn run_agent_task(
         is_read_only: config.is_read_only || config.mode == crate::cli::AgentMode::Plan,
         should_confirm: config.should_confirm,
         show_thinking: true,
+        model_context,
         max_ctx: config.max_ctx,
+        searxng_url: config.searxng_url.clone(),
     };
 
     let mut reporter = agent::StdoutReporter;
@@ -73,8 +75,8 @@ async fn run_agent_task(
         &agent_config,
         client,
         &selected.name,
-        model_context,
         &task,
+        None,
         &mut reporter,
         &mut confirmer,
     )

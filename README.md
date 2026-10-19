@@ -160,6 +160,28 @@ openbatrangs --thor --no-think "fix the failing test"
   reasoning is shown dimmed after 💭. `--no-think` turns it off.
 - `/models` and `list-models` show what the server serves; there is nothing
   to pull.
+- The web tools search a SearXNG instance at `http://127.0.0.1:8888` by
+  default. Point them elsewhere with `--searxng-url http://thor:8888` (or the
+  `OPENBATRANGS_SEARXNG_URL` environment variable).
+- Interrupting a run with Ctrl+C and typing a correction resumes the
+  conversation where it stopped instead of restarting the task.
+
+### The Thor over Tailscale
+
+The Thor's chat server is reachable on the tailnet with no SSH tunnel, and it
+fronts both TensorRT Edge-LLM engines, so one URL serves both models:
+
+```sh
+openbatrangs \
+  --openai-url https://arpanpathak.taildb9a39.ts.net/v1 \
+  --api-key-file ~/.config/thor-chat/api-key \
+  --model Qwen3.6-35B-A3B-NVFP4
+```
+
+Swap `--model` for `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` to use the other
+engine; `/models` lists both, and there is nothing to pull. That URL is the
+Thor's `tailscale funnel` address and is public, so the API key is the gate. On
+the same LAN an SSH tunnel to `127.0.0.1:8079` is faster and private.
 
 Measured with Nemotron 3 Nano 30B-A3B on a Jetson AGX Thor (llama-server,
 thinking on): a cargo project with a stack, a queue, a linked list, binary

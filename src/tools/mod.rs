@@ -13,6 +13,9 @@ mod command;
 mod files;
 mod path;
 mod text;
+mod web;
 
 pub(crate) use command::run_command;
-pub(crate) use files::{grep_files, list_files, read_file, write_file};
+pub(crate) use files::{edit_file, grep_files, list_files, read_file, write_file};
+
+pub(crate) use web::{web_read, web_search};

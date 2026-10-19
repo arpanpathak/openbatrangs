@@ -49,10 +49,17 @@ pub(crate) async fn resolve_model(
 async fn select_served_model(client: &OllamaClient, wanted: Option<&String>) -> Result<ModelScore> {
     let served = client.tags().await?;
     let model = match wanted {
-        Some(name) => served.iter().find(|model| &model.name == name).ok_or_else(|| {
-            let names: Vec<&str> = served.iter().map(|model| model.name.as_str()).collect();
-            anyhow!("'{name}' is not served at {}; it serves: {}", client.base_url, names.join(", "))
-        })?,
+        Some(name) => served
+            .iter()
+            .find(|model| &model.name == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = served.iter().map(|model| model.name.as_str()).collect();
+                anyhow!(
+                    "'{name}' is not served at {}; it serves: {}",
+                    client.base_url,
+                    names.join(", ")
+                )
+            })?,
         None => served
             .first()
             .ok_or_else(|| anyhow!("{} serves no models", client.base_url))?,

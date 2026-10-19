@@ -18,16 +18,15 @@ use super::app::App;
 use super::{text_wrapped_height, wrap_text_to_lines, ScrollMode};
 use crate::cli::AgentMode;
 use crate::constants::tui::{
-    COMPACT_BANNER_HEIGHT, FULL_BANNER_MIN_TERMINAL_HEIGHT, FULL_BANNER_MIN_WIDTH,
-    INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
+    HEADER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
     MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD, SMALL_BANNER_HEIGHT,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -43,7 +42,7 @@ use unicode_width::UnicodeWidthStr;
 /// - `app`: mutable reference to app state (used for render caching).
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
-    render_banner(f, app, chunks[0]);
+    render_header(f, app, chunks[0]);
     render_chat_area(f, app, chunks[1]);
     render_status_line(f, app, chunks[2]);
     if perf_visible(app, f.area().height) {
@@ -61,12 +60,11 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
-/// Banner height: compact when the terminal is tall enough, smaller otherwise.
-fn banner_height(area_height: u16) -> u16 {
-    if area_height >= FULL_BANNER_MIN_TERMINAL_HEIGHT {
-        COMPACT_BANNER_HEIGHT
-    } else {
-        SMALL_BANNER_HEIGHT
+/// Height of the top header: one extra line while a task prompt is set.
+fn header_height(app: &App) -> u16 {
+    match app.prompt_line() {
+        Some(_) => HEADER_HEIGHT + 1,
+        None => HEADER_HEIGHT,
     }
 }
 
@@ -92,7 +90,7 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Max(banner_height(area.height)),
+            Constraint::Max(header_height(app)),
             Constraint::Min(3),
             Constraint::Length(1),
             Constraint::Max(if perf_visible(app, area.height) {
@@ -107,53 +105,56 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         .to_vec()
 }
 
-/// Render the ASCII art banner with model info and optional prompt display.
-fn render_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
+/// Render the compact top header: identity, model, and the task prompt.
+fn render_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let full = area.height >= COMPACT_BANNER_HEIGHT && area.width >= FULL_BANNER_MIN_WIDTH;
-    let mut lines: Vec<Line> = app
-        .banner_lines
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            if full {
-                true
-            } else {
-                // Small terminal: title + quote only.
-                *index == 0 || *index + 1 == app.banner_lines.len()
-            }
-        })
-        .map(|(index, text)| {
-            let style = if index == 0 {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if index + 1 == app.banner_lines.len() {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::Magenta)
-            };
-            Line::from(Span::styled(
-                truncate_to_width(text, area.width as usize),
-                style,
-            ))
-        })
-        .collect();
-    lines.push(Line::from(Span::styled(
-        truncate_to_width(&app.model_info_line(), area.width as usize),
-        Style::default().fg(Color::Green),
-    )));
-    if full {
-        if let Some(prompt) = app.prompt_line() {
-            lines.push(Line::from(Span::styled(
-                truncate_to_width(&format!("Prompt: {prompt}"), area.width as usize),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let mut lines = vec![header_model_line(app, inner_width)];
+    if let Some(prompt) = app.prompt_line() {
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&format!("› {prompt}"), inner_width),
+            Style::default().fg(Color::Yellow),
+        )));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " ⣿ OPEN-BATARANGS ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
+        area,
+    );
+}
+
+/// The model, mode, and server summary line shown inside the header.
+fn header_model_line(app: &App, inner_width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate_to_width(&app.model_info_line(), inner_width),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// Shared frame for the transcript pane.
+fn transcript_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " transcript ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
 }
 
 /// Render the chat scrollback area with optional syntax highlighting and scrollbar.
@@ -181,21 +182,13 @@ fn render_chat_area(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     // freeze on low-power devices once the chat grew long.
     let chat = if chat_text.len() > RAW_CHAT_RENDER_THRESHOLD {
         Paragraph::new(chat_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" openBatarangs "),
-            )
+            .block(transcript_block())
             .wrap(Wrap { trim: false })
             .scroll((scroll_y.min(u16::MAX as usize) as u16, 0))
     } else {
         let chat_lines = app.chat_render.lines(&chat_text);
         Paragraph::new(chat_lines.to_vec())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" openBatarangs "),
-            )
+            .block(transcript_block())
             .wrap(Wrap { trim: false })
             .scroll((scroll_y.min(u16::MAX as usize) as u16, 0))
     };
@@ -280,7 +273,7 @@ fn render_status_line(f: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::Green)
     };
-    let status_line = truncate_to_width(&status_line, area.width as usize);
+    let status_line = truncate_to_width(&format!("▌ {status_line}"), area.width as usize);
     f.render_widget(Paragraph::new(status_line).style(status_style), area);
 }
 
@@ -307,7 +300,13 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 fn render_perf_panel(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let content = app.perf_lines().join("\n");
     let panel = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title(" ⚡ perf "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" ⚡ perf "),
+        )
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(panel, area);
@@ -338,6 +337,8 @@ fn render_suggestions(f: &mut ratatui::Frame, app: &App, area: Rect) {
         List::new(suggestion_items).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
                 .title(" suggestions "),
         ),
         area,
@@ -351,7 +352,18 @@ fn render_input_box(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .map(Line::from)
         .collect();
     let input_paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" input "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " › ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
         .scroll((input_scroll_y(app, area), 0));
     f.render_widget(input_paragraph, area);
 }
@@ -423,6 +435,7 @@ fn render_model_picker(f: &mut ratatui::Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .title(" Select model "),
             )
             .highlight_style(
@@ -460,6 +473,7 @@ fn render_confirmation(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title(" confirm ")
             .border_style(Style::default().fg(Color::Yellow)),
         area,

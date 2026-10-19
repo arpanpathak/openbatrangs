@@ -68,6 +68,8 @@ pub(super) async fn execute_tool<C: Confirmer>(
             path,
             max_results,
         } => tools::grep_files(cwd, pattern, path, *max_results),
+        Tool::WebSearch { query } => tools::web_search(&config.searxng_url, query).await,
+        Tool::WebRead { url } => tools::web_read(url).await,
         Tool::WriteFile { path, content } => {
             ensure_not_read_only(config)?;
             if let Some(reason) = placeholder_reason(content) {
@@ -77,6 +79,18 @@ pub(super) async fn execute_tool<C: Confirmer>(
             }
             confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
             let result = tools::write_file(cwd, path, content)?;
+            changed_files.push(path.clone());
+            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
+        }
+        Tool::EditFile {
+            path,
+            old_string,
+            new_string,
+            replace_all,
+        } => {
+            ensure_not_read_only(config)?;
+            confirm_or_abort(config, confirmer, &format!("edit file '{path}'?")).await?;
+            let result = tools::edit_file(cwd, path, old_string, new_string, *replace_all)?;
             changed_files.push(path.clone());
             Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
         }
@@ -178,7 +192,9 @@ mod tests {
             is_read_only: false,
             should_confirm: false,
             show_thinking: true,
+            model_context: 8_192,
             max_ctx: Some(8_192),
+            searxng_url: "http://127.0.0.1:8888".to_string(),
         };
         let mut changed = Vec::new();
         let mut confirmer = StdioConfirmer;
@@ -243,7 +259,9 @@ mod tests {
             is_read_only,
             should_confirm: false,
             show_thinking: true,
+            model_context: 8_192,
             max_ctx: Some(8_192),
+            searxng_url: "http://127.0.0.1:8888".to_string(),
         }
     }
 
@@ -270,7 +288,9 @@ mod tests {
             is_read_only: false,
             should_confirm: true,
             show_thinking: true,
+            model_context: 8_192,
             max_ctx: Some(8_192),
+            searxng_url: "http://127.0.0.1:8888".to_string(),
         }
     }
 

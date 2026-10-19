@@ -10,7 +10,7 @@
 //! - OpenAI chat completions streaming: <https://platform.openai.com/docs/api-reference/chat-streaming>
 //! - llama-server API: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
-use super::types::{ChatRequest, Delta, OllamaModel, Role};
+use super::types::{ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
 use serde_json::{json, Value};
 
 /// Result of draining complete server-sent event lines from the buffer.
@@ -78,10 +78,14 @@ pub(super) fn drain_events(buffer: &mut String) -> EventDrain {
     EventDrain::NeedMore
 }
 
-/// Parse one `data:` payload into a content or reasoning delta.
+/// Parse one `data:` payload into a content, reasoning, or tool-call delta.
 fn parse_event(data: &str) -> Option<Delta> {
     let value = serde_json::from_str::<Value>(data).ok()?;
     let delta = value.pointer("/choices/0/delta")?;
+    let calls = parse_tool_calls(delta);
+    if !calls.is_empty() {
+        return Some(Delta::ToolCalls(calls));
+    }
     let text = |key: &str| {
         delta
             .get(key)
@@ -92,6 +96,33 @@ fn parse_event(data: &str) -> Option<Delta> {
     text("content")
         .map(Delta::Content)
         .or_else(|| text("reasoning_content").map(Delta::Thinking))
+}
+
+/// Extract the incremental `tool_calls` array of one streamed delta.
+fn parse_tool_calls(delta: &Value) -> Vec<ToolCallDelta> {
+    delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|calls| calls.iter().map(parse_tool_call).collect())
+        .unwrap_or_default()
+}
+
+/// Map one `tool_calls` entry to its incremental delta.
+fn parse_tool_call(call: &Value) -> ToolCallDelta {
+    let function = call.get("function");
+    ToolCallDelta {
+        index: call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32,
+        id: string_at(call, "id"),
+        name: function.and_then(|function| string_at(function, "name")),
+        arguments: function
+            .and_then(|function| string_at(function, "arguments"))
+            .unwrap_or_default(),
+    }
+}
+
+/// Read an optional string field from a JSON object.
+fn string_at(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 /// Turn a `GET /models` body into model entries.
@@ -125,6 +156,20 @@ fn short_model_name(id: &str) -> String {
 /// Server address without the `/v1` suffix, where llama-server serves `/props`.
 pub(super) fn server_root(base_url: &str) -> &str {
     base_url.strip_suffix("/v1").unwrap_or(base_url)
+}
+
+/// Shape one model's entry in a `/models` body like Ollama's `/api/show`.
+///
+/// TensorRT Edge-LLM has no `/props`; it reports each model's context window
+/// in the list, as `max_model_len`.
+pub(super) fn show_from_models(list: &Value, name: &str) -> Option<Value> {
+    list.get("data")?
+        .as_array()?
+        .iter()
+        .find(|model| model.get("id").and_then(Value::as_str) == Some(name))?
+        .get("max_model_len")
+        .and_then(Value::as_u64)
+        .map(|context| json!({ "details": { "context_length": context } }))
 }
 
 /// Shape a `/props` body like Ollama's `/api/show`, so context lookup works
@@ -190,8 +235,12 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
             "data: [DONE]\n\n",
         ));
-        assert!(matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Thinking(text)) if text == "hmm"));
-        assert!(matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Content(text)) if text == "{}"));
+        assert!(
+            matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Thinking(text)) if text == "hmm")
+        );
+        assert!(
+            matches!(drain_events(&mut buffer), EventDrain::Delta(Delta::Content(text)) if text == "{}")
+        );
         assert!(matches!(drain_events(&mut buffer), EventDrain::Done));
     }
 
@@ -210,20 +259,48 @@ mod tests {
     #[test]
     fn model_list_keeps_file_names() {
         let body = json!({"data": [{"id": "/home/a/models/Nemotron-Q8_0.gguf"}, {"id": "plain"}]});
-        let names: Vec<String> = models_from_list(&body).into_iter().map(|m| m.name).collect();
+        let names: Vec<String> = models_from_list(&body)
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
         assert_eq!(names, vec!["Nemotron-Q8_0", "plain"]);
+    }
+
+    #[test]
+    fn a_listed_model_reports_its_context_length() {
+        let list = json!({"data": [
+            {"id": "qwen", "max_model_len": 65_536},
+            {"id": "plain"}
+        ]});
+
+        assert_eq!(
+            show_from_models(&list, "qwen"),
+            Some(json!({"details": {"context_length": 65_536}}))
+        );
+        assert_eq!(show_from_models(&list, "plain"), None);
+        assert_eq!(show_from_models(&list, "other"), None);
+        assert_eq!(show_from_models(&json!({}), "qwen"), None);
     }
 
     #[test]
     fn props_become_context_length() {
         let props = json!({"default_generation_settings": {"n_ctx": 1_048_576}});
-        assert_eq!(show_from_props(&props)["details"]["context_length"], 1_048_576);
+        assert_eq!(
+            show_from_props(&props)["details"]["context_length"],
+            1_048_576
+        );
         assert_eq!(show_from_props(&json!({})), json!({}));
     }
 
     #[test]
     fn root_drops_v1() {
-        assert_eq!(server_root("http://127.0.0.1:8079/v1"), "http://127.0.0.1:8079");
-        assert_eq!(server_root("http://127.0.0.1:8079"), "http://127.0.0.1:8079");
+        assert_eq!(
+            server_root("http://127.0.0.1:8079/v1"),
+            "http://127.0.0.1:8079"
+        );
+        assert_eq!(
+            server_root("http://127.0.0.1:8079"),
+            "http://127.0.0.1:8079"
+        );
     }
 }

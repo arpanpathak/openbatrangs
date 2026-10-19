@@ -72,17 +72,8 @@ pub const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 pub const CHAT_SCROLL_STEP: usize = 5;
 
-/// Banner height: title + compact Batman art + quote + model info + prompt.
-pub const COMPACT_BANNER_HEIGHT: u16 = 9;
-
-/// Banner height on small terminals (title + quote only).
-pub const SMALL_BANNER_HEIGHT: u16 = 7;
-
-/// Minimum terminal height for showing the full banner.
-pub const FULL_BANNER_MIN_TERMINAL_HEIGHT: u16 = 30;
-
-/// Minimum terminal width for showing the full banner.
-pub const FULL_BANNER_MIN_WIDTH: u16 = 20;
+/// Height of the compact top header (border, model line, border).
+pub const HEADER_HEIGHT: u16 = 3;
 
 /// Maximum number of suggestion rows rendered before scrolling.
 pub const MAX_SUGGESTION_ITEMS: usize = 6;

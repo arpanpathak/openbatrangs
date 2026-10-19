@@ -100,6 +100,25 @@ pub enum Delta {
     Content(String),
     /// The model's reasoning before the reply (thinking models only).
     Thinking(String),
+    /// One or more incremental tool calls (OpenAI-compatible servers only).
+    ToolCalls(Vec<ToolCallDelta>),
+}
+
+/// One incremental tool-call chunk from a streamed OpenAI reply.
+///
+/// A tool call arrives in pieces: the first chunk carries the call `id` and the
+/// function `name`, while later chunks append fragments of the JSON-encoded
+/// `arguments`. [`index`](Self::index) ties the chunks of one call together.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ToolCallDelta {
+    /// Position of this call in the assistant turn's `tool_calls` array.
+    pub index: u32,
+    /// Call id, sent once on the first chunk.
+    pub id: Option<String>,
+    /// Function name, sent once on the first chunk.
+    pub name: Option<String>,
+    /// JSON-encoded arguments, appended across chunks.
+    pub arguments: String,
 }
 
 /// A meaningful event extracted from one Ollama NDJSON stream line.

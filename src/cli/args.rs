@@ -21,8 +21,8 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
     pub(crate) ollama_url: String,
 
-    /// Use Nemotron on the Thor: same as
-    /// `--openai-url http://127.0.0.1:8079/v1 --api-key-file ~/.config/thor-chat/api-key`.
+    /// Use the models on the Thor over Tailscale: same as
+    /// `--openai-url https://arpanpathak.taildb9a39.ts.net/v1 --api-key-file ~/.config/thor-chat/api-key`.
     #[arg(long, global = true)]
     pub(crate) thor: bool,
 
@@ -71,6 +71,11 @@ pub(crate) struct Cli {
     /// model's own context length is used in full (lower uses less memory).
     #[arg(long = "max-ctx", global = true)]
     pub(crate) max_ctx: Option<u64>,
+
+    /// Base URL of the SearXNG instance the web tools search; falls back to
+    /// OPENBATRANGS_SEARXNG_URL, then to a localhost instance.
+    #[arg(long = "searxng-url", global = true, env = "OPENBATRANGS_SEARXNG_URL")]
+    pub(crate) searxng_url: Option<String>,
 
     /// Optional subcommand (agent, list-models, doctor, setup, pull).
     #[command(subcommand)]

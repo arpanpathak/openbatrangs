@@ -8,6 +8,7 @@ use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_
 use crate::ollama::{ChatMessage, ChatRequest, Delta, OllamaClient};
 use anyhow::Result;
 use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -19,6 +20,9 @@ pub(crate) enum UiEvent {
     Chunk(String),
     /// The agent task finished, either successfully or with an error message.
     Done(Result<(), String>),
+    /// A snapshot of the agent conversation, kept so an interrupted run can
+    /// resume with its context instead of starting over.
+    History(Vec<Value>),
     /// A background model pull completed with the given name and result.
     PullDone {
         /// The Ollama model tag that was being pulled.
@@ -72,6 +76,30 @@ impl Reporter for ChannelReporter {
     }
 }
 
+/// Sends conversation snapshots to the TUI for interrupt-safe resume.
+struct ChannelHistorySink {
+    /// Channel for forwarding conversation snapshots to the event loop.
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl crate::agent::HistorySink for ChannelHistorySink {
+    fn save(&mut self, messages: Vec<Value>) {
+        let _ = self.tx.send(UiEvent::History(messages));
+    }
+}
+
+/// Prior context handed to a worker: the chat-mode conversation and the
+/// agent-mode resume snapshot.
+///
+/// Bundling the two keeps [`run_agent_worker`]'s signature small; only one
+/// of them is used per run, depending on the mode.
+pub(crate) struct WorkerHistory {
+    /// Prior conversation messages for chat mode.
+    pub chat: Vec<ChatMessage>,
+    /// Prior agent conversation (OpenAI message shape) to resume from.
+    pub resume: Option<Vec<Value>>,
+}
+
 /// Run the agentic coding loop in the background, streaming events to the TUI.
 ///
 /// Dispatches to [`run_chat_worker`] for chat mode or runs the full
@@ -84,7 +112,7 @@ impl Reporter for ChannelReporter {
 /// - `model_slot`: explicit model tag or `None` for auto-selection.
 /// - `prefs`: model preferences for auto-selection (min context, auto-pull).
 /// - `task`: the user's task description.
-/// - `chat_history`: prior conversation messages for chat mode.
+/// - `prior`: prior chat messages or the interrupted agent conversation.
 /// - `tx`: channel for sending UI events back to the event loop.
 ///
 /// # Returns
@@ -96,13 +124,12 @@ pub(crate) async fn run_agent_worker(
     model_slot: Option<String>,
     prefs: ModelPrefs,
     task: String,
-    chat_history: Vec<ChatMessage>,
+    prior: WorkerHistory,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     match config.mode {
         AgentMode::Chat => {
-            return run_chat_worker(client, config, model_slot, prefs, task, chat_history, tx)
-                .await;
+            return run_chat_worker(client, config, model_slot, prefs, task, prior.chat, tx).await;
         }
         AgentMode::Agent | AgentMode::Plan => {}
     }
@@ -120,16 +147,23 @@ pub(crate) async fn run_agent_worker(
         is_read_only: config.is_read_only || matches!(config.mode, AgentMode::Plan),
         should_confirm: config.should_confirm,
         show_thinking: config.show_thinking,
+        model_context,
         max_ctx: config.max_ctx,
+        searxng_url: config.searxng_url,
     };
     let mut reporter = ChannelReporter { tx: tx.clone() };
-    let mut confirmer = ChannelConfirmer { tx };
+    let mut confirmer = ChannelConfirmer { tx: tx.clone() };
+    let mut history = ChannelHistorySink { tx };
+    let continuation = crate::agent::RunContinuation {
+        messages: prior.resume,
+        sink: Some(&mut history),
+    };
     crate::agent::run_agent(
         &agent_config,
         &client,
         &selected.name,
-        model_context,
         &task,
+        Some(continuation),
         &mut reporter,
         &mut confirmer,
     )
@@ -202,6 +236,7 @@ async fn run_chat_worker(
                 let _ = tx.send(UiEvent::Log("💭 thinking...".to_string()));
             }
             Delta::Thinking(_) => {}
+            Delta::ToolCalls(_) => {}
         }
     }
     Ok(())

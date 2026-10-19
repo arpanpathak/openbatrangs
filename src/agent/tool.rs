@@ -61,12 +61,33 @@ pub(super) enum Tool {
         /// Maximum number of matches to return.
         max_results: usize,
     },
+    /// Search the current web using local SearXNG.
+    WebSearch {
+        /// Focused search query.
+        query: String,
+    },
+    /// Read official NVIDIA or GitHub documentation returned by search.
+    WebRead {
+        /// HTTPS URL of an approved documentation page.
+        url: String,
+    },
     /// Write (or overwrite) a file.
     WriteFile {
         /// Relative file path inside the workspace.
         path: String,
         /// Full file contents.
         content: String,
+    },
+    /// Replace a literal string inside an existing file.
+    EditFile {
+        /// Relative file path inside the workspace.
+        path: String,
+        /// Exact text to find.
+        old_string: String,
+        /// Replacement text.
+        new_string: String,
+        /// Replace every occurrence instead of requiring a unique match.
+        replace_all: bool,
     },
     /// Run a shell command in the workspace.
     RunCommand {
@@ -111,11 +132,25 @@ impl Tool {
                     .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
                     as usize,
             }),
+            "web_search" => Ok(Self::WebSearch {
+                query: required_string_arg(args, "query", "web_search")?.to_string(),
+            }),
+            "web_read" => Ok(Self::WebRead {
+                url: required_string_arg(args, "url", "web_read")?.to_string(),
+            }),
             "write_file" => Ok(Self::WriteFile {
                 path: path_arg(args)?
                     .ok_or_else(|| anyhow!("write_file requires 'path'"))?
                     .to_string(),
                 content: required_string_arg(args, "content", "write_file")?.to_string(),
+            }),
+            "edit_file" => Ok(Self::EditFile {
+                path: path_arg(args)?
+                    .ok_or_else(|| anyhow!("edit_file requires 'path'"))?
+                    .to_string(),
+                old_string: required_string_arg(args, "old_string", "edit_file")?.to_string(),
+                new_string: required_string_arg(args, "new_string", "edit_file")?.to_string(),
+                replace_all: optional_bool_arg(args, "replace_all")?.unwrap_or(false),
             }),
             "run_command" => Ok(Self::RunCommand {
                 command: required_string_arg(args, "command", "run_command")?.to_string(),
@@ -133,7 +168,10 @@ impl Tool {
             Self::ListFiles { path } => format!("list_files → {path}"),
             Self::ReadFile { path, .. } => format!("read_file → {path}"),
             Self::GrepFiles { pattern, path, .. } => format!("grep_files → {pattern:?} in {path}"),
+            Self::WebSearch { query } => format!("web_search → {query}"),
+            Self::WebRead { url } => format!("web_read → {url}"),
             Self::WriteFile { path, .. } => format!("write_file → {path}"),
+            Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),
             Self::Finish { .. } => "finish".to_string(),
         }
@@ -229,6 +267,17 @@ pub(super) fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a st
         Some(Value::String(value)) => Ok(Some(value)),
         Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("argument '{key}' must be a string"),
+    }
+}
+
+/// Read an optional boolean argument.
+///
+/// `null` and missing keys both produce `None`; any other JSON type is an error.
+pub(super) fn optional_bool_arg(args: &Value, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => bail!("argument '{key}' must be a boolean"),
     }
 }
 

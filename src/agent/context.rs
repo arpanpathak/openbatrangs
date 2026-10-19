@@ -7,7 +7,7 @@
 
 use crate::constants::agent::{
     CHARS_PER_TOKEN, COMPACT_NOTE_MAX_CHARS, CONTEXT_RESERVE_TOKENS, KEEP_RECENT_MESSAGES,
-    MAX_OUTPUT_TOKENS, MAX_RECENT_MESSAGE_CHARS, MIN_OUTPUT_TOKENS,
+    MAX_OUTPUT_TOKENS, MAX_RECENT_MESSAGE_CHARS, MIN_OUTPUT_TOKENS, TOOL_RESULT_PREFIX,
 };
 use crate::ollama::{ChatMessage, Role};
 use serde_json::Value;
@@ -153,8 +153,11 @@ fn compact_note(messages: &[ChatMessage], max_chars: usize) -> String {
 /// One terse line for a compacted message.
 fn message_line(message: &ChatMessage) -> String {
     match message.role {
-        Role::User if message.content.starts_with("Tool result:") => {
-            let result = message.content.trim_start_matches("Tool result:").trim();
+        Role::User if message.content.starts_with(TOOL_RESULT_PREFIX) => {
+            let result = message
+                .content
+                .trim_start_matches(TOOL_RESULT_PREFIX)
+                .trim();
             format!("tool result: {}", head(result, 200))
         }
         Role::User => format!("user: {}", head(&message.content, 200)),

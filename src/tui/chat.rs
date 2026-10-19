@@ -16,7 +16,7 @@
 //! - Ratatui `Line`/`Span`: <https://docs.rs/ratatui/latest/ratatui/text/index.html>
 //! - CommonMark fenced code blocks: <https://spec.commonmark.org/0.31.2/#fenced-code-blocks>
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
@@ -83,10 +83,7 @@ const FAST_PATH_MAX_LINES: usize = 2_000;
 /// Render chat text with syntax highlighting inside ``` code fences.
 fn highlighted_chat_lines(text: &str) -> Vec<Line<'static>> {
     if text.len() > FAST_PATH_MAX_CHARS || text.lines().count() > FAST_PATH_MAX_LINES {
-        return text
-            .lines()
-            .map(|line| Line::from(Span::raw(line.to_string())))
-            .collect();
+        return text.lines().map(plain_chat_line).collect();
     }
 
     let h = highlighter();
@@ -131,7 +128,7 @@ fn render_chat_line<'a>(
     h: &'a Highlighter,
 ) -> Line<'static> {
     match fence_state {
-        CodeFenceState::Plain => Line::from(Span::raw(raw.to_string())),
+        CodeFenceState::Plain => plain_chat_line(raw),
         CodeFenceState::InCode(highlighter) => {
             let mut spans: Vec<Span<'static>> = Vec::new();
             for line in LinesWithEndings::from(raw) {
@@ -148,6 +145,31 @@ fn render_chat_line<'a>(
             Line::from(spans)
         }
     }
+}
+
+/// Style one plain chat line by its leading marker, so agent activity reads as
+/// a transcript: tool calls, thinking, and results each get their own look.
+fn plain_chat_line(raw: &str) -> Line<'static> {
+    let trimmed = raw.trim_start();
+    let style = match trimmed {
+        _ if trimmed.starts_with("🔧") => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        _ if trimmed.starts_with("💭") => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+        _ if trimmed.starts_with("✅") => Style::default().fg(Color::Green),
+        _ if trimmed.starts_with("⚠️") || trimmed.starts_with("⛔") => {
+            Style::default().fg(Color::Yellow)
+        }
+        _ if trimmed.starts_with("── ") || trimmed.starts_with("🦇") => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+        _ if trimmed.starts_with("▶️") => Style::default().fg(Color::Cyan),
+        _ if trimmed.starts_with("You:") => Style::default().add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    };
+    Line::from(Span::styled(raw.to_string(), style))
 }
 
 /// Cache of the last highlighted chat log.
