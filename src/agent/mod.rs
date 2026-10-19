@@ -101,6 +101,8 @@ pub struct AgentConfig {
     pub max_ctx: Option<u64>,
     /// Base URL of the SearXNG instance the web tools search.
     pub searxng_url: String,
+    /// Bearer key sent with each search, for a search behind the Thor's agent.
+    pub search_key: Option<String>,
 }
 
 /// The outcome of one agent iteration.
@@ -194,7 +196,13 @@ pub async fn run_agent<'a, R: Reporter, C: Confirmer>(
     }
 
     let num_ctx = effective_context(config.model_context, config.max_ctx);
-    let docs = research::documentation_context(task, &config.searxng_url, reporter).await;
+    let docs = research::documentation_context(
+        task,
+        &config.searxng_url,
+        config.search_key.as_deref(),
+        reporter,
+    )
+    .await;
     let task_with_docs = match docs {
         Some(docs) => format!("{task}\n\n{docs}"),
         None => task.to_string(),

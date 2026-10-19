@@ -6,6 +6,7 @@ use crate::tools;
 pub(super) async fn documentation_context<R: Reporter>(
     task: &str,
     searxng_url: &str,
+    search_key: Option<&str>,
     reporter: &mut R,
 ) -> Option<String> {
     let lower = task.to_ascii_lowercase();
@@ -33,7 +34,7 @@ pub(super) async fn documentation_context<R: Reporter>(
         format!("official documentation {}", topic_words(task))
     };
     reporter.line(format!("\n🔎 web_search → {query}"));
-    let results = match tools::web_search(searxng_url, &query).await {
+    let results = match tools::web_search(searxng_url, search_key, &query).await {
         Ok(results) => results,
         Err(error) => {
             reporter.line(format!("⚠️ Documentation search failed: {error:#}"));

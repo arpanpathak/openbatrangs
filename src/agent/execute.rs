@@ -68,7 +68,9 @@ pub(super) async fn execute_tool<C: Confirmer>(
             path,
             max_results,
         } => tools::grep_files(cwd, pattern, path, *max_results),
-        Tool::WebSearch { query } => tools::web_search(&config.searxng_url, query).await,
+        Tool::WebSearch { query } => {
+            tools::web_search(&config.searxng_url, config.search_key.as_deref(), query).await
+        }
         Tool::WebRead { url } => tools::web_read(url).await,
         Tool::WriteFile { path, content } => {
             ensure_not_read_only(config)?;
@@ -195,6 +197,7 @@ mod tests {
             model_context: 8_192,
             max_ctx: Some(8_192),
             searxng_url: "http://127.0.0.1:8888".to_string(),
+            search_key: None,
         };
         let mut changed = Vec::new();
         let mut confirmer = StdioConfirmer;
@@ -262,6 +265,7 @@ mod tests {
             model_context: 8_192,
             max_ctx: Some(8_192),
             searxng_url: "http://127.0.0.1:8888".to_string(),
+            search_key: None,
         }
     }
 
@@ -291,6 +295,7 @@ mod tests {
             model_context: 8_192,
             max_ctx: Some(8_192),
             searxng_url: "http://127.0.0.1:8888".to_string(),
+            search_key: None,
         }
     }
 

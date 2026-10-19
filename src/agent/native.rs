@@ -487,7 +487,13 @@ where
     let docs = if resuming {
         None
     } else {
-        super::research::documentation_context(task, &config.searxng_url, reporter).await
+        super::research::documentation_context(
+            task,
+            &config.searxng_url,
+            config.search_key.as_deref(),
+            reporter,
+        )
+        .await
     };
     let task_with_docs = match docs {
         Some(docs) => format!("{task}\n\n{docs}\n\nThe bounded documentation preflight is complete. Use the supplied sources and proceed; do not repeat searches."),
@@ -1065,6 +1071,7 @@ mod tests {
             model_context: 8_192,
             max_ctx: None,
             searxng_url: "http://127.0.0.1:8888".to_string(),
+            search_key: None,
         }
     }
 

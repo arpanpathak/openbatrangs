@@ -150,6 +150,7 @@ pub(crate) async fn run_agent_worker(
         model_context,
         max_ctx: config.max_ctx,
         searxng_url: config.searxng_url,
+        search_key: config.search_key,
     };
     let mut reporter = ChannelReporter { tx: tx.clone() };
     let mut confirmer = ChannelConfirmer { tx: tx.clone() };

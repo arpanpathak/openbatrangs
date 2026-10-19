@@ -5,12 +5,12 @@ use super::session::SessionLog;
 use super::{
     chat_visual_line_indices, open_in_vim, run_agent_worker, ScrollMode, UiEvent, WorkerHistory,
 };
-use crate::cli::{searxng_url, AgentMode, AgentRunConfig, Cli, ModelPrefs};
+use crate::cli::{search_key, searxng_url, AgentMode, AgentRunConfig, Cli, ModelPrefs};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
-    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, TOKEN_RATE_MIN_ELAPSED,
+    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED,
 };
 use crate::ollama::{ChatMessage, OllamaClient};
 use crate::perf::{PerfMonitor, SystemStats};
@@ -141,6 +141,9 @@ pub(super) struct App {
     pub(super) rate_window_chars: u64,
     /// Start time of the current rate-measurement window.
     pub(super) rate_window_start: Option<Instant>,
+    /// When the last chunk arrived; a longer gap than [`STREAM_GAP`] starts a
+    /// new rate window, so time spent running tools is not counted as streaming.
+    pub(super) last_chunk_at: Option<Instant>,
     /// Cache of the last syntax-highlighted chat rendering result.
     pub(super) chat_render: ChatRenderCache,
 }
@@ -198,6 +201,7 @@ impl App {
                 show_thinking: true,
                 max_ctx: cli.max_ctx,
                 searxng_url: searxng_url(cli),
+                search_key: search_key(cli),
             },
             min_context: cli.min_context as u64,
             is_auto_pull_disabled: cli.is_auto_pull_disabled,
@@ -215,6 +219,7 @@ impl App {
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,
+            last_chunk_at: None,
             chat_render: ChatRenderCache::new(),
         }
     }
@@ -396,6 +401,7 @@ impl App {
         self.tokens_per_sec = 0.0;
         self.rate_window_chars = 0;
         self.rate_window_start = None;
+        self.last_chunk_at = None;
         if self.run_config.mode == AgentMode::Chat {
             self.chat_history.push(ChatMessage {
                 role: crate::ollama::Role::User,
@@ -455,8 +461,13 @@ impl App {
                     self.stream_started_at = Some(now);
                 }
                 self.stream_chars += msg.chars().count() as u64;
-                if self.rate_window_start.is_none() {
+                let resumed = self
+                    .last_chunk_at
+                    .is_some_and(|last| now.duration_since(last) > STREAM_GAP);
+                self.last_chunk_at = Some(now);
+                if resumed || self.rate_window_start.is_none() {
                     self.rate_window_start = Some(now);
+                    self.rate_window_chars = 0;
                 }
                 self.rate_window_chars += msg.chars().count() as u64;
                 if let Some(window_start) = self.rate_window_start {

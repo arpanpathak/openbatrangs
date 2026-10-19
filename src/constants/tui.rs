@@ -66,6 +66,10 @@ pub const PERF_MAX_PANEL_HEIGHT: u16 = 8;
 /// Minimum elapsed time before the token-rate estimate refreshes.
 pub const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;
 
+/// A pause between streamed chunks longer than this, such as a tool running,
+/// starts a new tokens-per-second window.
+pub const STREAM_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Minimum terminal height for showing the performance panel automatically.
 pub const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 
