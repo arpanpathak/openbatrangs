@@ -154,6 +154,7 @@ async fn run_loop(
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
     let mut app = app::App::new(cli, tegrastats_shared);
+    app.server_url = client.base_url.clone();
     app.refresh_model_info(client).await;
     let mut mouse_capture = false;
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
