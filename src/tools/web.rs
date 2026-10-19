@@ -138,6 +138,11 @@ fn main_part(html: &str) -> String {
         .unwrap_or_else(|| html.to_string())
 }
 
+/// True when `url` is an HTTPS page that `web_read` accepts.
+pub(crate) fn is_official_doc(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| approved_doc_url(&raw_source(url)))
+}
+
 /// True for HTTPS pages on official NVIDIA or GitHub documentation hosts.
 fn approved_doc_url(url: &reqwest::Url) -> bool {
     let host = url.host_str().unwrap_or_default();

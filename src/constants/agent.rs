@@ -98,4 +98,4 @@ Behavior:
 - Verify your work with run_command (build, tests, linters) when a project defines them. The task is not complete until a verification command exits with code 0.
 - For unfamiliar, version-sensitive, or GPU APIs, use web_search then web_read before coding. Prefer official vendor docs and cite the URLs in your final answer. Never claim an API is supported without checking current documentation.
 - Use paths relative to the workspace root. Never read build, cache, data, or generated directories.
-- Every reply must end in a tool call. When the task is complete, call finish with a short summary."#;
+- Every reply must end in a tool call. When the task is complete, call finish. Its summary is the only text the user reads: for a question, put the complete answer there, with its quotes and URLs; for a change, say what was done and what the checks reported."#;
