@@ -15,7 +15,7 @@
 //! - Unix environment variables: <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html>
 
 use super::text::truncate;
-use crate::constants::tools::MIN_COMMAND_TIMEOUT_SECONDS;
+use crate::constants::tools::{EXIT_CODE_PREFIX, MIN_COMMAND_TIMEOUT_SECONDS};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -67,7 +67,7 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
         .code()
         .map(|code| code.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    text.push_str(&format!("\n[exit code {exit_code}]\n"));
+    text.push_str(&format!("\n{EXIT_CODE_PREFIX}{exit_code}]\n"));
     Ok(truncate(text))
 }
 

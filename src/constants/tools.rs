@@ -63,3 +63,10 @@ pub const MAX_TOOL_OUTPUT: usize = 20_000;
 
 /// Minimum shell timeout in seconds (avoids instant timeout bugs).
 pub const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
+
+/// Prefix of the exit-status line `run_command` appends to its output; the
+/// finished line reads `[exit code 0]`, `[exit code 101]`, and so on.
+pub const EXIT_CODE_PREFIX: &str = "[exit code ";
+
+/// The zero-exit marker the quality gate accepts as a verified command.
+pub const SUCCESS_EXIT_MARKER: &str = "[exit code 0]";

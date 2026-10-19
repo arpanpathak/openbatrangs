@@ -72,6 +72,11 @@ pub(crate) struct Cli {
     #[arg(long = "max-ctx", global = true)]
     pub(crate) max_ctx: Option<u64>,
 
+    /// Base URL of the SearXNG instance the web tools search; falls back to
+    /// OPENBATRANGS_SEARXNG_URL, then to a localhost instance.
+    #[arg(long = "searxng-url", global = true, env = "OPENBATRANGS_SEARXNG_URL")]
+    pub(crate) searxng_url: Option<String>,
+
     /// Optional subcommand (agent, list-models, doctor, setup, pull).
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,

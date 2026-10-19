@@ -30,7 +30,9 @@ pub(super) use text::{
     chat_visual_line_indices, extract_path_from_line, open_in_vim, split_command,
     text_wrapped_height, wrap_text_to_lines,
 };
-pub(super) use worker::{run_agent_worker, run_pull_worker, run_setup_worker, UiEvent};
+pub(super) use worker::{
+    run_agent_worker, run_pull_worker, run_setup_worker, UiEvent, WorkerHistory,
+};
 
 /// How the chat viewport follows newly generated output.
 ///

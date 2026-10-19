@@ -15,3 +15,7 @@ pub const DEFAULT_MAX_STEPS: usize = 40;
 
 /// Default minimum acceptable context window for auto model selection.
 pub const DEFAULT_MIN_CONTEXT: usize = 8_192;
+
+/// Default SearXNG endpoint the web tools search when neither `--searxng-url`
+/// nor `OPENBATRANGS_SEARXNG_URL` is set.
+pub const DEFAULT_SEARXNG_URL: &str = "http://127.0.0.1:8888";

@@ -481,6 +481,8 @@ impl App {
         self.log.clear();
         self.live.clear();
         self.current_prompt = None;
+        self.interrupted_task = None;
+        self.agent_conversation = None;
         self.chat_history.clear();
         self.scroll_mode = ScrollMode::Follow;
         self.chat_scroll_offset = 0;

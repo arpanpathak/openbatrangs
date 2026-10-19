@@ -1,6 +1,7 @@
 //! Runtime configuration types shared by the one-shot CLI and the TUI.
 
 use super::args::Cli;
+use crate::constants::cli::DEFAULT_SEARXNG_URL;
 use std::path::PathBuf;
 
 /// Agent execution mode selected in the TUI.
@@ -42,6 +43,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) show_thinking: bool,
     /// Upper limit on the context window; `None` uses the model's own length.
     pub(crate) max_ctx: Option<u64>,
+    /// Base URL of the SearXNG instance the web tools search.
+    pub(crate) searxng_url: String,
 }
 
 /// Build model-selection preferences from parsed CLI arguments.
@@ -63,7 +66,17 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         mode: AgentMode::Agent,
         show_thinking: true,
         max_ctx: cli.max_ctx,
+        searxng_url: searxng_url(cli),
     }
+}
+
+/// The SearXNG endpoint: the flag first, the environment second, localhost last.
+pub(crate) fn searxng_url(cli: &Cli) -> String {
+    cli.searxng_url
+        .as_deref()
+        .unwrap_or(DEFAULT_SEARXNG_URL)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -119,5 +132,14 @@ mod tests {
         assert!(prefs.model.is_none());
         assert!(!prefs.is_auto_pull_disabled);
         assert_eq!(prefs.min_context, 8_192);
+    }
+
+    #[test]
+    fn searxng_url_defaults_to_localhost_and_trims_the_trailing_slash() {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        assert_eq!(agent_run_config(&cli).searxng_url, DEFAULT_SEARXNG_URL);
+
+        let flagged = Cli::parse_from(["openbatrangs", "--searxng-url", "http://thor:8080/"]);
+        assert_eq!(agent_run_config(&flagged).searxng_url, "http://thor:8080");
     }
 }

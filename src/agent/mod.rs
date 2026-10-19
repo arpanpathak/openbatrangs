@@ -24,15 +24,18 @@
 
 mod confirm;
 mod context;
+mod environment;
 mod execute;
 mod native;
 mod quality;
 mod reporter;
+mod research;
 mod stream;
 mod tool;
 
 use crate::constants::agent::{
     AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, MIN_CONTEXT_TOKENS, SYSTEM_PROMPT,
+    TOOL_RESULT_PREFIX,
 };
 use crate::constants::ansi::{
     ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
@@ -40,8 +43,10 @@ use crate::constants::ansi::{
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
 use anyhow::{bail, Context, Result};
+use environment::{environment_facts, project_has_build_manifest};
 use execute::{execute_tool_or_report_error, print_changed_files};
-use quality::{requires_file_work, FileWorkGate};
+use quality::{command_succeeded, requires_file_work, FileWorkGate};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use stream::stream_model_response;
 use tool::{parse_agent_response, Tool, ToolCall};
@@ -49,6 +54,32 @@ use tool::{parse_agent_response, Tool, ToolCall};
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, max_output_tokens};
 pub use reporter::{Reporter, StdoutReporter};
+
+/// Receives snapshots of the conversation as it grows.
+///
+/// The TUI keeps the latest snapshot so that when the user interrupts a run
+/// and types a correction, the next run can resume the conversation instead
+/// of restarting from the task text alone.
+///
+/// Implementations must be `Send`: the sink is held inside the spawned
+/// background worker.
+pub trait HistorySink: Send {
+    /// Store the current conversation, in OpenAI `/chat/completions` shape.
+    fn save(&mut self, messages: Vec<Value>);
+}
+
+/// The interrupted run this run continues, plus the sink that keeps the
+/// TUI's resume copy up to date for the next interrupt.
+///
+/// Bundling the two keeps [`run_agent`]'s signature small: the conversation
+/// to resume from and the channel that snapshots this run belong together.
+pub struct RunContinuation<'a> {
+    /// Prior conversation in OpenAI `/chat/completions` shape; `None` for a
+    /// fresh start.
+    pub messages: Option<Vec<Value>>,
+    /// Sink receiving conversation snapshots; `None` in one-shot mode.
+    pub sink: Option<&'a mut dyn HistorySink>,
+}
 
 /// Immutable configuration for the agentic coding loop.
 #[derive(Debug, Clone)]
@@ -63,9 +94,13 @@ pub struct AgentConfig {
     pub should_confirm: bool,
     /// When `true`, the model's reasoning/thinking text is shown to the user.
     pub show_thinking: bool,
+    /// The model's own context window, in tokens, from server metadata.
+    pub model_context: u64,
     /// Upper limit on the context window (tokens); `None` uses the model's
     /// own context length in full.
     pub max_ctx: Option<u64>,
+    /// Base URL of the SearXNG instance the web tools search.
+    pub searxng_url: String,
 }
 
 /// The outcome of one agent iteration.
@@ -88,6 +123,9 @@ struct AgentRunContext<'a> {
     num_ctx: u64,
     /// Whether the original task asks for file output rather than just a chat answer.
     requires_file_work: bool,
+    /// Whether the workspace has a build manifest, so a successful build or
+    /// test is expected before the task counts as done.
+    needs_verification: bool,
 }
 
 /// Mutable state that persists across agent steps.
@@ -107,8 +145,10 @@ struct AgentStepState<'a> {
 /// - `config`: agent runtime configuration.
 /// - `client`: Ollama client for model calls.
 /// - `model`: model name to use for completions.
-/// - `model_context`: model's native context window size.
 /// - `task`: user's task description.
+/// - `continuation`: the interrupted run to continue and the snapshot sink;
+///   `None` in one-shot mode. Only the native tool loop consumes the
+///   conversation.
 /// - `reporter`: output sink for status and results.
 /// - `confirmer`: human-in-the-loop confirmer for writes/commands.
 ///
@@ -116,14 +156,14 @@ struct AgentStepState<'a> {
 ///
 /// `Ok(())` when the agent finishes (with or without an answer), or an error
 /// if the model call fails.
-pub async fn run_agent<R: Reporter, C: Confirmer>(
-    config: &AgentConfig,
-    client: &OllamaClient,
-    model: &str,
-    model_context: u64,
+pub async fn run_agent<'a, R: Reporter, C: Confirmer>(
+    config: &'a AgentConfig,
+    client: &'a OllamaClient,
+    model: &'a str,
     task: &str,
-    reporter: &mut R,
-    confirmer: &mut C,
+    continuation: Option<RunContinuation<'a>>,
+    reporter: &'a mut R,
+    confirmer: &'a mut C,
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
 
@@ -132,25 +172,45 @@ pub async fn run_agent<R: Reporter, C: Confirmer>(
             config,
             client,
             model,
-            model_context,
             task,
+            continuation,
             reporter,
             confirmer,
         )
         .await;
     }
 
-    let num_ctx = effective_context(model_context, config.max_ctx);
-    let mut messages = initial_messages(&config.cwd, task);
+    if matches!(
+        continuation.as_ref(),
+        Some(RunContinuation {
+            messages: Some(_),
+            ..
+        })
+    ) {
+        reporter.line(
+            "\n⚠️  The previous conversation cannot be resumed: this server uses the JSON tool loop."
+                .to_string(),
+        );
+    }
+
+    let num_ctx = effective_context(config.model_context, config.max_ctx);
+    let docs = research::documentation_context(task, &config.searxng_url, reporter).await;
+    let task_with_docs = match docs {
+        Some(docs) => format!("{task}\n\n{docs}"),
+        None => task.to_string(),
+    };
+    let mut messages = initial_messages(&config.cwd, &task_with_docs);
     let mut changed_files: Vec<String> = Vec::new();
     let mut file_work_gate = FileWorkGate::default();
 
+    let file_work = requires_file_work(task);
     let step_context = AgentRunContext {
         config,
         client,
         model,
         num_ctx,
-        requires_file_work: requires_file_work(task),
+        requires_file_work: file_work,
+        needs_verification: file_work && project_has_build_manifest(&config.cwd),
     };
 
     for step in 1..=config.max_steps {
@@ -218,18 +278,18 @@ async fn run_agent_step<R: Reporter, C: Confirmer>(
         // A final answer ends the loop. If it was already streamed live, do
         // not print it a second time.
         (Some(answer), _) => {
-            if file_work_gate.should_block_finish(
+            if let Some(feedback) = file_work_gate.reject_finish(
                 context.requires_file_work,
                 context.config.is_read_only,
                 changed_files.len(),
+                context.needs_verification,
             ) {
-                file_work_gate.record_retry();
                 messages.push(ChatMessage {
                     role: crate::ollama::Role::User,
-                    content: FileWorkGate::feedback().to_string(),
+                    content: feedback.to_string(),
                 });
                 reporter.line(format!(
-                    "\n{COLOR_DIM}⚠️  Shallow finish blocked: no files were written.{COLOR_RESET}"
+                    "\n{COLOR_DIM}⚠️  Shallow finish blocked.{COLOR_RESET}"
                 ));
                 return Ok(AgentStepOutcome::Continue);
             }
@@ -314,18 +374,18 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
         // `finish` is the model's way of saying "done": report the summary,
         // list changed files, and stop the loop.
         Tool::Finish { summary } => {
-            if file_work_gate.should_block_finish(
+            if let Some(feedback) = file_work_gate.reject_finish(
                 requires_file_work,
                 config.is_read_only,
                 changed_files.len(),
+                context.needs_verification,
             ) {
-                file_work_gate.record_retry();
                 messages.push(ChatMessage {
                     role: crate::ollama::Role::User,
-                    content: FileWorkGate::feedback().to_string(),
+                    content: feedback.to_string(),
                 });
                 reporter.line(format!(
-                    "\n{COLOR_DIM}⚠️  Shallow finish blocked: no files were written.{COLOR_RESET}"
+                    "\n{COLOR_DIM}⚠️  Shallow finish blocked.{COLOR_RESET}"
                 ));
                 return Ok(AgentStepOutcome::Continue);
             }
@@ -350,11 +410,14 @@ async fn handle_tool_call<R: Reporter, C: Confirmer>(
             let result_text =
                 execute_tool_or_report_error(config, &config.cwd, &other, changed_files, confirmer)
                     .await;
+            if matches!(other, Tool::RunCommand { .. }) && command_succeeded(&result_text) {
+                file_work_gate.record_verification();
+            }
             reporter.line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
 
             messages.push(ChatMessage {
                 role: crate::ollama::Role::User,
-                content: format!("Tool result:\n{result_text}"),
+                content: format!("{TOOL_RESULT_PREFIX}\n{result_text}"),
             });
             trim_messages(messages, MAX_HISTORY_MESSAGES);
             Ok(AgentStepOutcome::Continue)
@@ -436,7 +499,10 @@ fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
             cwd.display()
         )
     };
-    let user_content = format!("{workspace_note}\n\nTask:\n{task}");
+    let user_content = format!(
+        "{workspace_note}\n\nEnvironment:\n{}\n\nTask:\n{task}",
+        environment_facts(cwd)
+    );
     vec![
         ChatMessage {
             role: crate::ollama::Role::System,
@@ -477,6 +543,12 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
     let system = messages.remove(0);
     let first_user = messages.remove(0);
     let tail = messages.split_off(messages.len().saturating_sub(max - 2));
+    // A trimmed tail may start with a tool result whose assistant JSON was
+    // cut off; drop the orphan so the conversation still makes sense.
+    let tail = tail
+        .into_iter()
+        .skip_while(|message| message.content.starts_with(TOOL_RESULT_PREFIX))
+        .collect::<Vec<_>>();
     messages.clear();
     messages.push(system);
     messages.push(first_user);
@@ -653,6 +725,45 @@ mod tests {
         assert_eq!(messages[1].content, "task");
         assert_eq!(messages[2].content, "u2");
         assert_eq!(messages[3].content, "a3");
+    }
+
+    #[test]
+    fn trim_drops_orphan_tool_results_from_the_tail() {
+        let mut messages = vec![
+            ChatMessage {
+                role: Role::System,
+                content: "system".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: r#"{"tool":{"name":"read_file"}}"#.to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "Tool result:\nold output".to_string(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "Tool result:\nolder output".to_string(),
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                content: r#"{"answer":"done"}"#.to_string(),
+            },
+        ];
+        trim_messages(&mut messages, 4);
+
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].content, "task");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].content, r#"{"answer":"done"}"#);
+        assert!(messages
+            .iter()
+            .all(|message| !message.content.starts_with("Tool result:")));
     }
 
     #[test]

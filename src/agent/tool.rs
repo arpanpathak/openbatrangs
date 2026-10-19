@@ -61,6 +61,16 @@ pub(super) enum Tool {
         /// Maximum number of matches to return.
         max_results: usize,
     },
+    /// Search the current web using local SearXNG.
+    WebSearch {
+        /// Focused search query.
+        query: String,
+    },
+    /// Read official NVIDIA or GitHub documentation returned by search.
+    WebRead {
+        /// HTTPS URL of an approved documentation page.
+        url: String,
+    },
     /// Write (or overwrite) a file.
     WriteFile {
         /// Relative file path inside the workspace.
@@ -122,6 +132,12 @@ impl Tool {
                     .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
                     as usize,
             }),
+            "web_search" => Ok(Self::WebSearch {
+                query: required_string_arg(args, "query", "web_search")?.to_string(),
+            }),
+            "web_read" => Ok(Self::WebRead {
+                url: required_string_arg(args, "url", "web_read")?.to_string(),
+            }),
             "write_file" => Ok(Self::WriteFile {
                 path: path_arg(args)?
                     .ok_or_else(|| anyhow!("write_file requires 'path'"))?
@@ -152,6 +168,8 @@ impl Tool {
             Self::ListFiles { path } => format!("list_files → {path}"),
             Self::ReadFile { path, .. } => format!("read_file → {path}"),
             Self::GrepFiles { pattern, path, .. } => format!("grep_files → {pattern:?} in {path}"),
+            Self::WebSearch { query } => format!("web_search → {query}"),
+            Self::WebRead { url } => format!("web_read → {url}"),
             Self::WriteFile { path, .. } => format!("write_file → {path}"),
             Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),

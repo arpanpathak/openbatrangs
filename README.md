@@ -160,6 +160,11 @@ openbatrangs --thor --no-think "fix the failing test"
   reasoning is shown dimmed after 💭. `--no-think` turns it off.
 - `/models` and `list-models` show what the server serves; there is nothing
   to pull.
+- The web tools search a SearXNG instance at `http://127.0.0.1:8888` by
+  default. Point them elsewhere with `--searxng-url http://thor:8888` (or the
+  `OPENBATRANGS_SEARXNG_URL` environment variable).
+- Interrupting a run with Ctrl+C and typing a correction resumes the
+  conversation where it stopped instead of restarting the task.
 
 ### The Thor over Tailscale
 

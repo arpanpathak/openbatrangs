@@ -2,8 +2,11 @@
 //!
 //! OpenAI-compatible servers — llama-server in router mode and TensorRT
 //! Edge-LLM — accept a `tools` array and reply with structured `tool_calls`.
-//! This loop sends the schemas, streams the reply, executes every call, feeds
-//! the `tool` results back, and treats a reply without calls as the answer.
+//! This loop sends the schemas with `tool_choice: "required"`, streams the
+//! reply, executes every call, and feeds the `tool` results back. Served
+//! models that answer with their JSON tool call as plain text instead of the
+//! structured channel are detected and executed anyway; anything else is the
+//! answer.
 //!
 //! Tool execution, confirmation, and the file-work gate are shared with the
 //! JSON loop in [`super`], so writes and commands behave the same either way.
@@ -13,13 +16,14 @@
 //! - OpenAI function calling: <https://platform.openai.com/docs/guides/function-calling>
 //! - llama.cpp server, router mode: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
+use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{execute_tool_or_report_error, print_changed_files};
-use super::quality::{requires_file_work, FileWorkGate};
+use super::quality::{command_succeeded, requires_file_work, FileWorkGate};
 use super::tool::{Tool, ToolCall};
-use super::{effective_context, AgentConfig, Confirmer, Reporter};
+use super::{effective_context, AgentConfig, Confirmer, HistorySink, Reporter, RunContinuation};
 use crate::constants::agent::{
-    AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, MAX_HISTORY_MESSAGES,
-    MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, NATIVE_SYSTEM_PROMPT,
+    AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
+    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, NATIVE_SYSTEM_PROMPT,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use anyhow::{Context, Result};
@@ -77,6 +81,55 @@ impl Message {
         }
     }
 
+    /// Rebuild a message from its OpenAI `/chat/completions` shape.
+    ///
+    /// Unknown roles and malformed entries are dropped, so a resumed
+    /// conversation degrades gracefully instead of failing the request.
+    fn from_json(value: &Value) -> Option<Self> {
+        let role = value.get("role")?.as_str()?;
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match role {
+            "system" => Some(Self::System(content)),
+            "user" => Some(Self::User(content)),
+            "assistant" => {
+                let calls = value
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map(|calls| calls.iter().filter_map(Invocation::from_json).collect())
+                    .unwrap_or_default();
+                Some(Self::Assistant { content, calls })
+            }
+            "tool" => Some(Self::Tool {
+                id: value
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                content,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Rebuild a stored conversation, dropping entries that do not parse;
+    /// `None` when nothing survives, so the caller can start fresh instead.
+    fn conversation(values: &[Value]) -> Option<Vec<Self>> {
+        let messages: Vec<Self> = values.iter().filter_map(Self::from_json).collect();
+        (!messages.is_empty()).then_some(messages)
+    }
+
+    /// The tool calls of this message, when it is an assistant turn.
+    fn calls(&self) -> Option<&[Invocation]> {
+        match self {
+            Self::Assistant { calls, .. } => Some(calls),
+            _ => None,
+        }
+    }
+
     /// Approximate character size, used to budget output tokens.
     fn char_len(&self) -> usize {
         match self {
@@ -107,6 +160,28 @@ impl Invocation {
             "id": self.id,
             "type": "function",
             "function": { "name": self.name, "arguments": self.arguments },
+        })
+    }
+
+    /// Rebuild an invocation from an OpenAI `tool_calls` item.
+    fn from_json(value: &Value) -> Option<Self> {
+        let function = value.get("function")?;
+        Some(Self {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         })
     }
 
@@ -159,12 +234,18 @@ struct Run<'a, R, C> {
     think: bool,
     /// Whether the task asks for file changes.
     needs_files: bool,
+    /// Whether a successful build/test is expected before the task counts as done.
+    needs_verification: bool,
+    /// Number of consecutive empty model turns already nudged to act.
+    empty_retries: u8,
     /// Conversation sent to the model.
     messages: Vec<Message>,
     /// Files changed by tools so far.
-    changed: Vec<String>,
+    changed_files: Vec<String>,
     /// Gate that rejects shallow finishes.
-    gate: FileWorkGate,
+    finish_gate: FileWorkGate,
+    /// Sink receiving conversation snapshots, so an interrupted run can resume.
+    sink: Option<&'a mut dyn HistorySink>,
     /// Output sink.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
@@ -190,7 +271,7 @@ where
         Ok(())
     }
 
-    /// Stream one model turn and act on it.
+    /// Stream one model turn, act on it, and snapshot the conversation.
     async fn step(&mut self, step: usize) -> Result<Progress> {
         self.reporter
             .line(step_header(step, self.config.max_steps, self.model));
@@ -199,10 +280,50 @@ where
         let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
             .await
             .with_context(|| format!("model call failed at step {step}"))?;
-        match turn.calls.as_slice() {
-            [] => Ok(self.answer(turn.content)),
-            _ => self.tools(turn).await,
+
+        let progress = self.act(turn).await?;
+        self.save_conversation();
+        Ok(progress)
+    }
+
+    /// Decide what one streamed turn means and act on it.
+    async fn act(&mut self, turn: Turn) -> Result<Progress> {
+        if !turn.calls.is_empty() {
+            self.empty_retries = 0;
+            return self.tools(turn).await;
         }
+
+        if let Some(call) = parse_text_tool_call(&turn.content) {
+            self.reporter.line(
+                "\n⚠️ The model wrote its tool call as text; executing it anyway.".to_string(),
+            );
+            return self
+                .tools(Turn {
+                    calls: vec![call],
+                    ..turn
+                })
+                .await;
+        }
+
+        if turn.content.trim().is_empty() {
+            return Ok(self.handle_empty_turn());
+        }
+
+        Ok(self.answer(turn.content))
+    }
+
+    /// Nudge a silent model twice, then accept the silence as an answer.
+    fn handle_empty_turn(&mut self) -> Progress {
+        if self.empty_retries >= 2 {
+            return self.answer(String::new());
+        }
+
+        self.empty_retries += 1;
+        self.messages
+            .push(Message::User(EMPTY_TURN_NUDGE.to_string()));
+        self.reporter
+            .line("\n⚠️ Empty model turn; prompting it to continue with tools.".to_string());
+        Progress::More
     }
 
     /// Treat a turn without tool calls as the final answer.
@@ -213,15 +334,18 @@ where
                 .line("\n⚠️  The model returned an empty reply.".to_string());
             return Progress::Done;
         }
-        if self.gate_blocks() {
+        if let Some(feedback) = self.finish_feedback() {
             self.messages.push(Message::Assistant {
                 content: answer.to_string(),
                 calls: Vec::new(),
             });
-            return self.blocked();
+            self.messages.push(Message::User(feedback.to_string()));
+            self.reporter
+                .line("\n⚠️  Finish rejected: the task is not done.".to_string());
+            return Progress::More;
         }
         self.reporter.line(format!("\n✅ {answer}"));
-        print_changed_files(&self.config.cwd, &self.changed, self.reporter);
+        print_changed_files(&self.config.cwd, &self.changed_files, self.reporter);
         Progress::Done
     }
 
@@ -234,11 +358,14 @@ where
         let Some(summary) = self.execute(&turn.calls).await else {
             return Ok(Progress::More);
         };
-        if self.gate_blocks() {
-            return Ok(self.blocked());
+        if let Some(feedback) = self.finish_feedback() {
+            self.messages.push(Message::User(feedback.to_string()));
+            self.reporter
+                .line("\n⚠️  Finish rejected: the task is not done.".to_string());
+            return Ok(Progress::More);
         }
         self.reporter.line(format!("\n✅ {summary}"));
-        print_changed_files(&self.config.cwd, &self.changed, self.reporter);
+        print_changed_files(&self.config.cwd, &self.changed_files, self.reporter);
         Ok(Progress::Done)
     }
 
@@ -246,7 +373,9 @@ where
     async fn execute(&mut self, calls: &[Invocation]) -> Option<String> {
         let mut summary = None;
         for call in calls {
-            summary = self.execute_one(call).await.or(summary);
+            if let Some(found) = self.execute_one(call).await {
+                summary = Some(found);
+            }
         }
         summary
     }
@@ -272,10 +401,13 @@ where
                     self.config,
                     &self.config.cwd,
                     &tool,
-                    &mut self.changed,
+                    &mut self.changed_files,
                     self.confirmer,
                 )
                 .await;
+                if matches!(tool, Tool::RunCommand { .. }) && command_succeeded(&result) {
+                    self.finish_gate.record_verification();
+                }
                 self.reporter.line(result.clone());
                 self.messages.push(Message::Tool {
                     id,
@@ -297,26 +429,23 @@ where
         None
     }
 
-    /// True and recorded when a finish must be rejected for lack of file work.
-    fn gate_blocks(&mut self) -> bool {
-        let blocked = self.gate.should_block_finish(
+    /// Reject a premature finish and return the feedback the model must hear.
+    fn finish_feedback(&mut self) -> Option<&'static str> {
+        self.finish_gate.reject_finish(
             self.needs_files,
             self.config.is_read_only,
-            self.changed.len(),
-        );
-        if blocked {
-            self.gate.record_retry();
-        }
-        blocked
+            self.changed_files.len(),
+            self.needs_verification,
+        )
     }
 
-    /// Tell the model to keep working and take another step.
-    fn blocked(&mut self) -> Progress {
-        self.messages
-            .push(Message::User(FileWorkGate::feedback().to_string()));
-        self.reporter
-            .line("\n⚠️  Finish blocked: no files were written yet.".to_string());
-        Progress::More
+    /// Send the current conversation to the snapshot sink, if one is attached.
+    fn save_conversation(&mut self) {
+        let Some(sink) = &mut self.sink else {
+            return;
+        };
+        let snapshot: Vec<Value> = self.messages.iter().map(Message::to_json).collect();
+        sink.save(snapshot);
     }
 }
 
@@ -326,47 +455,151 @@ where
 /// - `config`: agent runtime configuration.
 /// - `client`: an OpenAI-compatible client.
 /// - `model`: model name to request.
-/// - `model_context`: the model's native context window, in tokens.
-/// - `task`: the user's task.
+/// - `task`: the user's task, or the correction when resuming.
+/// - `continuation`: the interrupted run to continue and the snapshot sink;
+///   `None` in one-shot mode.
 /// - `reporter`: output sink.
 /// - `confirmer`: human-in-the-loop gate for writes and commands.
 ///
 /// # Returns
 /// `Ok(())` when the agent finishes, or an error if a model call fails.
-pub(super) async fn run_native_agent<R, C>(
-    config: &AgentConfig,
-    client: &OllamaClient,
-    model: &str,
-    model_context: u64,
+pub(super) async fn run_native_agent<'a, R, C>(
+    config: &'a AgentConfig,
+    client: &'a OllamaClient,
+    model: &'a str,
     task: &str,
-    reporter: &mut R,
-    confirmer: &mut C,
+    continuation: Option<RunContinuation<'a>>,
+    reporter: &'a mut R,
+    confirmer: &'a mut C,
 ) -> Result<()>
 where
     R: Reporter,
     C: Confirmer,
 {
+    let (resume, sink) = continuation
+        .map(|run| (run.messages, run.sink))
+        .unwrap_or((None, None));
     let think = client.requests_thinking();
-    let run = Run {
+    let resuming = resume.is_some();
+
+    // A resumed run already carries its documentation in the conversation;
+    // repeating the preflight would refetch the same pages for nothing.
+    let docs = if resuming {
+        None
+    } else {
+        super::research::documentation_context(task, &config.searxng_url, reporter).await
+    };
+    let task_with_docs = match docs {
+        Some(docs) => format!("{task}\n\n{docs}\n\nThe bounded documentation preflight is complete. Use the supplied sources and proceed; do not repeat searches."),
+        None => task.to_string(),
+    };
+
+    let messages = seed_messages(config, &task_with_docs, think, resume);
+    let needs_files = messages
+        .iter()
+        .find_map(|message| match message {
+            Message::User(text) => Some(requires_file_work(text)),
+            _ => None,
+        })
+        .unwrap_or(false);
+
+    // Carry the prior run's state forward so the gate does not demand work
+    // that was already done before the interrupt.
+    let changed_files = previously_changed_files(&messages);
+    let finish_gate = gate_for_run(&messages);
+
+    let mut run = Run {
         config,
         client,
         model,
-        num_ctx: effective_context(model_context, config.max_ctx),
+        num_ctx: effective_context(config.model_context, config.max_ctx),
         think,
-        needs_files: requires_file_work(task),
-        messages: vec![
-            Message::System(NATIVE_SYSTEM_PROMPT.to_string()),
-            Message::User(initial_user_message(config, task, think)),
-        ],
-        changed: Vec::new(),
-        gate: FileWorkGate::default(),
+        needs_files,
+        needs_verification: needs_files && project_has_build_manifest(&config.cwd),
+        empty_retries: 0,
+        messages,
+        changed_files,
+        finish_gate,
+        sink,
         reporter,
         confirmer,
     };
+    run.save_conversation();
     run.run().await
 }
 
-/// The user turn that opens the conversation.
+/// The opening messages: the stored conversation plus the new task when
+/// resuming, or the fresh system + task pair otherwise.
+fn seed_messages(
+    config: &AgentConfig,
+    task: &str,
+    think: bool,
+    resume: Option<Vec<Value>>,
+) -> Vec<Message> {
+    let Some(mut messages) = resume.as_deref().and_then(Message::conversation) else {
+        return fresh_messages(config, task, think);
+    };
+
+    messages.push(Message::User(task.to_string()));
+    messages
+}
+
+/// The system prompt and initial user turn for a fresh run.
+fn fresh_messages(config: &AgentConfig, task: &str, think: bool) -> Vec<Message> {
+    vec![
+        Message::System(NATIVE_SYSTEM_PROMPT.to_string()),
+        Message::User(initial_user_message(config, task, think)),
+    ]
+}
+
+/// The finish gate for a run, carrying a resumed run's verification state
+/// forward when its history already shows a successful command.
+fn gate_for_run(messages: &[Message]) -> FileWorkGate {
+    let mut gate = FileWorkGate::default();
+    if verified_in_history(messages) {
+        gate.record_verification();
+    }
+    gate
+}
+
+/// True when a tool result in the conversation reports a zero exit code.
+fn verified_in_history(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::Tool { content, .. } => command_succeeded(content),
+        _ => false,
+    })
+}
+
+/// Files the prior conversation already wrote, so a resumed run's finish gate
+/// does not complain that nothing changed.
+fn previously_changed_files(messages: &[Message]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+
+    for call in messages.iter().filter_map(Message::calls).flatten() {
+        let Some(path) = written_path(call) else {
+            continue;
+        };
+        if !files.iter().any(|known| known == &path) {
+            files.push(path);
+        }
+    }
+
+    files
+}
+
+/// The file an invocation writes, when it is a `write_file` or `edit_file` call.
+fn written_path(call: &Invocation) -> Option<String> {
+    let is_file_writer = matches!(call.name.as_str(), "write_file" | "edit_file");
+    if !is_file_writer {
+        return None;
+    }
+
+    let arguments: Value = serde_json::from_str(&call.arguments).ok()?;
+    let path = arguments.get("path")?.as_str()?;
+    Some(path.to_string())
+}
+
+/// The user turn that opens a fresh conversation.
 ///
 /// A model told not to think stops honouring rules that only live in the
 /// system turn: with `enable_thinking: false`, Nemotron-3-Nano writes to the
@@ -374,7 +607,11 @@ where
 /// again the moment the same words arrive in the user turn. So the task
 /// carries the instructions whenever thinking is off.
 fn initial_user_message(config: &AgentConfig, task: &str, think: bool) -> String {
-    let task = format!("Workspace root: {}\n\nTask:\n{task}", config.cwd.display());
+    let task = format!(
+        "Workspace root: {}\n\nEnvironment:\n{}\n\nTask:\n{task}",
+        config.cwd.display(),
+        environment_facts(&config.cwd)
+    );
     match think {
         true => task,
         false => format!("Instructions (highest priority):\n{NATIVE_SYSTEM_PROMPT}\n\n{task}"),
@@ -422,12 +659,42 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
         "model": model,
         "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
         "tools": tools_schema(),
-        "tool_choice": "auto",
+        // "required" keeps served models from answering in plain text when a
+        // tool call is what the task needs; the `finish` tool is the exit.
+        "tool_choice": "required",
         "temperature": AGENT_TEMPERATURE,
         "max_tokens": max_tokens,
         "stream": true,
         "chat_template_kwargs": { "enable_thinking": think },
     })
+}
+
+/// Parse a JSON tool call the model wrote as plain text instead of using the
+/// server's structured `tool_calls` channel.
+///
+/// Some served models are trained to answer with `{"name": ..., "arguments": ...}`
+/// in the reply text; when `tool_choice` does not force the structured channel
+/// the loop would otherwise treat that JSON as the final answer. Known tools
+/// are extracted and executed instead; anything else is left to the answer path.
+fn parse_text_tool_call(content: &str) -> Option<Invocation> {
+    let cleaned = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let value: Value = serde_json::from_str(cleaned).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    // The id is left empty on purpose: `call_id` synthesizes one for calls
+    // the server did not identify.
+    let invocation = Invocation {
+        id: String::new(),
+        name,
+        arguments: arguments.to_string(),
+    };
+    parse_call(&invocation).ok()?;
+    Some(invocation)
 }
 
 /// Stream one model turn, forwarding text to the reporter.
@@ -479,26 +746,45 @@ where
     Ok(turn)
 }
 
-/// Drop the oldest exchanges, keeping the system prompt and initial task.
+/// Drop the oldest turns whole, keeping the system prompt, the initial task,
+/// and as many complete recent turns as fit in `max` messages.
+///
+/// A turn is an assistant message plus its tool results (and any injected
+/// user feedback). Cutting inside a turn would either strand tool results
+/// without their call or leave an assistant tool call without its results —
+/// both shapes the server rejects — so turns are always dropped as a unit.
 fn trim_messages(messages: &mut Vec<Message>, max: usize) {
     if messages.len() <= max || max < 2 {
         return;
     }
+
     let system = messages.remove(0);
     let task = messages.remove(0);
-    let mut tail = messages.split_off(messages.len().saturating_sub(max - 2));
-    while matches!(tail.first(), Some(Message::Tool { .. })) {
-        tail.remove(0);
+
+    while messages.len() > max - 2 {
+        let mut end = 1;
+        while end < messages.len() && matches!(messages[end], Message::Tool { .. }) {
+            end += 1;
+        }
+        messages.drain(0..end);
     }
-    messages.clear();
-    messages.push(system);
-    messages.push(task);
-    messages.extend(tail);
+
+    // A tail that starts with a tool result has lost its assistant message;
+    // drop the orphans so the conversation stays valid.
+    while matches!(messages.first(), Some(Message::Tool { .. })) {
+        messages.remove(0);
+    }
+
+    messages.insert(0, task);
+    messages.insert(0, system);
 }
 
 /// JSON schemas for the tools offered to the model.
+///
+/// The web tools are always present: the system prompt advertises them, and a
+/// call to a tool that is not in the schema is rejected as unknown.
 fn tools_schema() -> Value {
-    json!([
+    let tools = json!([
         {
             "type": "function",
             "function": {
@@ -541,6 +827,34 @@ fn tools_schema() -> Value {
                         "max_results": { "type": "integer", "description": "Maximum matches to return; defaults to 200." }
                     },
                     "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search current web documentation. Prefer official vendor sources for APIs, libraries, GPU programming, and version-sensitive behavior. Return URLs and snippets. Search once or twice, then use web_read on an official result; do not repeat near-identical queries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Focused search query; include the vendor or project and API/version." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_read",
+                "description": "Read an official NVIDIA or GitHub documentation page found by web_search. Pages are capped at 128 KiB and only approved HTTPS documentation hosts are allowed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "HTTPS URL from a web_search result on nvidia.github.io, developer.nvidia.com, docs.nvidia.com, or github.com." }
+                    },
+                    "required": ["url"]
                 }
             }
         },
@@ -594,7 +908,7 @@ fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "finish",
-                "description": "Signal that the task is complete. Prefer replying in plain text instead.",
+                "description": "Signal that the task is complete. Call it only after the work is done and verified.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -604,7 +918,8 @@ fn tools_schema() -> Value {
                 }
             }
         }
-    ])
+    ]);
+    tools
 }
 
 #[cfg(test)]
@@ -697,6 +1012,19 @@ mod tests {
     }
 
     #[test]
+    fn web_tools_are_always_offered() {
+        let names: Vec<String> = tools_schema()
+            .as_array()
+            .expect("schema is an array")
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"web_read".to_string()));
+    }
+
+    #[test]
     fn tool_schema_offers_edit_and_command_tools() {
         let names: Vec<String> = tools_schema()
             .as_array()
@@ -734,7 +1062,9 @@ mod tests {
             is_read_only: false,
             should_confirm: false,
             show_thinking: false,
+            model_context: 8_192,
             max_ctx: None,
+            searxng_url: "http://127.0.0.1:8888".to_string(),
         }
     }
 
@@ -759,5 +1089,252 @@ mod tests {
         };
         assert_eq!(flag(false), json!(false));
         assert_eq!(flag(true), json!(true));
+    }
+
+    #[test]
+    fn the_request_requires_tool_calls() {
+        let messages = vec![Message::User("task".to_string())];
+        let body = request_body("m", &messages, 8192, true);
+
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert!(body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()));
+    }
+
+    #[test]
+    fn trims_whole_turns_without_splitting_a_call_from_its_result() {
+        let call = |index: usize| Invocation {
+            id: format!("c{index}"),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let mut messages = vec![
+            Message::System("system".to_string()),
+            Message::User("task".to_string()),
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![call(1)],
+            },
+            Message::Tool {
+                id: "c1".to_string(),
+                content: "one".to_string(),
+            },
+            Message::Tool {
+                id: "c1b".to_string(),
+                content: "one more".to_string(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![call(2)],
+            },
+            Message::Tool {
+                id: "c2".to_string(),
+                content: "two".to_string(),
+            },
+        ];
+        trim_messages(&mut messages, 4);
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(messages[0], Message::System(_)));
+        assert!(matches!(messages[1], Message::User(_)));
+        let Message::Assistant { calls, .. } = &messages[2] else {
+            panic!("expected the recent assistant turn to survive");
+        };
+        assert_eq!(calls[0].id, "c2");
+        assert!(matches!(messages[3], Message::Tool { .. }));
+    }
+
+    #[test]
+    fn trims_never_leave_a_call_without_its_results() {
+        // Six turns of two messages each, trimmed to 4: the kept tail must be
+        // an assistant message followed by its tool result, never a bare
+        // assistant with dangling calls.
+        let mut messages = vec![
+            Message::System("system".to_string()),
+            Message::User("task".to_string()),
+        ];
+        for index in 0..6 {
+            messages.push(Message::Assistant {
+                content: String::new(),
+                calls: vec![Invocation {
+                    id: format!("c{index}"),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            });
+            messages.push(Message::Tool {
+                id: format!("c{index}"),
+                content: "x".to_string(),
+            });
+        }
+        trim_messages(&mut messages, 4);
+
+        assert_eq!(messages.len(), 4);
+        for window in messages.windows(2) {
+            let [first, second] = window else { continue };
+            let Message::Assistant { calls, .. } = first else {
+                continue;
+            };
+            assert!(
+                !calls.is_empty() && matches!(second, Message::Tool { .. }),
+                "a call must be followed by its tool result"
+            );
+        }
+    }
+
+    #[test]
+    fn trims_strip_orphan_tool_results() {
+        let mut messages = vec![
+            Message::System("system".to_string()),
+            Message::User("task".to_string()),
+            Message::Tool {
+                id: "lost".to_string(),
+                content: "orphan".to_string(),
+            },
+            Message::Assistant {
+                content: String::new(),
+                calls: vec![Invocation {
+                    id: "c1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            Message::Tool {
+                id: "c1".to_string(),
+                content: "x".to_string(),
+            },
+        ];
+        trim_messages(&mut messages, 4);
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(messages[2], Message::Assistant { .. }));
+        assert!(matches!(messages[3], Message::Tool { .. }));
+    }
+
+    #[test]
+    fn messages_round_trip_through_json() {
+        let original = Message::Assistant {
+            content: "reading".to_string(),
+            calls: vec![Invocation {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"a.rs"}"#.to_string(),
+            }],
+        };
+        let restored = Message::from_json(&original.to_json()).expect("known shape");
+
+        let Message::Assistant { content, calls } = restored else {
+            panic!("expected an assistant message");
+        };
+        assert_eq!(content, "reading");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn from_json_drops_unknown_roles() {
+        assert!(Message::from_json(&json!({"role": "oracle", "content": "x"})).is_none());
+    }
+
+    #[test]
+    fn text_tool_calls_are_parsed_when_the_tool_is_known() {
+        let call = parse_text_tool_call(r#"{"name": "read_file", "arguments": {"path": "a.rs"}}"#)
+            .expect("known tool in text form");
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.arguments, r#"{"path":"a.rs"}"#);
+
+        let fenced = parse_text_tool_call(
+            "```json\n{\"name\": \"list_files\", \"arguments\": {\"path\": \".\"}}\n```",
+        )
+        .expect("fenced tool call");
+        assert_eq!(fenced.name, "list_files");
+    }
+
+    #[test]
+    fn text_tool_calls_ignore_unknown_tools_and_plain_answers() {
+        assert!(parse_text_tool_call(r#"{"name": "rm_rf", "arguments": {}}"#).is_none());
+        assert!(parse_text_tool_call("the build failed because of x").is_none());
+        assert!(parse_text_tool_call(r#"{"answer": "done"}"#).is_none());
+    }
+
+    #[test]
+    fn resumed_messages_append_the_correction_as_a_user_turn() {
+        let prior = vec![
+            json!({"role": "system", "content": "rules"}),
+            json!({"role": "user", "content": "original task"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "file contents"}),
+        ];
+        let messages = seed_messages(&config(), "use the other API instead", true, Some(prior));
+
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(messages[0], Message::System(_)));
+        assert!(matches!(messages[1], Message::User(_)));
+        let Message::User(correction) = &messages[4] else {
+            panic!("expected the correction as the last user turn");
+        };
+        assert_eq!(correction, "use the other API instead");
+    }
+
+    #[test]
+    fn resumed_messages_with_bad_history_fall_back_to_a_fresh_start() {
+        let messages = seed_messages(
+            &config(),
+            "task",
+            true,
+            Some(vec![json!({"role": "oracle", "content": "x"})]),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0], Message::System(_)));
+        assert!(matches!(messages[1], Message::User(_)));
+    }
+
+    #[test]
+    fn previously_changed_files_reads_write_calls_from_history() {
+        let messages = vec![Message::Assistant {
+            content: String::new(),
+            calls: vec![
+                Invocation {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: r#"{"path":"src/lib.rs","content":"x"}"#.to_string(),
+                },
+                Invocation {
+                    id: "c2".to_string(),
+                    name: "edit_file".to_string(),
+                    arguments: r#"{"path":"README.md"}"#.to_string(),
+                },
+                Invocation {
+                    id: "c3".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                },
+            ],
+        }];
+
+        assert_eq!(
+            previously_changed_files(&messages),
+            vec!["src/lib.rs".to_string(), "README.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_successful_command_in_history_seeds_the_gate() {
+        let messages = vec![Message::Tool {
+            id: "c1".to_string(),
+            content: "compiled\n[exit code 0]\n".to_string(),
+        }];
+
+        let mut gate = gate_for_run(&messages);
+        assert_eq!(gate.reject_finish(true, false, 2, true), None);
+
+        let mut fresh = gate_for_run(&[Message::User("task".to_string())]);
+        assert!(fresh.reject_finish(true, false, 2, true).is_some());
     }
 }
