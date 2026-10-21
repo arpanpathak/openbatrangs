@@ -3,7 +3,7 @@
 use super::text::strip_ansi;
 use crate::agent::{compact_context, max_output_tokens, AgentConfig, Confirmer, Reporter};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
-use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE, MAX_CHAT_HISTORY_MESSAGES};
+use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::{ChatMessage, ChatRequest, Delta, OllamaClient};
 use anyhow::Result;
@@ -197,7 +197,6 @@ async fn run_chat_worker(
         content: CHAT_SYSTEM_PROMPT.to_string(),
     }];
     messages.extend(history);
-    messages.truncate(MAX_CHAT_HISTORY_MESSAGES + 1);
 
     // Auto rolling context for plain chat too: page out old turns when the
     // estimated prompt would otherwise overflow the safe per-device window.

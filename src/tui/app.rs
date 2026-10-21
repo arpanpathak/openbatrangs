@@ -224,6 +224,18 @@ impl App {
         }
     }
 
+    /// Add one chat turn, dropping the oldest turns beyond
+    /// [`MAX_CHAT_HISTORY_MESSAGES`] so the newest question is always kept.
+    pub(super) fn remember_chat(&mut self, message: ChatMessage) {
+        self.chat_history.push(message);
+
+        let excess = self
+            .chat_history
+            .len()
+            .saturating_sub(MAX_CHAT_HISTORY_MESSAGES);
+        self.chat_history.drain(..excess);
+    }
+
     /// True when a tool-confirmation dialog is displayed.
     pub(super) fn is_confirming(&self) -> bool {
         matches!(self.modal, Some(ActiveModal::Confirm(_)))
@@ -403,11 +415,10 @@ impl App {
         self.rate_window_start = None;
         self.last_chunk_at = None;
         if self.run_config.mode == AgentMode::Chat {
-            self.chat_history.push(ChatMessage {
+            self.remember_chat(ChatMessage {
                 role: crate::ollama::Role::User,
                 content: task.clone(),
             });
-            self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
         }
 
         let chat_history = self.chat_history.clone();
@@ -498,11 +509,10 @@ impl App {
                 if !assistant_text.is_empty() {
                     self.log.push(assistant_text.clone());
                     if self.run_config.mode == AgentMode::Chat {
-                        self.chat_history.push(ChatMessage {
+                        self.remember_chat(ChatMessage {
                             role: crate::ollama::Role::Assistant,
                             content: assistant_text,
                         });
-                        self.chat_history.truncate(MAX_CHAT_HISTORY_MESSAGES);
                     }
                 }
                 match result {
@@ -1179,6 +1189,27 @@ mod tests {
         assert_eq!(app.chat_history.len(), 2);
         assert_eq!(app.chat_history[1].role, crate::ollama::Role::Assistant);
         assert_eq!(app.chat_history[1].content, "world");
+    }
+
+    #[test]
+    fn a_full_chat_history_keeps_the_newest_turn() {
+        let mut app = test_app();
+        let turn = |index: usize| ChatMessage {
+            role: crate::ollama::Role::User,
+            content: format!("turn {index}"),
+        };
+
+        (0..=MAX_CHAT_HISTORY_MESSAGES).for_each(|index| app.remember_chat(turn(index)));
+
+        assert_eq!(app.chat_history.len(), MAX_CHAT_HISTORY_MESSAGES);
+        assert_eq!(
+            app.chat_history.first().map(|m| m.content.as_str()),
+            Some("turn 1")
+        );
+        assert_eq!(
+            app.chat_history.last().map(|m| m.content.clone()),
+            Some(format!("turn {MAX_CHAT_HISTORY_MESSAGES}"))
+        );
     }
 
     #[test]
