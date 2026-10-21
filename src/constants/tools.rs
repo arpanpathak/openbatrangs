@@ -1,27 +1,39 @@
 //! Filesystem and shell tool constants.
 
-/// Directories skipped during recursive walks (build caches, VCS, dependencies,
-/// and large data directories that are almost never relevant to coding tasks).
-pub const HEAVY_DIRS: &[&str] = &[
+/// Directories skipped at any depth: version control, dependency trees and
+/// tool caches, which never hold the project's own source.
+pub const SKIPPED_DIRS: &[&str] = &[
     ".git",
     "target",
     "node_modules",
-    "dist",
-    "build",
-    "out",
-    "output",
-    "outputs",
     ".venv",
     "venv",
     "__pycache__",
     ".cache",
-    "cache",
-    "caches",
     ".next",
     ".nuxt",
     ".idea",
     ".vscode",
     ".agent",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".gradle",
+    "Pods",
+    "DerivedData",
+];
+
+/// Directories skipped only directly under the workspace root, where they
+/// usually hold build output or large data. Deeper down the same names are
+/// often source code (`src/models`, `src/data`), so they are listed there.
+pub const SKIPPED_ROOT_DIRS: &[&str] = &[
+    "dist",
+    "build",
+    "out",
+    "output",
+    "outputs",
+    "cache",
+    "caches",
     "data",
     "datasets",
     "dataset",
@@ -35,12 +47,6 @@ pub const HEAVY_DIRS: &[&str] = &[
     "artifacts",
     "generated",
     "coverage",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".gradle",
-    "Pods",
-    "DerivedData",
 ];
 
 /// Default depth for `list_files` tool calls made by the agent.
