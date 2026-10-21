@@ -241,7 +241,7 @@ mod tests {
             &root,
             &Tool::WriteFile {
                 path: "README.md".to_string(),
-                content: "This is a placeholder for the full answer.".to_string(),
+                content: "# Design\n\nTODO: implement the full answer.".to_string(),
             },
             &mut changed,
             &mut confirmer,

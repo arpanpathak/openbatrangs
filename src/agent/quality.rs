@@ -95,7 +95,11 @@ const FILE_WORK_HINTS: &[&str] = &[
     "tests",
 ];
 
-/// Reasons why a write may look like a placeholder/stub.
+/// Phrases that only a stub template contains, each with the reason shown to
+/// the model. Single words such as "placeholder", "stub" or "hello world" are
+/// not here: they appear in real files (an HTML `placeholder=` attribute, a
+/// test that prints "hello world"), and refusing those writes left the agent
+/// looping until its step budget ran out.
 const PLACEHOLDER_MARKERS: &[(&str, &str)] = &[
     ("todo: implement", "TODO placeholder"),
     ("your code here", "code placeholder"),
@@ -104,17 +108,9 @@ const PLACEHOLDER_MARKERS: &[(&str, &str)] = &[
     ("implement this here", "implementation placeholder"),
     ("add your code here", "code placeholder"),
     ("write your code here", "code placeholder"),
-    ("coming soon", "coming soon placeholder"),
-    ("hello world", "hello-world stub"),
-    ("lorem ipsum", "lorem ipsum filler"),
-    ("not implemented", "unimplemented stub"),
-    ("to be implemented", "unimplemented stub"),
-    ("placeholder", "placeholder text"),
     ("... rest of code", "elided code"),
-    ("// ...", "elided code"),
-    ("# ...", "elided content"),
-    ("stub", "stub content"),
-    ("fixme", "unimplemented stub"),
+    ("rest of the code remains", "elided code"),
+    ("lorem ipsum", "lorem ipsum filler"),
 ];
 
 /// Return a reason when content is likely a placeholder that should not be
@@ -133,10 +129,6 @@ mod tests {
     #[test]
     fn detects_placeholder_variants_case_insensitively() {
         assert_eq!(
-            placeholder_reason("This is a Placeholder for the answer"),
-            Some("placeholder text")
-        );
-        assert_eq!(
             placeholder_reason("TODO: Implement binary search"),
             Some("TODO placeholder")
         );
@@ -144,7 +136,21 @@ mod tests {
             placeholder_reason("Your Code Here"),
             Some("code placeholder")
         );
-        assert_eq!(placeholder_reason("hello world"), Some("hello-world stub"));
+        assert_eq!(
+            placeholder_reason("fn main() {\n    // ... rest of code\n}"),
+            Some("elided code")
+        );
+    }
+
+    #[test]
+    fn real_files_that_mention_stub_words_are_written() {
+        let form = r#"<input name="email" placeholder="you@example.com">"#;
+        let test = "#[test]\nfn greets() {\n    assert_eq!(greet(), \"hello world\");\n}";
+        let doc = "/// Elided bodies are written as `// ...` in the docs.\npub fn stub_free() {}";
+
+        assert_eq!(placeholder_reason(form), None);
+        assert_eq!(placeholder_reason(test), None);
+        assert_eq!(placeholder_reason(doc), None);
     }
 
     #[test]
