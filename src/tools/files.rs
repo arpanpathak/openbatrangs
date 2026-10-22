@@ -12,16 +12,26 @@
 
 use super::path::{canonical_root, ensure_canonical_within_root, resolve_in_root};
 use super::text::{truncate, truncate_to};
-use crate::constants::tools::{BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, HEAVY_DIRS, MAX_LISTED_FILES};
+use crate::constants::tools::{
+    BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, MAX_LISTED_FILES, SKIPPED_DIRS, SKIPPED_ROOT_DIRS,
+};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
-/// Returns true when a directory name should be skipped by recursive walks.
-fn is_heavy_dir(name: &str) -> bool {
-    HEAVY_DIRS.contains(&name)
+/// Whether a recursive walk skips this directory: a cache or dependency tree
+/// anywhere, or a build or data directory directly under the workspace root.
+fn is_skipped_dir(directory: &Path, workspace: &Path) -> bool {
+    let name = directory
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+
+    let at_root = directory.parent() == Some(workspace);
+
+    SKIPPED_DIRS.contains(&name.as_ref()) || (at_root && SKIPPED_ROOT_DIRS.contains(&name.as_ref()))
 }
 
 /// Return `path` relative to the workspace root for display.
@@ -35,31 +45,30 @@ fn relative_to_root<'a>(path: &'a Path, root: &Path, canonical_root: &Path) -> &
         .unwrap_or(path)
 }
 
-/// Build a recursive directory walker that skips heavy directories.
+/// Build a recursive directory walker that skips the directories
+/// [`is_skipped_dir`] names. The directory the walk starts in is never
+/// skipped, so asking for `data` explicitly still lists it.
 ///
 /// # Arguments
-/// - `root`: directory to walk.
+/// - `start`: canonical directory to walk.
+/// - `workspace`: canonical workspace root.
 /// - `max_depth`: maximum recursion depth.
 ///
 /// # Returns
 /// An iterator over directory entries.
-fn walker(
-    root: &Path,
+fn walker<'a>(
+    start: &'a Path,
+    workspace: &'a Path,
     max_depth: usize,
-) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> + '_ {
-    WalkDir::new(root)
+) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> + 'a {
+    WalkDir::new(start)
         .max_depth(max_depth)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| {
-            if entry.depth() == 0 {
-                return true;
-            }
-            if entry.file_type().is_dir() {
-                let name = entry.file_name().to_string_lossy();
-                return !is_heavy_dir(&name);
-            }
-            true
+        .filter_entry(move |entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !is_skipped_dir(entry.path(), workspace)
         })
 }
 
@@ -82,7 +91,7 @@ pub(crate) fn list_files(root: &Path, path: &str, max_depth: usize) -> Result<St
 
     let mut output = String::new();
     let mut count = 0usize;
-    for entry in walker(&directory, max_depth) {
+    for entry in walker(&directory, &canonical_root, max_depth) {
         let entry = entry.context("walkdir error")?;
         if entry.file_type().is_file() {
             let relative = relative_to_root(entry.path(), root, &canonical_root)
@@ -254,7 +263,7 @@ pub(crate) fn grep_files(
     let mut output = String::new();
     let mut count = 0usize;
 
-    for entry in walker(&directory, GREP_MAX_DEPTH) {
+    for entry in walker(&directory, &canonical_root, GREP_MAX_DEPTH) {
         let entry = entry.context("walkdir error")?;
         if !entry.file_type().is_file() {
             continue;
@@ -317,6 +326,33 @@ mod tests {
         let root = temp_dir();
         assert!(list_files(&root, "missing", 5).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_folders_named_like_build_output_are_listed_below_the_root() -> Result<()> {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("src/models"))?;
+        fs::create_dir_all(root.join("src/data"))?;
+        fs::create_dir_all(root.join("data"))?;
+        fs::write(root.join("src/models/mod.rs"), "pub struct Model;\n")?;
+        fs::write(root.join("src/data/mod.rs"), "pub struct Row;\n")?;
+        fs::write(root.join("data/rows.csv"), "1,2\n")?;
+
+        let listed = list_files(&root, ".", 5)?;
+        let only_data = list_files(&root, "data", 5)?;
+        let found = grep_files(&root, "pub struct", ".", 10)?;
+
+        assert!(listed.contains("src/models/mod.rs"), "{listed}");
+        assert!(listed.contains("src/data/mod.rs"), "{listed}");
+        assert!(!listed.contains("data/rows.csv"), "{listed}");
+        assert!(only_data.contains("data/rows.csv"), "{only_data}");
+        assert!(
+            found.contains("src/models/mod.rs:1: pub struct Model;"),
+            "{found}"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

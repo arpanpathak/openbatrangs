@@ -67,6 +67,7 @@ async fn run_agent_task(
         model_context,
         max_ctx: config.max_ctx,
         searxng_url: config.searxng_url.clone(),
+        search_key: config.search_key.clone(),
     };
 
     let mut reporter = agent::StdoutReporter;

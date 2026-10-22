@@ -280,10 +280,10 @@ impl OllamaClient {
 
         let byte_stream = response.bytes_stream();
         let stream = futures_util::stream::unfold(
-            (byte_stream, String::new()),
+            (byte_stream, stream::TextBuffer::default()),
             |(mut byte_stream, mut buffer)| async move {
                 loop {
-                    match stream::drain_complete_lines(&mut buffer) {
+                    match stream::drain_complete_lines(&mut buffer.text) {
                         stream::LineDrain::Content(content) => {
                             return Some((Ok(Delta::Content(content)), (byte_stream, buffer)));
                         }
@@ -292,7 +292,7 @@ impl OllamaClient {
                     }
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            buffer.push(&bytes);
                         }
                         Some(Err(error)) => {
                             return Some((
@@ -359,10 +359,10 @@ impl OllamaClient {
     ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>> {
         let byte_stream = response.bytes_stream();
         let stream = futures_util::stream::unfold(
-            (byte_stream, String::new()),
+            (byte_stream, stream::TextBuffer::default()),
             |(mut byte_stream, mut buffer)| async move {
                 loop {
-                    match openai::drain_events(&mut buffer) {
+                    match openai::drain_events(&mut buffer.text) {
                         openai::EventDrain::Delta(delta) => {
                             return Some((Ok(delta), (byte_stream, buffer)));
                         }
@@ -371,7 +371,7 @@ impl OllamaClient {
                     }
                     match byte_stream.next().await {
                         Some(Ok(bytes)) => {
-                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            buffer.push(&bytes);
                         }
                         Some(Err(error)) => {
                             return Some((
@@ -423,11 +423,11 @@ impl OllamaClient {
         }
 
         let mut byte_stream = Box::pin(response.bytes_stream());
-        let mut buffer = String::new();
+        let mut buffer = stream::TextBuffer::default();
         while let Some(bytes) = byte_stream.next().await {
             let bytes = bytes.context("failed to read Ollama /api/pull stream")?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(event) = stream::drain_pull_line(&mut buffer) {
+            buffer.push(&bytes);
+            while let Some(event) = stream::drain_pull_line(&mut buffer.text) {
                 match event {
                     stream::PullLine::Status(status) => on_status(&status),
                     stream::PullLine::Error(error) => {

@@ -1,7 +1,7 @@
 //! Runtime configuration types shared by the one-shot CLI and the TUI.
 
 use super::args::Cli;
-use crate::constants::cli::DEFAULT_SEARXNG_URL;
+use crate::constants::cli::{DEFAULT_SEARXNG_URL, THOR_KEY_FILE, THOR_OPENAI_URL};
 use std::path::PathBuf;
 
 /// Agent execution mode selected in the TUI.
@@ -45,6 +45,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) max_ctx: Option<u64>,
     /// Base URL of the SearXNG instance the web tools search.
     pub(crate) searxng_url: String,
+    /// Bearer key sent with each search, for a search behind the Thor's agent.
+    pub(crate) search_key: Option<String>,
 }
 
 /// Build model-selection preferences from parsed CLI arguments.
@@ -67,16 +69,38 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         show_thinking: true,
         max_ctx: cli.max_ctx,
         searxng_url: searxng_url(cli),
+        search_key: search_key(cli),
     }
 }
 
-/// The SearXNG endpoint: the flag first, the environment second, localhost last.
+/// The SearXNG endpoint: the flag first, the environment second, the Thor's
+/// agent with `--thor`, localhost last.
 pub(crate) fn searxng_url(cli: &Cli) -> String {
+    let fallback = if cli.thor {
+        THOR_OPENAI_URL
+    } else {
+        DEFAULT_SEARXNG_URL
+    };
     cli.searxng_url
         .as_deref()
-        .unwrap_or(DEFAULT_SEARXNG_URL)
+        .unwrap_or(fallback)
         .trim_end_matches('/')
         .to_string()
+}
+
+/// The key a search sends: the Thor's access key when `--thor` searches through
+/// the Thor's agent, nothing for a SearXNG named by flag or environment.
+pub(crate) fn search_key(cli: &Cli) -> Option<String> {
+    if cli.searxng_url.is_some() || !cli.thor {
+        return None;
+    }
+    let path = cli
+        .api_key_file
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(THOR_KEY_FILE)))?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|key| key.trim().to_string())
 }
 
 #[cfg(test)]
@@ -141,5 +165,20 @@ mod tests {
 
         let flagged = Cli::parse_from(["openbatrangs", "--searxng-url", "http://thor:8080/"]);
         assert_eq!(agent_run_config(&flagged).searxng_url, "http://thor:8080");
+    }
+
+    #[test]
+    fn thor_searches_through_the_agent() {
+        let cli = Cli::parse_from(["openbatrangs", "--thor"]);
+        assert_eq!(agent_run_config(&cli).searxng_url, THOR_OPENAI_URL);
+
+        let named = Cli::parse_from([
+            "openbatrangs",
+            "--thor",
+            "--searxng-url",
+            "http://other:8888",
+        ]);
+        assert_eq!(agent_run_config(&named).searxng_url, "http://other:8888");
+        assert_eq!(agent_run_config(&named).search_key, None);
     }
 }

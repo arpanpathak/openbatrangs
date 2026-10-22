@@ -487,21 +487,31 @@ where
     let docs = if resuming {
         None
     } else {
-        super::research::documentation_context(task, &config.searxng_url, reporter).await
+        super::research::documentation_context(
+            task,
+            &config.searxng_url,
+            config.search_key.as_deref(),
+            reporter,
+        )
+        .await
     };
     let task_with_docs = match docs {
-        Some(docs) => format!("{task}\n\n{docs}\n\nThe bounded documentation preflight is complete. Use the supplied sources and proceed; do not repeat searches."),
+        Some(docs) => format!("{task}\n\n{docs}"),
         None => task.to_string(),
     };
 
     let messages = seed_messages(config, &task_with_docs, think, resume);
-    let needs_files = messages
-        .iter()
-        .find_map(|message| match message {
-            Message::User(text) => Some(requires_file_work(text)),
-            _ => None,
-        })
-        .unwrap_or(false);
+    let needs_files = if resuming {
+        messages
+            .iter()
+            .find_map(|message| match message {
+                Message::User(text) => Some(requires_file_work(task_part(text))),
+                _ => None,
+            })
+            .unwrap_or(false)
+    } else {
+        requires_file_work(task)
+    };
 
     // Carry the prior run's state forward so the gate does not demand work
     // that was already done before the interrupt.
@@ -599,6 +609,18 @@ fn written_path(call: &Invocation) -> Option<String> {
     Some(path.to_string())
 }
 
+/// The task inside a first user message: what follows its `Task:` heading,
+/// without the environment facts and, with thinking off, the system prompt
+/// in front of it. Their words ("write", "tests") are not the user's request.
+fn task_part(message: &str) -> &str {
+    message
+        .rsplit_once(TASK_HEADING)
+        .map_or(message, |(_, task)| task)
+}
+
+/// The heading [`initial_user_message`] puts before the task.
+const TASK_HEADING: &str = "\n\nTask:\n";
+
 /// The user turn that opens a fresh conversation.
 ///
 /// A model told not to think stops honouring rules that only live in the
@@ -608,7 +630,7 @@ fn written_path(call: &Invocation) -> Option<String> {
 /// carries the instructions whenever thinking is off.
 fn initial_user_message(config: &AgentConfig, task: &str, think: bool) -> String {
     let task = format!(
-        "Workspace root: {}\n\nEnvironment:\n{}\n\nTask:\n{task}",
+        "Workspace root: {}\n\nEnvironment:\n{}{TASK_HEADING}{task}",
         config.cwd.display(),
         environment_facts(&config.cwd)
     );
@@ -912,7 +934,7 @@ fn tools_schema() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "summary": { "type": "string", "description": "Short summary of what was done." }
+                        "summary": { "type": "string", "description": "The only text the user reads. For a question, the complete answer, with its quotes and URLs; for a change, what was done and what the checks reported." }
                     },
                     "required": ["summary"]
                 }
@@ -925,6 +947,20 @@ fn tools_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_file_change_check_reads_the_task_not_the_wrapping() {
+        let wrapped = format!(
+            "Instructions (highest priority):\nwrite tests and fix bugs\n\nWorkspace root: /w\n\nEnvironment:\nrust{TASK_HEADING}Read src/lib.rs and say what it returns."
+        );
+
+        assert_eq!(
+            task_part(&wrapped),
+            "Read src/lib.rs and say what it returns."
+        );
+        assert!(!requires_file_work(task_part(&wrapped)));
+        assert!(requires_file_work(&wrapped));
+    }
     use std::path::PathBuf;
 
     #[test]
@@ -1065,6 +1101,7 @@ mod tests {
             model_context: 8_192,
             max_ctx: None,
             searxng_url: "http://127.0.0.1:8888".to_string(),
+            search_key: None,
         }
     }
 

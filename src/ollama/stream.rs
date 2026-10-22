@@ -13,6 +13,37 @@
 use super::types::StreamLine;
 use serde_json::Value;
 
+/// Text received so far from a byte stream, decoded as UTF-8.
+///
+/// A network chunk can end in the middle of a multi-byte character. Decoding
+/// each chunk on its own turned both halves into U+FFFD, so an emoji or any
+/// non-ASCII letter at a chunk boundary reached the user as `�`. The bytes of
+/// an unfinished character wait in `pending` until the next chunk completes it.
+#[derive(Debug, Default)]
+pub(super) struct TextBuffer {
+    /// Decoded text not yet consumed by a drain function.
+    pub(super) text: String,
+    /// The first bytes of a character whose remaining bytes have not arrived.
+    pending: Vec<u8>,
+}
+
+impl TextBuffer {
+    /// Append one chunk, decoding every complete character in it.
+    pub(super) fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+
+        let complete = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(_) => self.pending.len(),
+        };
+
+        self.text
+            .push_str(&String::from_utf8_lossy(&self.pending[..complete]));
+        self.pending.drain(..complete);
+    }
+}
+
 /// Result of draining complete NDJSON lines from the stream buffer.
 pub(super) enum LineDrain {
     /// A content delta is ready to emit.
@@ -114,6 +145,25 @@ fn parse_pull_line(line: &str) -> Option<PullLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_character_split_across_chunks_is_decoded_whole() {
+        let bytes = "bat 🦇 ünïcode".as_bytes();
+        let mut buffer = TextBuffer::default();
+
+        bytes.chunks(1).for_each(|chunk| buffer.push(chunk));
+
+        assert_eq!(buffer.text, "bat 🦇 ünïcode");
+    }
+
+    #[test]
+    fn invalid_bytes_still_decode_lossily() {
+        let mut buffer = TextBuffer::default();
+
+        buffer.push(&[b'a', 0xFF, b'b']);
+
+        assert_eq!(buffer.text, "a\u{FFFD}b");
+    }
 
     #[test]
     fn parses_content_delta_from_stream_line() {

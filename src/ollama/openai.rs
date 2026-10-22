@@ -3,7 +3,8 @@
 //! The same [`ChatRequest`] used for Ollama is translated into a
 //! `POST /chat/completions` body, and the server-sent event stream is parsed
 //! back into [`Delta`]s. llama-server streams a thinking model's reasoning in
-//! `delta.reasoning_content` and the reply in `delta.content`.
+//! `delta.reasoning_content`, vLLM in `delta.reasoning`, and both the reply in
+//! `delta.content`.
 //!
 //! ## References
 //!
@@ -96,6 +97,7 @@ fn parse_event(data: &str) -> Option<Delta> {
     text("content")
         .map(Delta::Content)
         .or_else(|| text("reasoning_content").map(Delta::Thinking))
+        .or_else(|| text("reasoning").map(Delta::Thinking))
 }
 
 /// Extract the incremental `tool_calls` array of one streamed delta.
@@ -226,6 +228,12 @@ mod tests {
         let body = chat_body(&request(None), false);
         assert!(body.get("response_format").is_none());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn reads_vllm_reasoning_as_thinking() {
+        let delta = parse_event(r#"{"choices":[{"delta":{"reasoning":"hmm"}}]}"#);
+        assert!(matches!(delta, Some(Delta::Thinking(text)) if text == "hmm"));
     }
 
     #[test]
