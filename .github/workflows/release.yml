@@ -96,4 +96,5 @@ jobs:
           files: |
             dist/*
             install.sh
+            thor.sh
           generate_release_notes: true

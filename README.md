@@ -187,6 +187,21 @@ openbatrangs --thor --no-think "fix the failing test"
 
 ### The Thor over Tailscale
 
+One line sets up a client on any Mac or Linux box — binary, API key, and a
+ready-to-run command:
+
+```sh
+curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/thor.sh | sh
+```
+
+It installs `openbatrangs` plus an `openbatrangs-thor` wrapper, asks for the key
+once, stores it `chmod 600` at `~/.config/thor-chat/api-key`, and verifies the
+endpoint before printing what to run. Afterwards:
+
+```sh
+openbatrangs-thor "add tests for src/main.rs"
+```
+
 The Thor's chat server is reachable on the tailnet with no SSH tunnel, and it
 fronts both TensorRT Edge-LLM engines, so one URL serves both models:
 
