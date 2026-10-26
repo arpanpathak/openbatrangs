@@ -16,28 +16,24 @@ BASE_URL="https://github.com/${REPO}/releases/${VERSION}/download"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-case "${ARCH}" in
-  aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-  x86_64|amd64) TARGET="x86_64-unknown-linux-gnu" ;;
+case "${OS}" in
+  Linux)  SUFFIX="unknown-linux-gnu" ;;
+  Darwin) SUFFIX="apple-darwin" ;;
   *)
-    echo "❌ Unsupported architecture for the prebuilt binary: ${ARCH}"
-    echo "   Prebuilt releases currently target aarch64 and x86_64 Linux."
-    echo "   To build from source instead:"
-    echo "     git clone https://github.com/arpanpathak/openbatrangs.git"
-    echo "     cd openbatrangs && cargo build --release"
+    echo "❌ Unsupported OS: ${OS}"
     exit 1
     ;;
 esac
 
-case "${OS}" in
-  Linux) ;;
-  Darwin)
-    echo "❌ There is no prebuilt macOS binary yet. Build it from source (needs Rust):"
-    echo "     cargo install --git https://github.com/${REPO} --locked"
-    exit 1
-    ;;
+case "${ARCH}" in
+  aarch64|arm64) TARGET="aarch64-${SUFFIX}" ;;
+  x86_64|amd64)  TARGET="x86_64-${SUFFIX}" ;;
   *)
-    echo "❌ Unsupported OS: ${OS}"
+    echo "❌ Unsupported architecture for the prebuilt binary: ${ARCH}"
+    echo "   Prebuilt releases target aarch64 and x86_64 on Linux and macOS."
+    echo "   To build from source instead:"
+    echo "     git clone https://github.com/arpanpathak/openbatrangs.git"
+    echo "     cd openbatrangs && cargo build --release"
     exit 1
     ;;
 esac
