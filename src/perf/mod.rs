@@ -328,6 +328,9 @@ mod tests {
         assert_eq!(parse_kibibytes("garbage"), 0);
     }
 
+    // `/proc` exists only on Linux. These two read the real kernel files, so
+    // they are meaningless (and fail) on macOS and Windows builds.
+    #[cfg(target_os = "linux")]
     #[test]
     fn reads_memory_from_proc_meminfo() {
         let memory = read_memory_mb();
@@ -336,6 +339,7 @@ mod tests {
         assert!(memory.used_mb <= memory.total_mb);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn reads_cpu_times_from_proc_stat() {
         let times = read_cpu_times();
