@@ -15,9 +15,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux is cross-built with zig, so one runner covers both arches.
           - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+            os: ubuntu-latest
+          # macOS builds natively on the arm64 runner; Apple's SDK can also
+          # target the x86_64 slice with the same toolchain.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,12 +35,23 @@ jobs:
           target: ${{ matrix.target }}
 
       - uses: goto-bus-stop/setup-zig@v2
+        if: runner.os == 'Linux'
 
       - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
         run: cargo install cargo-zigbuild
 
-      - name: Build release
+      - name: Build release (Linux, zig cross)
+        if: runner.os == 'Linux'
         run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build release (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: ./target/${{ matrix.target }}/release/openbatrangs --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -55,11 +75,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # Artifact folders are already named openbatrangs-<target>, which is
+          # the exact name install.sh downloads, so keep the folder name.
           for d in artifacts/*/; do
             name="$(basename "$d")"
             cp "$d/openbatrangs" "dist/${name}"
           done
           ls -la dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

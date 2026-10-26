@@ -592,6 +592,18 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<bool> {
+        // `setup_terminal` pushes `REPORT_EVENT_TYPES`, so terminals that speak
+        // the kitty keyboard protocol deliver a Press *and* a Release event for
+        // every keystroke (plus Repeat while a key is held). Acting on all
+        // three types inserts each character twice, so only press-like events
+        // are dispatched. Terminals without the protocol always report Press.
+        if !matches!(
+            key.kind,
+            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+        ) {
+            return Ok(false);
+        }
+
         if self.is_confirming() {
             self.handle_confirmation_key(key, client, tx);
             return Ok(false);
@@ -1055,6 +1067,42 @@ mod tests {
     fn test_app() -> App {
         let cli = Cli::parse_from(["openbatrangs"]);
         App::new(&cli, Arc::new(Mutex::new(None)))
+    }
+
+    /// Terminals with the kitty keyboard protocol send Press and Release for
+    /// one keystroke; only the Press may reach the input line.
+    #[tokio::test]
+    async fn release_events_do_not_double_type() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        let mut press = event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        press.kind = event::KeyEventKind::Press;
+        let mut release = press;
+        release.kind = event::KeyEventKind::Release;
+
+        app.handle_key(press, &client, &tx).await.unwrap();
+        app.handle_key(release, &client, &tx).await.unwrap();
+
+        assert_eq!(
+            app.input, "a",
+            "a single keystroke must insert one character"
+        );
+    }
+
+    /// A held key repeats; the repeats are real input and must still land.
+    #[tokio::test]
+    async fn repeat_events_still_reach_the_input_line() {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        let mut key = event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        key.kind = event::KeyEventKind::Repeat;
+        app.handle_key(key, &client, &tx).await.unwrap();
+
+        assert_eq!(app.input, "a");
     }
 
     #[test]

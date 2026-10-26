@@ -81,7 +81,19 @@ The binary is at `target/release/openbatrangs` (or `~/.cargo/bin/openbatrangs`).
 
 ### macOS
 
-There is no prebuilt macOS binary yet. Build from source (Intel or Apple silicon):
+Prebuilt binaries exist for both Apple silicon and Intel Macs:
+
+```sh
+# Apple silicon (M1/M2/M3/M4)
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-apple-darwin
+
+# Intel
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-apple-darwin
+
+chmod +x openbatrangs && sudo mv openbatrangs /usr/local/bin/
+```
+
+Or build from source, which needs no TLS headers because the client uses `rustls`:
 
 ```sh
 xcode-select --install                 # C compiler for the TLS library; skip if installed
@@ -89,13 +101,20 @@ curl https://sh.rustup.rs -sSf | sh    # skip if you have Rust
 cargo install --git https://github.com/arpanpathak/openbatrangs --locked
 ```
 
-The GPU panel stays empty on macOS (it reads `tegrastats` or `nvidia-smi`).
+macOS is a thin client in practice: point it at a GPU box and let that machine do
+the inference (see "The Thor over Tailscale"). Locally, the GPU panel stays empty
+(it reads `tegrastats` or `nvidia-smi`) and CPU/RAM percentages stay at zero
+because those readers parse `/proc`.
 
 ### Prebuilt binaries (easiest)
 
 Download from the latest GitHub release:
 
 ```sh
+# macOS Apple silicon / Intel
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-apple-darwin
+curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-apple-darwin
+
 # Linux x86_64 (most desktops/laptops)
 curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-unknown-linux-gnu
 
