@@ -5,6 +5,7 @@
 //! - [`models`]: model listing (`list-models`).
 //! - [`doctor`]: connectivity/health report (`doctor`).
 //! - [`agent`]: one-shot agent/TUI dispatch.
+//! - [`update`]: release check and install (`update`).
 //!
 //! [`ensure_ollama`] is the shared bootstrap: it probes the server, starts
 //! `ollama serve` when the binary exists, and polls until the server responds.
@@ -19,12 +20,14 @@ mod doctor;
 mod models;
 mod pull;
 mod setup;
+mod update;
 
 pub(crate) use agent::run_agent_or_tui;
 pub(crate) use doctor::{doctor, doctor_lines};
 pub(crate) use models::list_models;
 pub(crate) use pull::pull;
 pub(crate) use setup::{setup, setup_with_status};
+pub(crate) use update::update;
 
 use crate::constants::commands::{
     OLLAMA_BINARY, OLLAMA_POLL_INTERVAL_MILLIS, OLLAMA_START_POLL_ATTEMPTS,

@@ -9,6 +9,7 @@ use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::models::ModelScore;
 use crate::ollama::{ChatMessage, ChatRequest, Delta, OllamaClient, Role};
+use crate::update::{Installer, NewRelease, UpdateCheck, daily_check};
 use anyhow::Result;
 use futures_util::{Stream, TryStreamExt};
 use serde_json::Value;
@@ -41,6 +42,13 @@ pub(crate) enum UiEvent {
         /// Human-readable prompt describing the action to confirm.
         prompt: String,
         /// One-shot channel for sending the user's yes/no answer back.
+        response: oneshot::Sender<bool>,
+    },
+    /// A newer release exists; the user answers whether to install it.
+    UpdateAvailable {
+        /// The question, naming the new and the running version.
+        prompt: String,
+        /// One-shot channel for the user's yes/no answer.
         response: oneshot::Sender<bool>,
     },
 }
@@ -368,6 +376,66 @@ pub(crate) async fn run_setup_worker(client: OllamaClient, tx: mpsc::UnboundedSe
     send_event(&tx, UiEvent::SetupDone(error_text(result)));
 }
 
+/// Check for a newer release once a day; when one exists and the user
+/// accepts it, run the installer and show its output in the transcript.
+pub(crate) async fn run_update_worker(check: UpdateCheck, tx: mpsc::UnboundedSender<UiEvent>) {
+    let Some(release) = daily_check(&check).await else {
+        return;
+    };
+
+    offer_update(&check.installer, &release, &tx).await;
+}
+
+/// Ask whether to install `release`, and install it on yes.
+async fn offer_update(
+    installer: &Installer,
+    release: &NewRelease,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    if !ask_to_install(release, tx).await {
+        return;
+    }
+
+    install_update(installer, release, tx).await;
+}
+
+/// Show the install question and wait for the answer. A closed dialog or
+/// a TUI that quit counts as no.
+async fn ask_to_install(release: &NewRelease, tx: &mpsc::UnboundedSender<UiEvent>) -> bool {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    send_event(
+        tx,
+        UiEvent::UpdateAvailable {
+            prompt: release.install_question(),
+            response: response_tx,
+        },
+    );
+
+    response_rx.await.unwrap_or(false)
+}
+
+/// Run the installer, showing each line it prints, then the restart line
+/// or the error.
+async fn install_update(
+    installer: &Installer,
+    release: &NewRelease,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    send_event(tx, UiEvent::Log(release.installing_line()));
+
+    let outcome = installer
+        .run(|line| send_event(tx, UiEvent::Log(line)))
+        .await;
+
+    let last_line = match outcome {
+        Ok(()) => release.restart_line(),
+        Err(error) => format!("⚠️ The update failed: {error:#}"),
+    };
+
+    send_event(tx, UiEvent::Log(last_line));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +553,18 @@ mod tests {
         assert!(confirm_request(UiEvent::Log(String::new())).is_none());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_check_shows_nothing() {
+        use crate::update::fakes::fake_check;
+
+        let check = fake_check("http://127.0.0.1:1/releases/latest", "exit 1");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        run_update_worker(check, tx).await;
+
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

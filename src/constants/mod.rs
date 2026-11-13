@@ -14,3 +14,4 @@ pub mod ollama;
 pub mod perf;
 pub mod tools;
 pub mod tui;
+pub mod update;

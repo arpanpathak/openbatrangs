@@ -80,8 +80,13 @@ curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/
   | OPENBATRANGS_VERSION=v0.2.3 OPENBATRANGS_INSTALL_DIR=/opt/bin sh
 ```
 
-Run the same command again to update. To download a binary yourself, pick the
-file for your system from the [latest release](https://github.com/arpanpathak/openbatrangs/releases/latest).
+Run the same command again to update, or run `openbatrangs update`. Once a day,
+openbatrangs checks GitHub for a newer release, and you see a prompt to install
+it. To turn the check off, pass `--no-update-check` or set
+`OPENBATRANGS_NO_UPDATE_CHECK=1`.
+
+To download a binary yourself, pick the file for your system from the
+[latest release](https://github.com/arpanpathak/openbatrangs/releases/latest).
 
 | System | File |
 |---|---|
@@ -166,6 +171,7 @@ openbatrangs --openai-url http://gpu-vm:8000/v1 "fix the failing test"   # run o
 openbatrangs --openai-url http://gpu-vm:8000/v1 --confirm "update the CLI docs"
 openbatrangs --openai-url http://gpu-vm:8000/v1 --read-only "suggest a refactoring plan"
 openbatrangs --openai-url https://gpu-vm.example.com/v1 --api-key-file ~/.config/gpu-vm/key
+openbatrangs update                                                      # install the latest release
 ```
 
 | Option | Effect |
@@ -180,6 +186,7 @@ openbatrangs --openai-url https://gpu-vm.example.com/v1 --api-key-file ~/.config
 | `--max-ctx <tokens>` | an upper limit on the context window |
 | `--no-think` | thinking off, for thinking models |
 | `--searxng-url <url>` | the SearXNG instance for web search |
+| `--no-update-check` | no daily check for a newer release |
 
 ### Web search
 

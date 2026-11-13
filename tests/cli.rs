@@ -92,6 +92,7 @@ fn ollama_route(path: &str) -> (u16, String) {
             200,
             "{\"status\":\"pulling manifest\"}\n{\"status\":\"success\"}\n".to_string(),
         ),
+        "/releases/latest" => (200, r#"{"tag_name":"v99.0.0"}"#.to_string()),
         _ => (500, "chat is down".to_string()),
     }
 }
@@ -153,9 +154,36 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_openbatrangs")
 }
 
+/// The binary with the automatic release check turned off, so no test
+/// reaches GitHub.
+fn openbatrangs() -> Command {
+    let mut command = Command::new(bin());
+
+    command.env("OPENBATRANGS_NO_UPDATE_CHECK", "1");
+
+    command
+}
+
 /// Run the binary with `args` and collect its output.
 fn run(args: &[&str]) -> Result<Output> {
-    Ok(Command::new(bin()).args(args).output()?)
+    Ok(openbatrangs().args(args).output()?)
+}
+
+/// The binary with the release check pointed at `server` and a new empty
+/// cache folder, and with the check turned on unless the environment turns
+/// it off.
+fn with_release_server(server: &MockServer, name: &str) -> Result<Command> {
+    let mut command = Command::new(bin());
+
+    command
+        .env_remove("OPENBATRANGS_NO_UPDATE_CHECK")
+        .env(
+            "OPENBATRANGS_RELEASE_URL",
+            format!("{}/releases/latest", server.url()),
+        )
+        .env("XDG_CACHE_HOME", empty_workspace(name)?);
+
+    Ok(command)
 }
 
 /// A new empty directory for the agent to work in, as a `--cwd` argument.
@@ -293,6 +321,7 @@ fn no_task_without_a_terminal_fails_to_start_the_tui() -> Result<()> {
     let server = MockServer::start(ollama_route)?;
 
     let output = Command::new("setsid")
+        .env("OPENBATRANGS_NO_UPDATE_CHECK", "1")
         .args(["--wait", bin(), "--ollama-url", server.url()])
         .output()?;
 
@@ -343,7 +372,7 @@ fn confirm_runs_the_command_after_y() -> Result<()> {
     let openai_url = format!("{}/v1", server.url());
     let workspace_arg = empty_workspace("confirm")?;
 
-    let mut child = Command::new(bin())
+    let mut child = openbatrangs()
         .args([
             "--openai-url",
             &openai_url,
@@ -406,8 +435,105 @@ fn tui_starts_in_a_terminal_and_quits_on_exit() -> Result<()> {
         "(sleep 2; printf '/exit\\r'; sleep 2) | timeout 20 script -qec '{tui_command}' /dev/null"
     );
 
-    let output = Command::new("sh").args(["-c", &session]).output()?;
+    let output = Command::new("sh")
+        .env("OPENBATRANGS_NO_UPDATE_CHECK", "1")
+        .args(["-c", &session])
+        .output()?;
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
+    Ok(())
+}
+
+/// The line a one-shot run prints when the release server has v99.0.0.
+const NEW_RELEASE_LINE: &str = concat!(
+    "openbatrangs 99.0.0 is available (you have ",
+    env!("CARGO_PKG_VERSION"),
+    "). Run: openbatrangs update"
+);
+
+/// After a one-shot task, a newer release is named in one line, and the
+/// exit code stays the task's own.
+#[test]
+fn a_one_shot_task_names_a_newer_release() -> Result<()> {
+    let server = MockServer::start(ollama_route)?;
+    let workspace_arg = empty_workspace("one-shot-release")?;
+
+    let output = with_release_server(&server, "one-shot-release-cache")?
+        .args(["--ollama-url", server.url(), "--cwd", &workspace_arg])
+        .args(["say", "hello"])
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("chat is down"));
+    assert!(
+        stdout(&output).contains(NEW_RELEASE_LINE),
+        "stdout: {}",
+        stdout(&output)
+    );
+    Ok(())
+}
+
+/// `--no-update-check` and `OPENBATRANGS_NO_UPDATE_CHECK=1` each turn the
+/// one-shot line off.
+#[test]
+fn the_flag_and_the_variable_turn_the_check_off() -> Result<()> {
+    let server = MockServer::start(ollama_route)?;
+    let workspace_arg = empty_workspace("no-update-check")?;
+
+    let with_flag = with_release_server(&server, "no-update-check-flag")?
+        .args(["--no-update-check", "--ollama-url", server.url()])
+        .args(["--cwd", &workspace_arg, "say", "hello"])
+        .output()?;
+    let with_variable = with_release_server(&server, "no-update-check-variable")?
+        .env("OPENBATRANGS_NO_UPDATE_CHECK", "1")
+        .args(["--ollama-url", server.url(), "--cwd", &workspace_arg])
+        .args(["say", "hello"])
+        .output()?;
+
+    assert!(stderr(&with_flag).contains("chat is down"));
+    assert!(!stdout(&with_flag).contains("is available"));
+    assert!(stderr(&with_variable).contains("chat is down"));
+    assert!(!stdout(&with_variable).contains("is available"));
+    Ok(())
+}
+
+/// A server whose latest release is the running version.
+fn current_release_route(_path: &str) -> (u16, String) {
+    let body = format!(r#"{{"tag_name":"v{}"}}"#, env!("CARGO_PKG_VERSION"));
+
+    (200, body)
+}
+
+/// `openbatrangs update` checks even with the automatic check turned off,
+/// and says when the running version is the latest.
+#[test]
+fn update_reports_an_up_to_date_binary() -> Result<()> {
+    let server = MockServer::start(current_release_route)?;
+
+    let output = with_release_server(&server, "update-current")?
+        .env("OPENBATRANGS_NO_UPDATE_CHECK", "1")
+        .args(["--no-update-check", "update"])
+        .output()?;
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("is up to date"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    Ok(())
+}
+
+/// `openbatrangs update` reports a release server that cannot be read.
+#[test]
+fn update_reports_an_unreachable_release_server() -> Result<()> {
+    let output = openbatrangs()
+        .env("OPENBATRANGS_RELEASE_URL", CLOSED_URL)
+        .env("XDG_CACHE_HOME", empty_workspace("update-closed")?)
+        .arg("update")
+        .output()?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot read the latest release"));
     Ok(())
 }
