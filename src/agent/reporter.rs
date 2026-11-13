@@ -28,16 +28,32 @@ pub trait Reporter: Send {
 pub struct StdoutReporter;
 
 impl Reporter for StdoutReporter {
+    /// Print `msg` followed by a newline.
     fn line(&mut self, msg: String) {
-        if msg.is_empty() {
-            println!();
-        } else {
-            println!("{msg}");
-        }
+        println!("{msg}");
     }
 
+    /// Print `msg` without a newline and flush, so streamed text shows at once.
     fn chunk(&mut self, msg: &str) {
         print!("{msg}");
-        let _ = std::io::stdout().flush();
+
+        // A failed flush only delays the text until the next newline.
+        std::io::stdout().flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_reporter_prints_lines_and_chunks() -> anyhow::Result<()> {
+        let mut reporter = StdoutReporter;
+
+        reporter.line(String::new());
+        reporter.line("a line".to_string());
+        reporter.chunk("a chunk");
+
+        Ok(())
     }
 }

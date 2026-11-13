@@ -113,53 +113,16 @@ impl Tool {
     /// A typed [`Tool`], or an error when the tool name is unknown or an
     /// argument has the wrong type.
     pub(super) fn from_call(call: ToolCall) -> Result<Self> {
-        let args = &call.arguments;
-        match call.name.as_str() {
-            "list_files" => Ok(Self::ListFiles {
-                path: path_arg(args)?.unwrap_or(".").to_string(),
-            }),
-            "read_file" => Ok(Self::ReadFile {
-                path: path_arg(args)?
-                    .ok_or_else(|| anyhow!("read_file requires 'path'"))?
-                    .to_string(),
-                max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
-                    as usize,
-            }),
-            "grep_files" => Ok(Self::GrepFiles {
-                pattern: required_string_arg(args, "pattern", "grep_files")?.to_string(),
-                path: path_arg(args)?.unwrap_or(".").to_string(),
-                max_results: optional_u64_arg(args, "max_results")?
-                    .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64)
-                    as usize,
-            }),
-            "web_search" => Ok(Self::WebSearch {
-                query: required_string_arg(args, "query", "web_search")?.to_string(),
-            }),
-            "web_read" => Ok(Self::WebRead {
-                url: required_string_arg(args, "url", "web_read")?.to_string(),
-            }),
-            "write_file" => Ok(Self::WriteFile {
-                path: path_arg(args)?
-                    .ok_or_else(|| anyhow!("write_file requires 'path'"))?
-                    .to_string(),
-                content: required_string_arg(args, "content", "write_file")?.to_string(),
-            }),
-            "edit_file" => Ok(Self::EditFile {
-                path: path_arg(args)?
-                    .ok_or_else(|| anyhow!("edit_file requires 'path'"))?
-                    .to_string(),
-                old_string: required_string_arg(args, "old_string", "edit_file")?.to_string(),
-                new_string: required_string_arg(args, "new_string", "edit_file")?.to_string(),
-                replace_all: optional_bool_arg(args, "replace_all")?.unwrap_or(false),
-            }),
-            "run_command" => Ok(Self::RunCommand {
-                command: required_string_arg(args, "command", "run_command")?.to_string(),
-            }),
-            "finish" => Ok(Self::Finish {
-                summary: string_arg(args, "summary")?.unwrap_or("done").to_string(),
-            }),
-            other => bail!("unknown tool: {other}"),
-        }
+        let parser = TOOL_PARSERS
+            .iter()
+            .find(|(name, _)| *name == call.name)
+            .map(|(_, parser)| parser);
+
+        let Some(parse) = parser else {
+            bail!("unknown tool: {}", call.name);
+        };
+
+        parse(&call.arguments)
     }
 
     /// Human-readable one-line description shown before the tool executes.
@@ -176,6 +139,95 @@ impl Tool {
             Self::Finish { .. } => "finish".to_string(),
         }
     }
+}
+
+/// Builds one [`Tool`] variant from the call's JSON arguments.
+type ToolParser = fn(&Value) -> Result<Tool>;
+
+/// The parser for each tool name the model may call.
+const TOOL_PARSERS: [(&str, ToolParser); 9] = [
+    ("list_files", list_files_tool),
+    ("read_file", read_file_tool),
+    ("grep_files", grep_files_tool),
+    ("web_search", web_search_tool),
+    ("web_read", web_read_tool),
+    ("write_file", write_file_tool),
+    ("edit_file", edit_file_tool),
+    ("run_command", run_command_tool),
+    ("finish", finish_tool),
+];
+
+/// `list_files`: the directory defaults to the workspace root.
+fn list_files_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::ListFiles {
+        path: path_arg(args)?.unwrap_or(".").to_string(),
+    })
+}
+
+/// `read_file`: a required path and an optional character cap.
+fn read_file_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::ReadFile {
+        path: required_path_arg(args, "read_file")?.to_string(),
+        max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
+            as usize,
+    })
+}
+
+/// `grep_files`: a required pattern, a directory, and a result cap.
+fn grep_files_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::GrepFiles {
+        pattern: required_string_arg(args, "pattern", "grep_files")?.to_string(),
+        path: path_arg(args)?.unwrap_or(".").to_string(),
+        max_results: optional_u64_arg(args, "max_results")?
+            .unwrap_or(DEFAULT_GREP_MAX_RESULTS as u64) as usize,
+    })
+}
+
+/// `web_search`: a required query.
+fn web_search_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::WebSearch {
+        query: required_string_arg(args, "query", "web_search")?.to_string(),
+    })
+}
+
+/// `web_read`: a required URL.
+fn web_read_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::WebRead {
+        url: required_string_arg(args, "url", "web_read")?.to_string(),
+    })
+}
+
+/// `write_file`: a required path and the complete content.
+fn write_file_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::WriteFile {
+        path: required_path_arg(args, "write_file")?.to_string(),
+        content: required_string_arg(args, "content", "write_file")?.to_string(),
+    })
+}
+
+/// `edit_file`: a path, the text to find, its replacement, and whether to
+/// replace every occurrence.
+fn edit_file_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::EditFile {
+        path: required_path_arg(args, "edit_file")?.to_string(),
+        old_string: required_string_arg(args, "old_string", "edit_file")?.to_string(),
+        new_string: required_string_arg(args, "new_string", "edit_file")?.to_string(),
+        replace_all: optional_bool_arg(args, "replace_all")?.unwrap_or(false),
+    })
+}
+
+/// `run_command`: a required command line.
+fn run_command_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::RunCommand {
+        command: required_string_arg(args, "command", "run_command")?.to_string(),
+    })
+}
+
+/// `finish`: the summary defaults to `done`.
+fn finish_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::Finish {
+        summary: string_arg(args, "summary")?.unwrap_or("done").to_string(),
+    })
 }
 
 /// The two possible shapes of a model response: either a final `answer` or a
@@ -203,16 +255,22 @@ pub(super) struct AgentResponse {
 ///
 /// A parsed [`AgentResponse`], or an error describing the JSON problem.
 pub(super) fn parse_agent_response(content: &str) -> Result<AgentResponse> {
-    let cleaned = content
+    let value: Value = serde_json::from_str(strip_code_fence(content))
+        .with_context(|| format!("invalid JSON from model: {content}"))?;
+
+    serde_json::from_value(nest_flat_tool_call(value))
+        .with_context(|| format!("JSON did not match agent schema: {content}"))
+}
+
+/// `content` without surrounding whitespace and without a markdown code
+/// fence around it, which smaller local models add to their JSON.
+pub(super) fn strip_code_fence(content: &str) -> &str {
+    content
         .trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
-        .trim();
-    let value: Value = serde_json::from_str(cleaned)
-        .with_context(|| format!("invalid JSON from model: {content}"))?;
-    serde_json::from_value(nest_flat_tool_call(value))
-        .with_context(|| format!("JSON did not match agent schema: {content}"))
+        .trim()
 }
 
 /// Rewrites the flat shape some models use,
@@ -249,36 +307,51 @@ const PATH_ALIASES: [&str; 5] = ["path", "file_path", "filepath", "file", "filen
 
 /// Read the path argument under `path` or one of the names models commonly
 /// use instead, so a `file_path` from the model does not fail the call.
+///
+/// The first alias with a non-null value is used; it must be a string.
 pub(super) fn path_arg(args: &Value) -> Result<Option<&str>> {
-    for key in PATH_ALIASES {
-        if let Some(value) = string_arg(args, key)? {
-            return Ok(Some(value));
-        }
-    }
-    Ok(None)
+    let key = PATH_ALIASES
+        .iter()
+        .find(|key| present_arg(args, key).is_some());
+
+    key.map_or(Ok(None), |key| string_arg(args, key))
+}
+
+/// Require the path argument of `tool_name`.
+fn required_path_arg<'a>(args: &'a Value, tool_name: &str) -> Result<&'a str> {
+    path_arg(args)?.ok_or_else(|| anyhow!("{tool_name} requires 'path'"))
+}
+
+/// The argument under `key`, or `None` when it is missing or `null`.
+fn present_arg<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
+    args.get(key).filter(|value| !value.is_null())
 }
 
 /// Read an optional string argument.
 ///
 /// `null` and missing keys both produce `None`; any other JSON type is an
-/// error so the model cannot smuggle a number into a path.
+/// error, so a number is never used as a path.
 pub(super) fn string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
-    match args.get(key) {
-        Some(Value::String(value)) => Ok(Some(value)),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => bail!("argument '{key}' must be a string"),
-    }
+    present_arg(args, key)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("argument '{key}' must be a string"))
+        })
+        .transpose()
 }
 
 /// Read an optional boolean argument.
 ///
 /// `null` and missing keys both produce `None`; any other JSON type is an error.
 pub(super) fn optional_bool_arg(args: &Value, key: &str) -> Result<Option<bool>> {
-    match args.get(key) {
-        Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => bail!("argument '{key}' must be a boolean"),
-    }
+    present_arg(args, key)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("argument '{key}' must be a boolean"))
+        })
+        .transpose()
 }
 
 /// Read an optional non-negative integer argument.
@@ -286,93 +359,210 @@ pub(super) fn optional_bool_arg(args: &Value, key: &str) -> Result<Option<bool>>
 /// `null` and missing keys both produce `None`; negative or non-numeric values
 /// are rejected.
 pub(super) fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
-    match args.get(key) {
-        Some(Value::Number(number)) => number
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer")),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => bail!("argument '{key}' must be a number"),
-    }
+    present_arg(args, key)
+        .map(|value| u64_value(value, key))
+        .transpose()
+}
+
+/// A JSON number as a `u64`; `key` names the argument in the error.
+fn u64_value(value: &Value, key: &str) -> Result<u64> {
+    let Value::Number(number) = value else {
+        bail!("argument '{key}' must be a number");
+    };
+
+    number
+        .as_u64()
+        .ok_or_else(|| anyhow!("argument '{key}' must be a non-negative integer"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn parses_agent_response_without_code_fence() {
-        let response =
-            parse_agent_response(r#"{"answer":"done"}"#).expect("valid response should parse");
-        assert_eq!(response.answer.as_deref(), Some("done"));
-        assert!(response.tool.is_none());
+    /// Parse a call to `name` with `arguments`.
+    fn tool(name: &str, arguments: Value) -> Result<Tool> {
+        Tool::from_call(ToolCall {
+            name: name.to_string(),
+            arguments,
+        })
     }
 
     #[test]
-    fn parses_agent_response_with_code_fence() {
+    fn parses_agent_response_without_code_fence() -> Result<()> {
+        let response = parse_agent_response(r#"{"answer":"done"}"#)?;
+
+        assert_eq!(response.answer.as_deref(), Some("done"));
+        assert!(response.tool.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_agent_response_with_code_fence() -> Result<()> {
         let response = parse_agent_response(
             "```json\n{\"tool\":{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}}\n```",
-        )
-        .expect("valid fenced response should parse");
+        )?;
+
         assert!(response.tool.is_some());
+
+        Ok(())
     }
 
     #[test]
     fn rejects_invalid_agent_response() {
         assert!(parse_agent_response("not json").is_err());
+        assert!(parse_agent_response(r#"{"answer": 7}"#).is_err());
     }
 
     #[test]
-    fn parses_the_flat_tool_call_shape() {
+    fn parses_the_flat_tool_call_shape() -> Result<()> {
         let response =
-            parse_agent_response(r#"{"tool": "read_file", "arguments": {"path": "Cargo.toml"}}"#)
-                .expect("flat tool call should parse");
-        let tool = Tool::from_call(response.tool.expect("tool call")).expect("valid tool");
-        assert_eq!(tool.describe(), "read_file → Cargo.toml");
+            parse_agent_response(r#"{"tool": "read_file", "arguments": {"path": "Cargo.toml"}}"#)?;
+        let call = response.tool.context("tool call")?;
+
+        assert_eq!(Tool::from_call(call)?.describe(), "read_file → Cargo.toml");
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_file_path_as_the_path_argument() {
-        let call = ToolCall {
-            name: "read_file".to_string(),
-            arguments: serde_json::json!({"file_path": "Cargo.toml"}),
-        };
-        let tool = Tool::from_call(call).expect("file_path should be accepted");
-        assert_eq!(tool.describe(), "read_file → Cargo.toml");
+    fn the_flat_shape_accepts_args_and_no_arguments() -> Result<()> {
+        let with_args = parse_agent_response(r#"{"tool": "list_files", "args": {"path": "src"}}"#)?;
+        let call = with_args.tool.context("tool call")?;
+        assert_eq!(call.arguments, json!({"path": "src"}));
+
+        let without = parse_agent_response(r#"{"tool": "finish"}"#)?;
+        let call = without.tool.context("tool call")?;
+        assert_eq!(call.arguments, json!({}));
+
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_file_path_as_the_path_argument() -> Result<()> {
+        let parsed = tool("read_file", json!({"file_path": "Cargo.toml"}))?;
+
+        assert_eq!(parsed.describe(), "read_file → Cargo.toml");
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_null_path_alias_falls_through_to_the_next_one() -> Result<()> {
+        let args = json!({"path": null, "filename": "a.rs"});
+
+        assert_eq!(path_arg(&args)?, Some("a.rs"));
+        assert_eq!(path_arg(&json!({}))?, None);
+        assert!(path_arg(&json!({"file": 3})).is_err());
+
+        Ok(())
     }
 
     #[test]
     fn rejects_non_string_tool_argument() {
-        let args = serde_json::json!({"path": 42});
+        let args = json!({"path": 42});
+
         assert!(string_arg(&args, "path").is_err());
     }
 
     #[test]
-    fn tool_from_call_parses_known_tools() {
-        let call = ToolCall {
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({"path": "a.txt", "content": "x"}),
-        };
-        let tool = Tool::from_call(call).unwrap();
-        assert!(
-            matches!(tool, Tool::WriteFile { path, content } if path == "a.txt" && content == "x")
+    fn tool_from_call_parses_known_tools() -> Result<()> {
+        let parsed = tool("write_file", json!({"path": "a.txt", "content": "x"}))?;
+
+        assert_eq!(
+            format!("{parsed:?}"),
+            r#"WriteFile { path: "a.txt", content: "x" }"#
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn every_tool_parses_and_describes_itself() {
+        let calls = [
+            ("list_files", json!({}), "list_files → ."),
+            ("read_file", json!({"path": "a.rs"}), "read_file → a.rs"),
+            (
+                "grep_files",
+                json!({"pattern": "fn"}),
+                "grep_files → \"fn\" in .",
+            ),
+            (
+                "web_search",
+                json!({"query": "tokio"}),
+                "web_search → tokio",
+            ),
+            (
+                "web_read",
+                json!({"url": "https://a.b"}),
+                "web_read → https://a.b",
+            ),
+            (
+                "write_file",
+                json!({"path": "a", "content": ""}),
+                "write_file → a",
+            ),
+            (
+                "edit_file",
+                json!({"path": "a", "old_string": "x", "new_string": "y", "replace_all": true}),
+                "edit_file → a",
+            ),
+            ("run_command", json!({"command": "ls"}), "run_command → ls"),
+            ("finish", json!({}), "finish"),
+        ];
+
+        for (name, arguments, description) in calls {
+            let described = tool(name, arguments).map(|parsed| parsed.describe());
+            assert_eq!(described.ok().as_deref(), Some(description));
+        }
+    }
+
+    #[test]
+    fn defaults_fill_optional_arguments() -> Result<()> {
+        let read = tool("read_file", json!({"path": "a"}))?;
+        let grep = tool("grep_files", json!({"pattern": "x", "max_results": 5}))?;
+        let finish = tool("finish", json!({"summary": null}))?;
+
+        assert!(matches!(
+            read,
+            Tool::ReadFile {
+                max_chars: DEFAULT_READ_CHARS,
+                ..
+            }
+        ));
+        assert!(matches!(grep, Tool::GrepFiles { max_results: 5, .. }));
+        assert_eq!(format!("{finish:?}"), r#"Finish { summary: "done" }"#);
+
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_argument_types_are_errors() {
+        let bad_calls = [
+            ("read_file", json!({})),
+            ("read_file", json!({"path": "a", "max_chars": -1})),
+            ("read_file", json!({"path": "a", "max_chars": "many"})),
+            (
+                "edit_file",
+                json!({"path": "a", "old_string": "x", "new_string": "y", "replace_all": "yes"}),
+            ),
+            ("web_search", json!({})),
+        ];
+
+        for (name, arguments) in bad_calls {
+            assert!(tool(name, arguments).is_err(), "{name} should be rejected");
+        }
     }
 
     #[test]
     fn tool_from_call_rejects_unknown_tool() {
-        let call = ToolCall {
-            name: "rm_rf".to_string(),
-            arguments: serde_json::json!({}),
-        };
-        assert!(Tool::from_call(call).is_err());
+        assert!(tool("rm_rf", json!({})).is_err());
     }
 
     #[test]
-    fn tool_describe_is_human_readable() {
-        let tool = Tool::ListFiles {
-            path: "src".to_string(),
-        };
-        assert_eq!(tool.describe(), "list_files → src");
+    fn code_fences_are_stripped() {
+        assert_eq!(strip_code_fence(" ```json\n{}\n``` "), "{}");
+        assert_eq!(strip_code_fence("```\n{}\n```"), "{}");
     }
 }

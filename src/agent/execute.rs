@@ -7,7 +7,8 @@
 //! Mutating tools are protected by two guards:
 //!
 //! - [`AgentConfig::is_read_only`] disables writes/commands entirely.
-//! - [`Confirmer`] asks the user before a write/command when confirm mode is on.
+//! - [`Confirmer`] shows a yes/no prompt before a write/command when confirm
+//!   mode is on.
 //!
 //! Results are also made terminal-friendly: written files become OSC 8
 //! hyperlinks and control characters are stripped so a model cannot inject
@@ -27,7 +28,7 @@ use crate::constants::agent::COMMAND_TIMEOUT_SECONDS;
 use crate::constants::ansi::{ANSI_GREEN_CHECK, ANSI_YELLOW_FILES_HEADER};
 use crate::constants::tools::{DEFAULT_LIST_DEPTH, MAX_TOOL_OUTPUT};
 use crate::tools;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use std::path::Path;
 
 /// Execute a tool call, returning its output or a formatted error message.
@@ -48,8 +49,8 @@ pub(super) async fn execute_tool_or_report_error<C: Confirmer>(
 
 /// Execute a typed tool call and return its text result.
 ///
-/// Mutating tools (write, run command) are guarded by read-only mode and
-/// user confirmation.
+/// Mutating tools (write, edit, run command) are guarded by read-only mode
+/// and user confirmation.
 pub(super) async fn execute_tool<C: Confirmer>(
     config: &AgentConfig,
     cwd: &Path,
@@ -60,8 +61,7 @@ pub(super) async fn execute_tool<C: Confirmer>(
     match tool {
         Tool::ListFiles { path } => tools::list_files(cwd, path, DEFAULT_LIST_DEPTH),
         Tool::ReadFile { path, max_chars } => {
-            let max_chars = (*max_chars).min(MAX_TOOL_OUTPUT);
-            tools::read_file(cwd, path, max_chars)
+            tools::read_file(cwd, path, (*max_chars).min(MAX_TOOL_OUTPUT))
         }
         Tool::GrepFiles {
             pattern,
@@ -73,16 +73,7 @@ pub(super) async fn execute_tool<C: Confirmer>(
         }
         Tool::WebRead { url } => tools::web_read(url).await,
         Tool::WriteFile { path, content } => {
-            ensure_not_read_only(config)?;
-            if let Some(reason) = placeholder_reason(content) {
-                bail!(
-                    "quality gate: refusing to write '{path}' because the content looks like a placeholder ({reason}). Write the complete implementation."
-                );
-            }
-            confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
-            let result = tools::write_file(cwd, path, content)?;
-            changed_files.push(path.clone());
-            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
+            write_file(config, cwd, path, content, changed_files, confirmer).await
         }
         Tool::EditFile {
             path,
@@ -90,30 +81,130 @@ pub(super) async fn execute_tool<C: Confirmer>(
             new_string,
             replace_all,
         } => {
-            ensure_not_read_only(config)?;
-            confirm_or_abort(config, confirmer, &format!("edit file '{path}'?")).await?;
-            let result = tools::edit_file(cwd, path, old_string, new_string, *replace_all)?;
-            changed_files.push(path.clone());
-            Ok(format!("{result}\n📎 {}", clickable_path(cwd, path)))
+            edit_file(
+                config,
+                cwd,
+                Edit {
+                    path,
+                    old_string,
+                    new_string,
+                    replace_all: *replace_all,
+                },
+                changed_files,
+                confirmer,
+            )
+            .await
         }
-        Tool::RunCommand { command } => {
-            ensure_not_read_only(config)?;
-            confirm_or_abort(config, confirmer, &format!("run command: {command}")).await?;
-            tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS).await
-        }
+        Tool::RunCommand { command } => run_command(config, cwd, command, confirmer).await,
         Tool::Finish { summary } => Ok(format!("{ANSI_GREEN_CHECK} {summary}")),
     }
 }
 
+/// The arguments of one `edit_file` call.
+struct Edit<'a> {
+    /// File path relative to the workspace.
+    path: &'a str,
+    /// Exact text to find.
+    old_string: &'a str,
+    /// Replacement text.
+    new_string: &'a str,
+    /// Replace every occurrence instead of requiring a unique match.
+    replace_all: bool,
+}
+
+/// Write `content` to `path` after the read-only, placeholder, and
+/// confirmation checks, and record the path as changed.
+async fn write_file<C: Confirmer>(
+    config: &AgentConfig,
+    cwd: &Path,
+    path: &str,
+    content: &str,
+    changed_files: &mut Vec<String>,
+    confirmer: &mut C,
+) -> Result<String> {
+    ensure_not_read_only(config)?;
+    ensure_not_placeholder(path, content)?;
+    confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
+
+    let result = tools::write_file(cwd, path, content)?;
+    Ok(record_change(cwd, path, &result, changed_files))
+}
+
+/// Apply `edit` after the read-only and confirmation checks, and record the
+/// path as changed.
+async fn edit_file<C: Confirmer>(
+    config: &AgentConfig,
+    cwd: &Path,
+    edit: Edit<'_>,
+    changed_files: &mut Vec<String>,
+    confirmer: &mut C,
+) -> Result<String> {
+    let prompt = format!("edit file '{}'?", edit.path);
+    approve(config, confirmer, &prompt).await?;
+
+    let result = tools::edit_file(
+        cwd,
+        edit.path,
+        edit.old_string,
+        edit.new_string,
+        edit.replace_all,
+    )?;
+    Ok(record_change(cwd, edit.path, &result, changed_files))
+}
+
+/// Run `command` after the read-only and confirmation checks.
+async fn run_command<C: Confirmer>(
+    config: &AgentConfig,
+    cwd: &Path,
+    command: &str,
+    confirmer: &mut C,
+) -> Result<String> {
+    approve(config, confirmer, &format!("run command: {command}")).await?;
+
+    tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS).await
+}
+
+/// Add `path` to the changed files and return the tool result followed by a
+/// clickable link to the file.
+fn record_change(cwd: &Path, path: &str, result: &str, changed_files: &mut Vec<String>) -> String {
+    changed_files.push(path.to_string());
+
+    format!("{result}\n📎 {}", clickable_path(cwd, path))
+}
+
+/// Allow a mutating tool: fail in read-only mode or when the user declines.
+async fn approve<C: Confirmer>(
+    config: &AgentConfig,
+    confirmer: &mut C,
+    prompt: &str,
+) -> Result<()> {
+    ensure_not_read_only(config)?;
+
+    confirm_or_abort(config, confirmer, prompt).await
+}
+
 /// Bail if the agent is in read-only mode.
 fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
-    if config.is_read_only {
-        bail!("this tool is disabled in read-only mode");
-    }
+    ensure!(
+        !config.is_read_only,
+        "this tool is disabled in read-only mode"
+    );
+
     Ok(())
 }
 
-/// Ask the confirmer for approval, bailing if the user denies or confirm is off.
+/// Bail if `content` looks like a placeholder instead of real file content.
+fn ensure_not_placeholder(path: &str, content: &str) -> Result<()> {
+    let Some(reason) = placeholder_reason(content) else {
+        return Ok(());
+    };
+
+    bail!(
+        "quality gate: refusing to write '{path}' because the content looks like a placeholder ({reason}). Write the complete implementation."
+    )
+}
+
+/// Ask the confirmer for approval when confirm mode is on.
 async fn confirm_or_abort<C: Confirmer>(
     config: &AgentConfig,
     confirmer: &mut C,
@@ -122,9 +213,15 @@ async fn confirm_or_abort<C: Confirmer>(
     if !config.should_confirm {
         return Ok(());
     }
-    if !confirmer.confirm(prompt).await? {
-        bail!("aborted by user");
-    }
+
+    ask_user(confirmer, prompt).await
+}
+
+/// Bail unless the user approves `prompt`.
+async fn ask_user<C: Confirmer>(confirmer: &mut C, prompt: &str) -> Result<()> {
+    let is_approved = confirmer.confirm(prompt).await?;
+    ensure!(is_approved, "aborted by user");
+
     Ok(())
 }
 
@@ -156,7 +253,13 @@ pub(super) fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], rep
     if files.is_empty() {
         return;
     }
+
     reporter.line(format!("\n{ANSI_YELLOW_FILES_HEADER}"));
+    print_file_links(cwd, files, reporter);
+}
+
+/// Print one indented clickable link per file.
+fn print_file_links<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
     for file in files {
         reporter.line(format!("   {}", clickable_path(cwd, file)));
     }
@@ -165,259 +268,321 @@ pub(super) fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tool::Tool;
-    use crate::agent::{AgentConfig, StdioConfirmer};
+    use crate::agent::fakes::{
+        FixedConfirmer, RecordingReporter, Reply, serve_replies, test_config,
+    };
+    use serde_json::json;
     use std::path::PathBuf;
+
+    /// A new empty workspace directory.
+    fn temp_root() -> PathBuf {
+        crate::test_support::unique_temp_dir("openbatrangs-execute-test")
+    }
+
+    /// Run `tool` in the workspace of `config`.
+    async fn run(
+        config: &AgentConfig,
+        tool: Tool,
+        changed_files: &mut Vec<String>,
+        confirmer: &mut FixedConfirmer,
+    ) -> Result<String> {
+        execute_tool(config, &config.cwd, &tool, changed_files, confirmer).await
+    }
 
     #[test]
     fn clickable_path_encodes_special_characters() {
-        let path = std::path::Path::new("/tmp/a b#c");
-        let link = clickable_path(path, "x");
-        assert!(link.contains("a%20b%23c"));
-        assert!(link.contains("/tmp/a b#c"));
+        let link = clickable_path(Path::new("/tmp/a b#c?d%"), "x");
+
+        assert!(link.contains("a%20b%23c%3Fd%25"));
+        assert!(link.contains("/tmp/a b#c?d%"));
     }
 
     #[test]
     fn clickable_path_strips_terminal_escape_injection() {
-        let path = std::path::Path::new("/tmp");
-        let link = clickable_path(path, "evil\x1b]8;;http://evil\x1b\\file.txt");
+        let link = clickable_path(Path::new("/tmp"), "evil\x1b]8;;http://evil\x1b\\file.txt");
+
         assert!(!link.contains("\x1b]8;;http://evil"));
         assert!(link.contains("file.txt"));
     }
 
     #[tokio::test]
-    async fn execute_tool_reads_what_it_writes() {
-        let root = crate::test_support::unique_temp_dir("openbatrangs-agent-test");
-        let config = AgentConfig {
-            cwd: root.clone(),
-            max_steps: 1,
-            is_read_only: false,
-            should_confirm: false,
-            show_thinking: true,
-            model_context: 8_192,
-            max_ctx: Some(8_192),
-            searxng_url: "http://127.0.0.1:8888".to_string(),
-            search_key: None,
-        };
+    async fn execute_tool_reads_what_it_writes() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
         let mut changed = Vec::new();
-        let mut confirmer = StdioConfirmer;
-        execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "src/lib.rs".to_string(),
-                content: "pub fn f() {}".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await
-        .unwrap();
-        let output = execute_tool(
-            &config,
-            &root,
-            &Tool::ReadFile {
-                path: "src/lib.rs".to_string(),
-                max_chars: 100,
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await
-        .unwrap();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let write = Tool::WriteFile {
+            path: "src/lib.rs".to_string(),
+            content: "pub fn f() {}".to_string(),
+        };
+        let written = run(&config, write, &mut changed, &mut confirmer).await?;
+        assert!(written.contains("📎"));
+
+        let read = Tool::ReadFile {
+            path: "src/lib.rs".to_string(),
+            max_chars: 100,
+        };
+        let output = run(&config, read, &mut changed, &mut confirmer).await?;
         assert!(output.contains("pub fn f() {}"));
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(changed, vec!["src/lib.rs"]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn execute_tool_rejects_placeholder_write() {
+    async fn execute_tool_lists_greps_edits_and_runs() -> Result<()> {
         let root = temp_root();
-        let config = test_config(&root, false);
+        std::fs::write(root.join("notes.txt"), "alpha\nbeta\n")?;
+        let config = test_config(&root, 1);
         let mut changed = Vec::new();
-        let mut confirmer = StdioConfirmer;
+        let mut confirmer = FixedConfirmer::new(true);
 
-        let result = execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "README.md".to_string(),
-                content: "# Design\n\nTODO: implement the full answer.".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await;
+        let list = Tool::ListFiles {
+            path: ".".to_string(),
+        };
+        assert!(
+            run(&config, list, &mut changed, &mut confirmer)
+                .await?
+                .contains("notes.txt")
+        );
 
-        assert!(result.is_err());
-        assert!(format!("{:#}", result.unwrap_err()).contains("quality gate"));
+        let grep = Tool::GrepFiles {
+            pattern: "be.a".to_string(),
+            path: ".".to_string(),
+            max_results: 5,
+        };
+        assert!(
+            run(&config, grep, &mut changed, &mut confirmer)
+                .await?
+                .contains("beta")
+        );
+
+        let edit = Tool::EditFile {
+            path: "notes.txt".to_string(),
+            old_string: "alpha".to_string(),
+            new_string: "gamma".to_string(),
+            replace_all: false,
+        };
+        run(&config, edit, &mut changed, &mut confirmer).await?;
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt"))?,
+            "gamma\nbeta\n"
+        );
+
+        let command = Tool::RunCommand {
+            command: "echo ran".to_string(),
+        };
+        assert!(
+            run(&config, command, &mut changed, &mut confirmer)
+                .await?
+                .contains("ran")
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_tool_searches_and_refuses_local_pages() -> Result<()> {
+        let results = json!({ "results": [
+            { "title": "Tokio", "url": "https://docs.rs/tokio", "content": "async runtime" }
+        ] });
+        let root = temp_root();
+        let mut config = test_config(&root, 1);
+        config.searxng_url = serve_replies(vec![Reply::json(&results)]).await?;
+        let mut changed = Vec::new();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let search = Tool::WebSearch {
+            query: "tokio".to_string(),
+        };
+        let found = run(&config, search, &mut changed, &mut confirmer).await?;
+        assert!(found.contains("https://docs.rs/tokio"));
+
+        let read = Tool::WebRead {
+            url: "http://127.0.0.1:9/page".to_string(),
+        };
+        assert!(
+            run(&config, read, &mut changed, &mut confirmer)
+                .await
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_and_errors_become_text() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
+        let mut changed = Vec::new();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let finish = Tool::Finish {
+            summary: "all done".to_string(),
+        };
+        let finished =
+            execute_tool_or_report_error(&config, &root, &finish, &mut changed, &mut confirmer)
+                .await;
+        assert_eq!(finished, format!("{ANSI_GREEN_CHECK} all done"));
+
+        let missing = Tool::ReadFile {
+            path: "missing.txt".to_string(),
+            max_chars: 10,
+        };
+        let failed =
+            execute_tool_or_report_error(&config, &root, &missing, &mut changed, &mut confirmer)
+                .await;
+        assert!(failed.starts_with("Tool error: "), "{failed}");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_tool_rejects_placeholder_write() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
+        let mut changed = Vec::new();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let write = Tool::WriteFile {
+            path: "README.md".to_string(),
+            content: "# Design\n\nTODO: implement the full answer.".to_string(),
+        };
+        let result = run(&config, write, &mut changed, &mut confirmer).await;
+
+        assert!(format!("{result:?}").contains("quality gate"));
         assert!(!root.join("README.md").exists());
         assert!(changed.is_empty());
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
-    fn test_config(root: &std::path::Path, is_read_only: bool) -> AgentConfig {
-        AgentConfig {
-            cwd: root.to_path_buf(),
-            max_steps: 1,
-            is_read_only,
-            should_confirm: false,
-            show_thinking: true,
-            model_context: 8_192,
-            max_ctx: Some(8_192),
-            searxng_url: "http://127.0.0.1:8888".to_string(),
-            search_key: None,
-        }
-    }
-
-    fn temp_root() -> PathBuf {
-        crate::test_support::unique_temp_dir("openbatrangs-execute-test")
-    }
-
-    struct TestConfirmer {
-        response: bool,
-        prompts: Vec<String>,
-    }
-
-    impl Confirmer for TestConfirmer {
-        async fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
-            self.prompts.push(prompt.to_string());
-            Ok(self.response)
-        }
-    }
-
-    fn confirming_config(root: &std::path::Path) -> AgentConfig {
-        AgentConfig {
-            cwd: root.to_path_buf(),
-            max_steps: 1,
-            is_read_only: false,
-            should_confirm: true,
-            show_thinking: true,
-            model_context: 8_192,
-            max_ctx: Some(8_192),
-            searxng_url: "http://127.0.0.1:8888".to_string(),
-            search_key: None,
-        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn execute_tool_write_asks_confirmer_before_writing() {
+    async fn execute_tool_write_asks_confirmer_before_writing() -> Result<()> {
         let root = temp_root();
-        let config = confirming_config(&root);
+        let mut config = test_config(&root, 1);
+        config.should_confirm = true;
         let mut changed = Vec::new();
-        let mut confirmer = TestConfirmer {
-            response: true,
-            prompts: Vec::new(),
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let write = Tool::WriteFile {
+            path: "ok.txt".to_string(),
+            content: "x".to_string(),
         };
-        execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "ok.txt".to_string(),
-                content: "x".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await
-        .unwrap();
+        run(&config, write, &mut changed, &mut confirmer).await?;
+
         assert_eq!(confirmer.prompts, vec!["write file 'ok.txt'?"]);
         assert!(root.join("ok.txt").exists());
-        std::fs::remove_dir_all(root).unwrap();
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn execute_tool_write_aborts_when_confirmer_denies() {
+    async fn execute_tool_aborts_when_confirmer_denies() -> Result<()> {
         let root = temp_root();
-        let config = confirming_config(&root);
+        let mut config = test_config(&root, 1);
+        config.should_confirm = true;
         let mut changed = Vec::new();
-        let mut confirmer = TestConfirmer {
-            response: false,
-            prompts: Vec::new(),
+        let mut confirmer = FixedConfirmer::new(false);
+
+        let write = Tool::WriteFile {
+            path: "nope.txt".to_string(),
+            content: "x".to_string(),
         };
-        let result = execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "nope.txt".to_string(),
-                content: "x".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await;
-        assert!(result.is_err());
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("aborted by user"));
+        let written = run(&config, write, &mut changed, &mut confirmer).await;
+
+        let command = Tool::RunCommand {
+            command: "touch ran.txt".to_string(),
+        };
+        let ran = run(&config, command, &mut changed, &mut confirmer).await;
+
+        assert!(format!("{written:?}").contains("aborted by user"));
+        assert!(format!("{ran:?}").contains("aborted by user"));
+        assert_eq!(
+            confirmer.prompts,
+            vec!["write file 'nope.txt'?", "run command: touch ran.txt"]
+        );
         assert!(!root.join("nope.txt").exists());
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.join("ran.txt").exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn execute_tool_write_rejects_parent_traversal() {
-        let root = temp_root();
-        let config = test_config(&root, false);
+    async fn execute_tool_write_rejects_parent_traversal() -> Result<()> {
+        let root = temp_root().join("inner");
+        std::fs::create_dir_all(&root)?;
+        let config = test_config(&root, 1);
         let mut changed = Vec::new();
-        let mut confirmer = StdioConfirmer;
-        let result = execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "../evil.txt".to_string(),
-                content: "x".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await;
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let write = Tool::WriteFile {
+            path: "../evil.txt".to_string(),
+            content: "x".to_string(),
+        };
+        let result = run(&config, write, &mut changed, &mut confirmer).await;
+
         assert!(result.is_err());
-        assert!(!root.parent().unwrap().join("evil.txt").exists());
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.join("../evil.txt").exists());
+
+        std::fs::remove_dir_all(root.join(".."))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn execute_tool_write_respects_read_only_mode() {
+    async fn read_only_mode_blocks_every_mutating_tool() -> Result<()> {
         let root = temp_root();
-        let config = test_config(&root, true);
+        let mut config = test_config(&root, 1);
+        config.is_read_only = true;
         let mut changed = Vec::new();
-        let mut confirmer = StdioConfirmer;
-        let result = execute_tool(
-            &config,
-            &root,
-            &Tool::WriteFile {
-                path: "a.txt".to_string(),
-                content: "x".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await;
-        assert!(result.is_err());
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("read-only"));
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let write = Tool::WriteFile {
+            path: "a.txt".to_string(),
+            content: "x".to_string(),
+        };
+        let edit = Tool::EditFile {
+            path: "a.txt".to_string(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: true,
+        };
+        let command = Tool::RunCommand {
+            command: "touch nope.txt".to_string(),
+        };
+
+        let written = run(&config, write, &mut changed, &mut confirmer).await;
+        let edited = run(&config, edit, &mut changed, &mut confirmer).await;
+        let ran = run(&config, command, &mut changed, &mut confirmer).await;
+
+        let errors = format!("{written:?} {edited:?} {ran:?}");
+        assert_eq!(errors.matches("read-only").count(), 3);
         assert!(!root.join("a.txt").exists());
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.join("nope.txt").exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn execute_tool_run_command_respects_read_only_mode() {
-        let root = temp_root();
-        let config = test_config(&root, true);
-        let mut changed = Vec::new();
-        let mut confirmer = StdioConfirmer;
-        let result = execute_tool(
-            &config,
-            &root,
-            &Tool::RunCommand {
-                command: "touch nope.txt".to_string(),
-            },
-            &mut changed,
-            &mut confirmer,
-        )
-        .await;
-        assert!(result.is_err());
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("read-only"));
-        assert!(!root.join("nope.txt").exists());
-        std::fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn changed_files_are_listed_only_when_there_are_some() {
+        let mut reporter = RecordingReporter::default();
+
+        print_changed_files(Path::new("/tmp"), &[], &mut reporter);
+        assert!(reporter.output.is_empty());
+
+        let files = ["a.rs".to_string(), "b.rs".to_string()];
+        print_changed_files(Path::new("/tmp"), &files, &mut reporter);
+        assert!(reporter.output.contains(ANSI_YELLOW_FILES_HEADER));
+        assert!(reporter.output.contains("/tmp/a.rs"));
+        assert!(reporter.output.contains("/tmp/b.rs"));
     }
 }

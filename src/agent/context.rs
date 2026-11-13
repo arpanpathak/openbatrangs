@@ -21,15 +21,31 @@ const NOTE_FOOTER: &str = "--- End prior context ---";
 const NOTE_LINE_LIMIT: usize = 60;
 
 /// Shrink `messages` in place so the estimated prompt fits `num_ctx`.
+///
+/// A conversation of the system prompt and the task only gets its task
+/// truncated; a longer one has its older turns rolled into a note.
 pub(crate) fn compact_context(messages: &mut Vec<ChatMessage>, num_ctx: u64) {
     let budget = max_prompt_chars(num_ctx);
 
-    if messages.len() == 2 {
-        let task = messages.pop().expect("length checked");
-        messages.push(truncate_message(task, budget));
-    } else if messages.len() > 2 && total_chars(messages) > budget {
-        *messages = rolled_context(std::mem::take(messages), budget);
+    match messages.len() {
+        0..=1 => {}
+        2 => truncate_task(&mut messages[1], budget),
+        3.. => roll_when_over_budget(messages, budget),
     }
+}
+
+/// Truncate the task message to `budget` characters.
+fn truncate_task(task: &mut ChatMessage, budget: usize) {
+    task.content = truncate_chars(&task.content, budget);
+}
+
+/// Roll older turns into a note when the messages exceed `budget` characters.
+fn roll_when_over_budget(messages: &mut Vec<ChatMessage>, budget: usize) {
+    if total_chars(messages) <= budget {
+        return;
+    }
+
+    *messages = rolled_context(std::mem::take(messages), budget);
 }
 
 /// Largest `num_predict` that leaves room for the prompt inside `num_ctx`.
@@ -109,18 +125,16 @@ fn append_tail(compacted: &mut Vec<ChatMessage>, tail: Vec<ChatMessage>, budget:
     );
 }
 
-/// Truncate the task only when system + task already exceed the budget.
-fn shrink_task_if_needed(compacted: &mut Vec<ChatMessage>, budget: usize) {
-    if compacted.len() < 2 || total_chars(compacted) <= budget {
+/// Truncate the task, the second message, only when the compacted messages
+/// still exceed the budget. `compacted` always starts with the system prompt
+/// and the task.
+fn shrink_task_if_needed(compacted: &mut [ChatMessage], budget: usize) {
+    if total_chars(compacted) <= budget {
         return;
     }
 
-    let system_len = compacted[0].content.len();
-    let task = compacted.remove(1);
-    compacted.insert(
-        1,
-        truncate_message(task, budget.saturating_sub(system_len).max(256)),
-    );
+    let task_budget = budget.saturating_sub(compacted[0].content.len()).max(256);
+    compacted[1].content = truncate_chars(&compacted[1].content, task_budget);
 }
 
 /// Number of prompt characters that leave room for [`MIN_OUTPUT_TOKENS`] output.
@@ -150,42 +164,56 @@ fn compact_note(messages: &[ChatMessage], max_chars: usize) -> String {
     truncate_chars(&note, max_chars)
 }
 
-/// One terse line for a compacted message.
+/// One terse line for a compacted message; empty for system and tool roles.
 fn message_line(message: &ChatMessage) -> String {
     match message.role {
-        Role::User if message.content.starts_with(TOOL_RESULT_PREFIX) => {
-            let result = message
-                .content
-                .trim_start_matches(TOOL_RESULT_PREFIX)
-                .trim();
-            format!("tool result: {}", head(result, 200))
-        }
-        Role::User => format!("user: {}", head(&message.content, 200)),
+        Role::User => user_line(&message.content),
         Role::Assistant => assistant_line(&message.content),
         Role::System | Role::Tool => String::new(),
     }
 }
 
-/// Summarize an assistant JSON message without repeating file contents.
-fn assistant_line(content: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(content) else {
-        return format!("assistant: {}", head(content, 160));
-    };
-
-    if let Some(answer) = value.get("answer").and_then(Value::as_str) {
-        return format!("answer: {}", head(answer, 240));
+/// One line for a user message: a tool result or the user's own text.
+fn user_line(content: &str) -> String {
+    if !content.starts_with(TOOL_RESULT_PREFIX) {
+        return format!("user: {}", head(content, 200));
     }
 
-    let Some(tool) = value.get("tool") else {
-        return format!("assistant: {}", head(content, 160));
-    };
-    let Some(name) = tool.get("name").and_then(Value::as_str) else {
-        return format!("assistant: {}", head(content, 160));
-    };
-    let Some(args) = tool.get("arguments") else {
-        return format!("assistant: {}", head(content, 160));
-    };
+    let result = content.trim_start_matches(TOOL_RESULT_PREFIX).trim();
+    format!("tool result: {}", head(result, 200))
+}
 
+/// Summarize an assistant JSON message without repeating file contents.
+fn assistant_line(content: &str) -> String {
+    let summary = serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|value| reply_summary(&value, content));
+
+    summary.unwrap_or_else(|| format!("assistant: {}", head(content, 160)))
+}
+
+/// The summary of a parsed reply: its answer, or its tool call. `None` when
+/// the reply has neither an answer nor a tool call with a name and arguments.
+fn reply_summary(value: &Value, content: &str) -> Option<String> {
+    match value.get("answer").and_then(Value::as_str) {
+        Some(answer) => Some(format!("answer: {}", head(answer, 240))),
+        None => tool_summary(value, content),
+    }
+}
+
+/// The summary of the `tool` call in a parsed reply, when it has a name and
+/// arguments.
+fn tool_summary(value: &Value, content: &str) -> Option<String> {
+    let name = value.pointer("/tool/name").and_then(Value::as_str);
+    let arguments = value.pointer("/tool/arguments");
+
+    name.zip(arguments)
+        .map(|(name, arguments)| tool_line(name, arguments, content))
+}
+
+/// One line for a tool call named `name`; `content` is the whole reply,
+/// shown for tools without their own format.
+fn tool_line(name: &str, args: &Value, content: &str) -> String {
     match name {
         "list_files" => format!("list_files(path={})", arg(args, "path")),
         "read_file" => format!(
@@ -210,12 +238,17 @@ fn assistant_line(content: &str) -> String {
     }
 }
 
-/// Read a string or displayable argument from a tool-call JSON object.
+/// Read a string or displayable argument from a tool-call JSON object; empty
+/// when the argument is missing.
 fn arg<'a>(args: &'a Value, key: &str) -> Cow<'a, str> {
-    match args.get(key) {
-        Some(Value::String(value)) => Cow::Borrowed(value),
-        Some(value) => Cow::Owned(value.to_string()),
-        None => Cow::Borrowed(""),
+    args.get(key).map_or(Cow::Borrowed(""), argument_text)
+}
+
+/// A string argument as it is, any other JSON value in its JSON form.
+fn argument_text(value: &Value) -> Cow<'_, str> {
+    match value.as_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => Cow::Owned(value.to_string()),
     }
 }
 
@@ -259,6 +292,7 @@ fn total_chars(messages: &[ChatMessage]) -> usize {
 mod tests {
     use super::*;
 
+    /// A chat message with `role` and `content`.
     fn message(role: Role, content: impl Into<String>) -> ChatMessage {
         ChatMessage {
             role,
@@ -267,11 +301,28 @@ mod tests {
     }
 
     #[test]
+    fn a_single_message_is_left_alone() {
+        let mut messages = vec![message(Role::System, "s".repeat(50_000))];
+
+        compact_context(&mut messages, 4096);
+
+        assert_eq!(messages[0].content.len(), 50_000);
+    }
+
+    #[test]
+    fn tool_results_are_summarized_by_their_first_line() {
+        let result = message(Role::User, "Tool result:\n  compiled\nmore");
+
+        assert_eq!(message_line(&result), "tool result: compiled");
+    }
+
+    #[test]
     fn rolls_old_tool_output_into_note() {
         let mut messages = vec![
             message(Role::System, "system".repeat(100)),
             message(Role::User, "Fix the regression in src/lib.rs"),
         ];
+
         for index in 0..20 {
             messages.push(message(
                 Role::Assistant,
@@ -284,6 +335,7 @@ mod tests {
                 format!("Tool result:\n{}", "x".repeat(6_000)),
             ));
         }
+
         let original_len = messages.len();
 
         compact_context(&mut messages, 4096);
@@ -292,7 +344,7 @@ mod tests {
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].role, Role::User);
         assert!(messages[1].content.contains(NOTE_HEADER));
-        assert_eq!(messages.last().unwrap().role, Role::User);
+        assert!(messages.last().is_some_and(|last| last.role == Role::User));
         assert!(
             total_chars(&messages) <= max_prompt_chars(4096) + 512,
             "context pager should stay near the token budget"
