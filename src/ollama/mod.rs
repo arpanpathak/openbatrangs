@@ -19,6 +19,7 @@
 //! - NDJSON (newline-delimited JSON): <https://ndjson.org/>
 
 mod openai;
+mod reader;
 mod stream;
 mod types;
 
@@ -31,7 +32,8 @@ use crate::constants::ollama::{
     HTTP_TIMEOUT_SECONDS,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{Stream, StreamExt};
+use reader::DeltaStream;
+use reqwest::{Response, StatusCode};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -55,7 +57,8 @@ enum Api {
     OpenAi {
         /// Bearer token sent with every request, if the server needs one.
         key: Option<String>,
-        /// Ask the model to think before answering.
+        /// Send `enable_thinking: true` with each chat request, so thinking
+        /// models reason before the reply.
         think: bool,
     },
 }
@@ -69,11 +72,8 @@ impl OllamaClient {
     /// # Returns
     /// A configured client, or an error if the HTTP client could not be built.
     pub fn new(base_url: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECONDS))
-            .build()
-            .context("failed to build HTTP client")?;
+        let http = http_client(reqwest::Client::builder())?;
+
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
@@ -86,18 +86,15 @@ impl OllamaClient {
     /// # Arguments
     /// - `base_url`: API address including `/v1`, e.g. `http://127.0.0.1:8079/v1`.
     /// - `key`: bearer token, if the server requires one.
-    /// - `think`: ask thinking models to reason before answering.
+    /// - `think`: send `enable_thinking: true`, so thinking models reason
+    ///   before the reply.
     ///
     /// Idle connections are not reused: through an SSH tunnel a kept-alive
     /// connection can be closed between agent steps, and the next request
     /// would fail with "connection closed before message completed".
     pub fn openai(base_url: &str, key: Option<String>, think: bool) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECONDS))
-            .pool_max_idle_per_host(0)
-            .build()
-            .context("failed to build HTTP client")?;
+        let http = http_client(reqwest::Client::builder().pool_max_idle_per_host(0))?;
+
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
@@ -124,7 +121,7 @@ impl OllamaClient {
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api {
             Api::OpenAi { key: Some(key), .. } => request.bearer_auth(key),
-            _ => request,
+            Api::Ollama | Api::OpenAi { key: None, .. } => request,
         }
     }
 
@@ -135,9 +132,9 @@ impl OllamaClient {
             .send()
             .await
             .with_context(|| format!("failed to reach {url}"))?;
-        if !response.status().is_success() {
-            return Err(anyhow!("{url} returned HTTP {}", response.status()));
-        }
+        let response =
+            require_success(response).map_err(|status| anyhow!("{url} returned HTTP {status}"))?;
+
         response
             .json()
             .await
@@ -147,18 +144,19 @@ impl OllamaClient {
     /// Check whether the Ollama server is reachable.
     ///
     /// # Returns
-    /// `true` if `GET /api/tags` succeeds, otherwise `false`.
+    /// `true` if `GET /api/tags` (or `/models` on an OpenAI-compatible
+    /// server) succeeds, otherwise `false`.
     pub async fn is_available(&self) -> bool {
         let path = if self.is_openai() {
             "/models"
         } else {
             API_TAGS_PATH
         };
+
         self.authorize(self.http.get(format!("{}{path}", self.base_url)))
             .send()
             .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
+            .is_ok_and(|response| response.status().is_success())
     }
 
     /// List all installed models.
@@ -168,29 +166,37 @@ impl OllamaClient {
     /// or returns a non-success status.
     pub async fn tags(&self) -> Result<Vec<OllamaModel>> {
         if self.is_openai() {
-            let body = self
-                .get_openai_json(format!("{}/models", self.base_url))
-                .await?;
-            return Ok(openai::models_from_list(&body));
+            return self.openai_tags().await;
         }
+
+        self.ollama_tags().await
+    }
+
+    /// The models listed by an OpenAI-compatible server's `/models`.
+    async fn openai_tags(&self) -> Result<Vec<OllamaModel>> {
+        let body = self
+            .get_openai_json(format!("{}/models", self.base_url))
+            .await?;
+
+        Ok(openai::models_from_list(&body))
+    }
+
+    /// The models listed by Ollama's `/api/tags`.
+    async fn ollama_tags(&self) -> Result<Vec<OllamaModel>> {
         let response = self
             .http
             .get(format!("{}{API_TAGS_PATH}", self.base_url))
             .send()
             .await
             .context("failed to reach Ollama server; is `ollama serve` running?")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Ollama /api/tags returned HTTP {}",
-                response.status()
-            ));
-        }
+        let response = require_success(response)
+            .map_err(|status| anyhow!("Ollama /api/tags returned HTTP {status}"))?;
 
         let body: TagsResponse = response
             .json()
             .await
             .context("failed to parse Ollama /api/tags response")?;
+
         Ok(body.models)
     }
 
@@ -204,15 +210,24 @@ impl OllamaClient {
             .ok()
             .and_then(|list| openai::show_from_models(&list, name));
 
-        if let Some(show) = listed {
-            return show;
+        match listed {
+            Some(show) => show,
+            None => self.show_from_props().await,
         }
+    }
 
+    /// The context window from llama-server's `/props`, shaped like
+    /// `/api/show`; an empty object when the server has no `/props`.
+    async fn show_from_props(&self) -> Value {
         let root = openai::server_root(&self.base_url);
-        match self.get_openai_json(format!("{root}/props")).await {
-            Ok(props) => openai::show_from_props(&props),
-            Err(_) => serde_json::json!({}),
-        }
+
+        self.get_openai_json(format!("{root}/props"))
+            .await
+            .ok()
+            .map_or_else(
+                || serde_json::json!({}),
+                |props| openai::show_from_props(&props),
+            )
     }
 
     /// Fetch detailed metadata for a single model.
@@ -226,6 +241,12 @@ impl OllamaClient {
         if self.is_openai() {
             return Ok(self.show_openai(name).await);
         }
+
+        self.show_ollama(name).await
+    }
+
+    /// The metadata Ollama's `/api/show` returns for `name`.
+    async fn show_ollama(&self, name: &str) -> Result<Value> {
         let response = self
             .http
             .post(format!("{}{API_SHOW_PATH}", self.base_url))
@@ -233,14 +254,9 @@ impl OllamaClient {
             .send()
             .await
             .context("failed to call Ollama /api/show")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Ollama /api/show returned HTTP {} for model '{}'",
-                response.status(),
-                name
-            ));
-        }
+        let response = require_success(response).map_err(|status| {
+            anyhow!("Ollama /api/show returned HTTP {status} for model '{name}'")
+        })?;
 
         response
             .json()
@@ -256,64 +272,32 @@ impl OllamaClient {
     /// # Returns
     /// A stream of deltas: reply text, or reasoning from thinking models on
     /// an OpenAI-compatible server. `Err` if the stream fails.
-    pub async fn chat_stream(
-        &self,
-        mut request: ChatRequest,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
+    pub async fn chat_stream(&self, mut request: ChatRequest) -> Result<DeltaStream> {
         if let Api::OpenAi { think, .. } = self.api {
             return self.openai_chat_stream(&request, think).await;
         }
+
         request.stream = true;
+
+        self.ollama_chat_stream(&request).await
+    }
+
+    /// Stream a chat completion from Ollama's `/api/chat`.
+    async fn ollama_chat_stream(&self, request: &ChatRequest) -> Result<DeltaStream> {
         let response = self
             .http
             .post(format!("{}{API_CHAT_PATH}", self.base_url))
-            .json(&request)
+            .json(request)
             .send()
             .await
             .context("failed to call Ollama /api/chat (stream)")?;
+        let response = require_success_with_body(response, "Ollama /api/chat").await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Ollama /api/chat returned HTTP {status}: {text}"));
-        }
-
-        let byte_stream = response.bytes_stream();
-        let stream = futures_util::stream::unfold(
-            (byte_stream, stream::TextBuffer::default()),
-            |(mut byte_stream, mut buffer)| async move {
-                loop {
-                    match stream::drain_complete_lines(&mut buffer.text) {
-                        stream::LineDrain::Content(content) => {
-                            return Some((Ok(Delta::Content(content)), (byte_stream, buffer)));
-                        }
-                        stream::LineDrain::Done => return None,
-                        stream::LineDrain::NeedMore => {}
-                    }
-                    match byte_stream.next().await {
-                        Some(Ok(bytes)) => {
-                            buffer.push(&bytes);
-                        }
-                        Some(Err(error)) => {
-                            return Some((
-                                Err(anyhow!("stream error: {error}")),
-                                (byte_stream, buffer),
-                            ));
-                        }
-                        None => return None,
-                    }
-                }
-            },
-        );
-        Ok(Box::pin(stream))
+        Ok(reader::delta_stream(response, stream::drain_complete_lines))
     }
 
     /// Stream a chat completion from an OpenAI-compatible server.
-    async fn openai_chat_stream(
-        &self,
-        request: &ChatRequest,
-        think: bool,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
+    async fn openai_chat_stream(&self, request: &ChatRequest, think: bool) -> Result<DeltaStream> {
         self.chat_stream_body(openai::chat_body(request, think))
             .await
     }
@@ -331,10 +315,7 @@ impl OllamaClient {
     /// # Returns
     /// A stream of [`Delta`]s, or an error if the server cannot be reached or
     /// answers with a non-success status.
-    pub async fn chat_stream_body(
-        &self,
-        body: Value,
-    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>> {
+    pub async fn chat_stream_body(&self, body: Value) -> Result<DeltaStream> {
         let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .authorize(self.http.post(&url))
@@ -342,49 +323,9 @@ impl OllamaClient {
             .send()
             .await
             .with_context(|| format!("failed to call {url}"))?;
+        let response = require_success_with_body(response, &url).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("{url} returned HTTP {status}: {text}"));
-        }
-
-        Ok(self.openai_delta_stream(response))
-    }
-
-    /// Wrap a server-sent-event response in a stream of [`Delta`]s.
-    fn openai_delta_stream(
-        &self,
-        response: reqwest::Response,
-    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>> {
-        let byte_stream = response.bytes_stream();
-        let stream = futures_util::stream::unfold(
-            (byte_stream, stream::TextBuffer::default()),
-            |(mut byte_stream, mut buffer)| async move {
-                loop {
-                    match openai::drain_events(&mut buffer.text) {
-                        openai::EventDrain::Delta(delta) => {
-                            return Some((Ok(delta), (byte_stream, buffer)));
-                        }
-                        openai::EventDrain::Done => return None,
-                        openai::EventDrain::NeedMore => {}
-                    }
-                    match byte_stream.next().await {
-                        Some(Ok(bytes)) => {
-                            buffer.push(&bytes);
-                        }
-                        Some(Err(error)) => {
-                            return Some((
-                                Err(anyhow!("stream error: {error}")),
-                                (byte_stream, buffer),
-                            ));
-                        }
-                        None => return None,
-                    }
-                }
-            },
-        );
-        Box::pin(stream)
+        Ok(reader::delta_stream(response, openai::drain_events))
     }
 
     /// Download a model from the Ollama registry.
@@ -396,15 +337,31 @@ impl OllamaClient {
     /// # Returns
     /// `Ok(())` once the pull finishes successfully.
     pub async fn pull(&self, name: &str, on_status: &(dyn Fn(&str) + Sync)) -> Result<()> {
+        self.refuse_openai_pull(name)?;
+        on_status(&format!(
+            "⬇️  Pulling model '{name}' from Ollama registry..."
+        ));
+        let response = self.start_pull(name).await?;
+
+        reader::follow_pull(response, on_status).await
+    }
+
+    /// An error when this client talks to an OpenAI-compatible server, which
+    /// cannot download models.
+    fn refuse_openai_pull(&self, name: &str) -> Result<()> {
         if self.is_openai() {
             bail!(
                 "'{name}' can't be pulled: {} is not an Ollama server; load models on that server instead",
                 self.base_url
             );
         }
-        on_status(&format!(
-            "⬇️  Pulling model '{name}' from Ollama registry..."
-        ));
+
+        Ok(())
+    }
+
+    /// Send the pull request for `name` to `/api/pull` and return the
+    /// response that streams its progress.
+    async fn start_pull(&self, name: &str) -> Result<Response> {
         let response = self
             .http
             .post(format!("{}{API_PULL_PATH}", self.base_url))
@@ -416,101 +373,56 @@ impl OllamaClient {
             .await
             .context("failed to call Ollama /api/pull")?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Ollama /api/pull returned HTTP {status}: {text}"));
-        }
-
-        let mut byte_stream = Box::pin(response.bytes_stream());
-        let mut buffer = stream::TextBuffer::default();
-        while let Some(bytes) = byte_stream.next().await {
-            let bytes = bytes.context("failed to read Ollama /api/pull stream")?;
-            buffer.push(&bytes);
-            while let Some(event) = stream::drain_pull_line(&mut buffer.text) {
-                match event {
-                    stream::PullLine::Status(status) => on_status(&status),
-                    stream::PullLine::Error(error) => {
-                        return Err(anyhow!("Ollama /api/pull failed: {error}"));
-                    }
-                    stream::PullLine::Done => {
-                        on_status("✅ Pull finished");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        Err(anyhow!(
-            "Ollama /api/pull stream ended before reporting success"
-        ))
+        require_success_with_body(response, "Ollama /api/pull").await
     }
+}
+
+/// The HTTP client built from `builder` with the request and connect
+/// timeouts every model server call uses.
+fn http_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client> {
+    builder
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECONDS))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// `response` when its status is a success, else the status, so each caller
+/// words its own error.
+fn require_success(response: Response) -> std::result::Result<Response, StatusCode> {
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(status);
+    }
+
+    Ok(response)
+}
+
+/// `response` when its status is a success, else an error that holds the
+/// status and the body the server sent: `{endpoint} returned HTTP {status}:
+/// {body}`.
+async fn require_success_with_body(response: Response, endpoint: &str) -> Result<Response> {
+    let status = response.status();
+
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let text = response.text().await.unwrap_or_default();
+
+    Err(anyhow!("{endpoint} returned HTTP {status}: {text}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{MockResponse, spawn_mock_server};
+    use crate::tools::test_server::{cut_short, spawn_raw_server};
+    use futures_util::{StreamExt, TryStreamExt};
+    use std::sync::{Mutex, PoisonError};
 
-    #[test]
-    fn client_strips_trailing_slashes_from_base_url() {
-        let client = OllamaClient::new("http://localhost:11434///").unwrap();
-        assert_eq!(client.base_url, "http://localhost:11434");
-    }
-
-    #[test]
-    fn client_accepts_plain_url() {
-        let client = OllamaClient::new("http://127.0.0.1:11434").unwrap();
-        assert_eq!(client.base_url, "http://127.0.0.1:11434");
-    }
-
-    #[test]
-    fn chat_request_serializes_expected_shape() {
-        let request = ChatRequest {
-            model: "qwen2.5-coder:3b".to_string(),
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: "hello".to_string(),
-            }],
-            stream: true,
-            keep_alive: None,
-            format: None,
-            options: Some(serde_json::json!({"temperature": 0.7})),
-        };
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "qwen2.5-coder:3b");
-        assert_eq!(json["stream"], true);
-        assert_eq!(json["messages"][0]["role"], "user");
-        assert_eq!(json["options"]["temperature"], 0.7);
-    }
-
-    #[test]
-    fn tags_response_deserializes_with_missing_details() {
-        let json = r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#;
-        let response: TagsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.models.len(), 1);
-        assert_eq!(response.models[0].name, "qwen2.5-coder:3b");
-        assert_eq!(response.models[0].size, 123);
-        assert!(response.models[0].details.is_none());
-    }
-
-    #[test]
-    fn tags_response_deserializes_with_details() {
-        let json = r#"{"models":[{"name":"qwen2.5-coder:7b","size":1,"details":{"parameter_size":"7.6B","quantization_level":"Q4_K_M","context_length":32768}}]}"#;
-        let response: TagsResponse = serde_json::from_str(json).unwrap();
-        let details = response.models[0].details.as_ref().unwrap();
-        assert_eq!(details.parameter_size.as_deref(), Some("7.6B"));
-        assert_eq!(details.quantization_level.as_deref(), Some("Q4_K_M"));
-        assert_eq!(details.context_length, Some(32_768));
-    }
-
-    // ========================================================================
-    // Local mock Ollama HTTP server
-    //
-    // `spawn_mock_server` and `MockResponse` live in `crate::test_support` so
-    // the same real-HTTP seam is reusable by command/model tests.
-    // ========================================================================
-
+    /// A one-message chat request with no options.
     fn sample_request() -> ChatRequest {
         ChatRequest {
             model: "qwen2.5-coder:3b".to_string(),
@@ -525,27 +437,112 @@ mod tests {
         }
     }
 
+    /// Add `status` to the statuses a pull reported.
+    fn record(statuses: &Mutex<Vec<String>>, status: &str) {
+        let mut seen = statuses.lock().unwrap_or_else(PoisonError::into_inner);
+
+        seen.push(status.to_string());
+    }
+
+    /// Pull a model from the server at `base_url`, returning the outcome and
+    /// every status line reported along the way.
+    async fn pull_from(base_url: &str) -> Result<(Result<()>, Vec<String>)> {
+        let client = OllamaClient::new(base_url)?;
+        let statuses = Mutex::new(Vec::new());
+
+        let outcome = client
+            .pull("qwen2.5-coder:3b", &|status: &str| {
+                record(&statuses, status)
+            })
+            .await;
+
+        Ok((outcome, statuses.into_inner()?))
+    }
+
+    #[test]
+    fn client_strips_trailing_slashes_from_base_url() -> Result<()> {
+        let client = OllamaClient::new("http://localhost:11434///")?;
+
+        assert_eq!(client.base_url, "http://localhost:11434");
+        Ok(())
+    }
+
+    #[test]
+    fn client_accepts_plain_url() -> Result<()> {
+        let client = OllamaClient::new("http://127.0.0.1:11434")?;
+
+        assert_eq!(client.base_url, "http://127.0.0.1:11434");
+        Ok(())
+    }
+
+    #[test]
+    fn chat_request_serializes_expected_shape() -> Result<()> {
+        let request = ChatRequest {
+            stream: true,
+            options: Some(serde_json::json!({"temperature": 0.7})),
+            ..sample_request()
+        };
+
+        let json = serde_json::to_value(&request)?;
+
+        assert_eq!(json["model"], "qwen2.5-coder:3b");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["options"]["temperature"], 0.7);
+        Ok(())
+    }
+
+    #[test]
+    fn tags_response_deserializes_with_missing_details() -> Result<()> {
+        let json = r#"{"models":[{"name":"qwen2.5-coder:3b","size":123}]}"#;
+
+        let response: TagsResponse = serde_json::from_str(json)?;
+
+        assert_eq!(response.models.len(), 1);
+        assert_eq!(response.models[0].name, "qwen2.5-coder:3b");
+        assert_eq!(response.models[0].size, 123);
+        assert!(response.models[0].details.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tags_response_deserializes_with_details() -> Result<()> {
+        let json = r#"{"models":[{"name":"qwen2.5-coder:7b","size":1,"details":{"parameter_size":"7.6B","quantization_level":"Q4_K_M","context_length":32768}}]}"#;
+
+        let response: TagsResponse = serde_json::from_str(json)?;
+        let details = response.models[0].details.clone().unwrap_or_default();
+
+        assert_eq!(details.parameter_size.as_deref(), Some("7.6B"));
+        assert_eq!(details.quantization_level.as_deref(), Some("Q4_K_M"));
+        assert_eq!(details.context_length, Some(32_768));
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn is_available_true_on_success() {
+    async fn is_available_true_on_success() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/tags");
             MockResponse::json("200 OK", r#"{"models":[]}"#)
         })
         .await;
-        let client = OllamaClient::new(&base_url).unwrap();
+        let client = OllamaClient::new(&base_url)?;
+
         assert!(client.is_available().await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn is_available_false_on_error() {
+    async fn is_available_false_on_error() -> Result<()> {
         let base_url =
-            spawn_mock_server(|_| MockResponse::text("503 Service Unavailable", "down")).await;
-        let client = OllamaClient::new(&base_url).unwrap();
+            spawn_mock_server(|_path| MockResponse::text("503 Service Unavailable", "down")).await;
+        let client = OllamaClient::new(&base_url)?;
+
         assert!(!client.is_available().await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tags_parses_models_from_mock_server() {
+    async fn tags_parses_models_from_mock_server() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/tags");
             MockResponse::json(
@@ -554,37 +551,59 @@ mod tests {
             )
         })
         .await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        let tags = client.tags().await.unwrap();
+        let client = OllamaClient::new(&base_url)?;
+
+        let tags = client.tags().await?;
+
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].name, "qwen2.5-coder:3b");
         assert_eq!(tags[0].size, 123);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tags_returns_error_on_http_failure() {
+    async fn tags_returns_error_on_http_failure() -> Result<()> {
         let base_url =
-            spawn_mock_server(|_| MockResponse::text("500 Internal Server Error", "boom")).await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        assert!(client.tags().await.is_err());
+            spawn_mock_server(|_path| MockResponse::text("500 Internal Server Error", "boom"))
+                .await;
+        let client = OllamaClient::new(&base_url)?;
+
+        let tags = client.tags().await;
+
+        assert!(format!("{tags:?}").contains("Ollama /api/tags returned HTTP 500"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn show_returns_model_metadata() {
+    async fn show_returns_model_metadata() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/show");
             MockResponse::json("200 OK", r#"{"model_info":{"llama.context_length":32768}}"#)
         })
         .await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        let value = client.show("qwen2.5-coder:7b").await.unwrap();
+        let client = OllamaClient::new(&base_url)?;
+
+        let value = client.show("qwen2.5-coder:7b").await?;
+
         assert_eq!(value["model_info"]["llama.context_length"], 32_768);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn chat_stream_yields_content_deltas() {
-        use futures_util::StreamExt;
+    async fn show_names_the_model_on_http_failure() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| MockResponse::text("404 Not Found", "")).await;
+        let client = OllamaClient::new(&base_url)?;
 
+        let shown = client.show("missing:7b").await;
+
+        assert!(
+            format!("{shown:?}").contains("returned HTTP 404 Not Found for model 'missing:7b'")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_stream_yields_content_deltas() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/chat");
             MockResponse::json(
@@ -593,12 +612,14 @@ mod tests {
             )
         })
         .await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        let mut stream = client.chat_stream(sample_request()).await.unwrap();
-        let mut parts = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            parts.push(chunk.unwrap());
-        }
+        let client = OllamaClient::new(&base_url)?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
         assert_eq!(
             parts,
             vec![
@@ -606,20 +627,59 @@ mod tests {
                 Delta::Content(" world".to_string())
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn chat_stream_returns_error_on_http_failure() {
+    async fn chat_stream_ends_with_the_body_when_done_never_arrives() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| {
+            MockResponse::json("200 OK", "{\"message\":{\"content\":\"cut\"}}\n")
+        })
+        .await;
+        let client = OllamaClient::new(&base_url)?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
+        assert_eq!(parts, vec![Delta::Content("cut".to_string())]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_stream_reports_a_connection_lost_mid_reply() -> Result<()> {
         let base_url =
-            spawn_mock_server(|_| MockResponse::text("400 Bad Request", "bad model")).await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        assert!(client.chat_stream(sample_request()).await.is_err());
+            spawn_raw_server(|_path| cut_short("{\"message\":{\"content\":\"hi\"}}\n")).await?;
+        let client = OllamaClient::new(&base_url)?;
+        let mut stream = client.chat_stream(sample_request()).await?;
+
+        let first = stream.next().await.transpose()?;
+        let second = stream.next().await;
+
+        assert_eq!(first, Some(Delta::Content("hi".to_string())));
+        assert!(format!("{second:?}").contains("stream error"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pull_reports_statuses_and_finishes() {
-        use std::sync::{Arc, Mutex};
+    async fn chat_stream_returns_error_on_http_failure() -> Result<()> {
+        let base_url =
+            spawn_mock_server(|_path| MockResponse::text("400 Bad Request", "bad model")).await;
+        let client = OllamaClient::new(&base_url)?;
 
+        let error = client.chat_stream(sample_request()).await.err();
+
+        assert!(
+            format!("{error:?}")
+                .contains("Ollama /api/chat returned HTTP 400 Bad Request: bad model")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_reports_statuses_and_finishes() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/pull");
             MockResponse::json(
@@ -628,25 +688,58 @@ mod tests {
             )
         })
         .await;
-        let client = OllamaClient::new(&base_url).unwrap();
-        let statuses = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&statuses);
-        client
-            .pull("qwen2.5-coder:3b", &move |msg| {
-                captured.lock().unwrap().push(msg.to_string());
-            })
-            .await
-            .unwrap();
-        let statuses = statuses.lock().unwrap();
-        assert!(statuses.iter().any(|s| s.contains("pulling manifest")));
-        assert!(statuses.iter().any(|s| s.contains("50%")));
-        assert!(statuses.iter().any(|s| s.contains("Pull finished")));
+
+        let (outcome, statuses) = pull_from(&base_url).await?;
+
+        outcome?;
+        assert_eq!(
+            statuses,
+            [
+                "⬇️  Pulling model 'qwen2.5-coder:3b' from Ollama registry...",
+                "pulling manifest",
+                "downloading 50%",
+                "✅ Pull finished",
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn openai_chat_stream_yields_thinking_then_content() {
-        use futures_util::StreamExt;
+    async fn pull_fails_on_an_error_line_or_an_early_end() -> Result<()> {
+        let refused = spawn_mock_server(|_path| {
+            MockResponse::json("200 OK", "{\"error\":\"model not found\"}\n")
+        })
+        .await;
+        let ended = spawn_mock_server(|_path| {
+            MockResponse::json("200 OK", "{\"status\":\"pulling manifest\"}\n")
+        })
+        .await;
 
+        let (refused, _refused_statuses) = pull_from(&refused).await?;
+        let (ended, _ended_statuses) = pull_from(&ended).await?;
+
+        assert!(format!("{refused:?}").contains("Ollama /api/pull failed: model not found"));
+        assert!(format!("{ended:?}").contains("ended before reporting success"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_fails_on_http_and_read_errors() -> Result<()> {
+        let rejected =
+            spawn_mock_server(|_path| MockResponse::text("500 Internal Server Error", "disk full"))
+                .await;
+        let broken = spawn_raw_server(|_path| cut_short("{\"status\":\"pulling\"}\n")).await?;
+
+        let (rejected, _rejected_statuses) = pull_from(&rejected).await?;
+        let (broken, _broken_statuses) = pull_from(&broken).await?;
+
+        assert!(format!("{rejected:?}").contains("Ollama /api/pull returned HTTP 500"));
+        assert!(format!("{broken:?}").contains("failed to read Ollama /api/pull stream"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_chat_stream_yields_thinking_then_content() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/chat/completions");
             MockResponse::json(
@@ -659,12 +752,14 @@ mod tests {
             )
         })
         .await;
-        let client = OllamaClient::openai(&base_url, Some("key".to_string()), true).unwrap();
-        let mut stream = client.chat_stream(sample_request()).await.unwrap();
-        let mut parts = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            parts.push(chunk.unwrap());
-        }
+        let client = OllamaClient::openai(&base_url, Some("key".to_string()), true)?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
         assert_eq!(
             parts,
             vec![
@@ -672,65 +767,120 @@ mod tests {
                 Delta::Content("hi".to_string())
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn openai_tags_and_pull() {
+    async fn openai_chat_stream_returns_error_on_http_failure() -> Result<()> {
+        let base_url =
+            spawn_mock_server(|_path| MockResponse::text("503 Service Unavailable", "loading"))
+                .await;
+        let client = OllamaClient::openai(&base_url, None, false)?;
+
+        let error = client.chat_stream(sample_request()).await.err();
+
+        assert!(
+            format!("{error:?}")
+                .contains("/chat/completions returned HTTP 503 Service Unavailable: loading")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_tags_and_pull() -> Result<()> {
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/models");
             MockResponse::json("200 OK", r#"{"data":[{"id":"/m/Nemotron-Q8_0.gguf"}]}"#)
         })
         .await;
-        let client = OllamaClient::openai(&base_url, None, false).unwrap();
+        let client = OllamaClient::openai(&base_url, None, false)?;
+
+        let tags = client.tags().await?;
+
         assert!(client.is_openai());
         assert!(client.is_available().await);
-        let tags = client.tags().await.unwrap();
         assert_eq!(tags[0].name, "Nemotron-Q8_0");
-        assert!(client.pull("x", &|_| {}).await.is_err());
+        assert!(client.refuse_openai_pull("x").is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn openai_show_reads_the_context_from_the_list_then_from_props() {
+    async fn openai_tags_report_an_http_failure() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| MockResponse::text("401 Unauthorized", "")).await;
+        let client = OllamaClient::openai(&base_url, Some("wrong".to_string()), false)?;
+
+        let tags = client.tags().await;
+
+        assert!(format!("{tags:?}").contains("/models returned HTTP 401 Unauthorized"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_named_in_the_error() -> Result<()> {
+        let client = OllamaClient::openai("http://127.0.0.1:1/v1", None, false)?;
+
+        let tags = client.tags().await;
+        let chat = client.chat_stream(sample_request()).await.err();
+
+        assert!(format!("{tags:?}").contains("failed to reach http://127.0.0.1:1/v1/models"));
+        assert!(
+            format!("{chat:?}").contains("failed to call http://127.0.0.1:1/v1/chat/completions")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_tags_report_a_body_that_is_not_json() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| MockResponse::text("200 OK", "<html>")).await;
+        let client = OllamaClient::openai(&base_url, None, false)?;
+
+        let tags = client.tags().await;
+
+        assert!(format!("{tags:?}").contains("failed to parse the response from"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_show_reads_the_context_from_the_list_then_from_props() -> Result<()> {
         let base_url = spawn_mock_server(|path| match path {
             "/v1/models" => MockResponse::json(
                 "200 OK",
                 r#"{"data":[{"id":"qwen","max_model_len":65536},{"id":"gguf"}]}"#,
             ),
-            "/props" => MockResponse::json(
+            _ => MockResponse::json(
                 "200 OK",
                 r#"{"default_generation_settings":{"n_ctx":4096}}"#,
             ),
-            _ => MockResponse::text("404 Not Found", "no"),
         })
         .await;
-        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
-        let context = |show: Value| show["details"]["context_length"].clone();
+        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false)?;
 
-        assert_eq!(context(client.show("qwen").await.unwrap()), 65_536);
-        assert_eq!(context(client.show("gguf").await.unwrap()), 4_096);
+        let listed = client.show("qwen").await?;
+        let from_props = client.show("gguf").await?;
+
+        assert_eq!(listed["details"]["context_length"], 65_536);
+        assert_eq!(from_props["details"]["context_length"], 4_096);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn openai_show_is_empty_when_the_server_says_nothing() {
-        let base_url = spawn_mock_server(|_| MockResponse::text("404 Not Found", "no")).await;
-        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false).unwrap();
+    async fn openai_show_is_empty_when_the_server_says_nothing() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| MockResponse::text("404 Not Found", "no")).await;
+        let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false)?;
 
-        assert_eq!(client.show("qwen").await.unwrap(), serde_json::json!({}));
+        assert_eq!(client.show("qwen").await?, serde_json::json!({}));
+        Ok(())
     }
 
     #[test]
-    fn only_the_openai_flag_decides_whether_the_model_thinks() {
-        let openai = |think| {
-            OllamaClient::openai("http://127.0.0.1:8079/v1", None, think)
-                .unwrap()
-                .requests_thinking()
-        };
-        assert!(openai(true));
-        assert!(!openai(false));
-        assert!(
-            !OllamaClient::new("http://127.0.0.1:11434")
-                .unwrap()
-                .requests_thinking()
-        );
+    fn only_the_openai_flag_decides_whether_the_model_thinks() -> Result<()> {
+        let thinking = OllamaClient::openai("http://127.0.0.1:8079/v1", None, true)?;
+        let not_thinking = OllamaClient::openai("http://127.0.0.1:8079/v1", None, false)?;
+        let ollama = OllamaClient::new("http://127.0.0.1:11434")?;
+
+        assert!(thinking.requests_thinking());
+        assert!(!not_thinking.requests_thinking());
+        assert!(!ollama.requests_thinking());
+        Ok(())
     }
 }

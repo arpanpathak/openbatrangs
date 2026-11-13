@@ -120,11 +120,3 @@ pub struct ToolCallDelta {
     /// JSON-encoded arguments, appended across chunks.
     pub arguments: String,
 }
-
-/// A meaningful event extracted from one Ollama NDJSON stream line.
-pub enum StreamLine {
-    /// Assistant content delta.
-    Content(String),
-    /// Terminal `done: true` marker.
-    Done,
-}

@@ -28,30 +28,54 @@ use std::path::{Component, Path, PathBuf};
 /// The joined `PathBuf`, or an error if the path is outside the workspace or
 /// contains `..`.
 pub(super) fn resolve_in_root(root: &Path, path: &str) -> Result<PathBuf> {
-    let requested = Path::new(path);
+    let relative = workspace_relative(root, Path::new(path))?;
+
+    refuse_parent_dirs(relative)?;
+
+    Ok(root.join(relative))
+}
+
+/// `requested` as a path relative to the workspace: an absolute path inside
+/// the workspace loses its workspace prefix, a relative path is kept, and any
+/// other absolute path is an error.
+fn workspace_relative<'a>(root: &Path, requested: &'a Path) -> Result<&'a Path> {
+    match without_workspace_prefix(root, requested) {
+        Some(inside) => Ok(inside),
+        None => relative_only(requested),
+    }
+}
+
+/// `requested` with the workspace root removed from its front, written either
+/// as given or in canonical form; `None` when it does not start with either.
+fn without_workspace_prefix<'a>(root: &Path, requested: &'a Path) -> Option<&'a Path> {
     let canonical = canonical_root(root).ok();
 
-    let inside = requested
+    requested
         .strip_prefix(root)
         .ok()
-        .or_else(|| requested.strip_prefix(canonical.as_deref()?).ok());
+        .or_else(|| requested.strip_prefix(canonical.as_deref()?).ok())
+}
 
-    let relative = match (inside, requested.is_absolute()) {
-        (Some(inside), _) => inside,
-        (None, false) => requested,
-        (None, true) => {
-            bail!("that path is outside the workspace; use paths relative to the workspace")
-        }
-    };
+/// `requested` unchanged when it is relative, else an error.
+fn relative_only(requested: &Path) -> Result<&Path> {
+    if requested.is_absolute() {
+        bail!("that path is outside the workspace; use paths relative to the workspace");
+    }
 
-    if relative
+    Ok(requested)
+}
+
+/// An error when `relative` contains a `..` component.
+fn refuse_parent_dirs(relative: &Path) -> Result<()> {
+    let has_parent_dir = relative
         .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+        .any(|component| matches!(component, Component::ParentDir));
+
+    if has_parent_dir {
         bail!("'..' is not allowed in tool paths");
     }
 
-    Ok(root.join(relative))
+    Ok(())
 }
 
 /// Canonicalize the workspace root once so relative roots (`"."`, `"./src"`)
@@ -69,9 +93,21 @@ pub(super) fn ensure_canonical_within_root(root: &Path, resolved: &Path) -> Resu
     let canonical_root = canonical_root(root)?;
     let canonical_path = std::fs::canonicalize(resolved)
         .with_context(|| format!("failed to resolve path: {}", resolved.display()))?;
-    if !canonical_path.starts_with(&canonical_root) {
+
+    contained_path(canonical_path, &canonical_root, resolved)
+}
+
+/// `canonical_path` when it lies under `canonical_root`, else an error naming
+/// the path the model asked for.
+fn contained_path(
+    canonical_path: PathBuf,
+    canonical_root: &Path,
+    resolved: &Path,
+) -> Result<PathBuf> {
+    if !canonical_path.starts_with(canonical_root) {
         bail!("path escapes the workspace: {}", resolved.display());
     }
+
     Ok(canonical_path)
 }
 
@@ -87,30 +123,34 @@ mod tests {
     }
 
     #[test]
-    fn reads_an_absolute_path_inside_the_workspace_as_relative() {
+    fn reads_an_absolute_path_inside_the_workspace_as_relative() -> Result<()> {
         let root = Path::new("/tmp/project");
 
         assert_eq!(
-            resolve_in_root(root, "/tmp/project/src/main.rs").unwrap(),
+            resolve_in_root(root, "/tmp/project/src/main.rs")?,
             Path::new("/tmp/project/src/main.rs")
         );
-        assert_eq!(resolve_in_root(root, "/tmp/project").unwrap(), root);
+        assert_eq!(resolve_in_root(root, "/tmp/project")?, root);
         assert!(resolve_in_root(root, "/tmp/project/../secret").is_err());
         assert!(resolve_in_root(root, "/tmp/project-other/x").is_err());
+
+        Ok(())
     }
 
     #[test]
-    fn reads_the_canonical_form_of_a_relative_root() {
+    fn reads_the_canonical_form_of_a_relative_root() -> Result<()> {
         let base = crate::test_support::unique_temp_dir("openbatrangs-path-canonical");
-        fs::create_dir_all(base.join("src")).unwrap();
+        fs::create_dir_all(base.join("src"))?;
 
-        let canonical = fs::canonicalize(&base).unwrap();
+        let canonical = fs::canonicalize(&base)?;
         let dotted = base.join("src").join("..");
-        let resolved = resolve_in_root(&dotted, canonical.join("a.rs").to_str().unwrap());
+        let absolute = canonical.join("a.rs");
+        let resolved = resolve_in_root(&dotted, &absolute.to_string_lossy())?;
 
-        assert_eq!(resolved.unwrap(), dotted.join("a.rs"));
+        assert_eq!(resolved, dotted.join("a.rs"));
 
-        fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&base)?;
+        Ok(())
     }
 
     #[test]
@@ -121,38 +161,47 @@ mod tests {
     }
 
     #[test]
-    fn accepts_relative_paths() {
+    fn accepts_relative_paths() -> Result<()> {
         let root = Path::new("/tmp/project");
+
         assert_eq!(
-            resolve_in_root(root, "src/main.rs").expect("relative path should resolve"),
+            resolve_in_root(root, "src/main.rs")?,
             Path::new("/tmp/project/src/main.rs")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_dot_and_cur_dir() {
+    fn accepts_dot_and_cur_dir() -> Result<()> {
         let root = Path::new("/tmp/project");
-        assert_eq!(resolve_in_root(root, ".").unwrap(), root.to_path_buf());
+
+        assert_eq!(resolve_in_root(root, ".")?, root.to_path_buf());
         assert_eq!(
-            resolve_in_root(root, "./src").unwrap(),
+            resolve_in_root(root, "./src")?,
             Path::new("/tmp/project/src")
         );
+
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_escape_via_canonicalization() {
+    fn rejects_symlink_escape_via_canonicalization() -> Result<()> {
         let base = crate::test_support::unique_temp_dir("openbatrangs-path-test");
         let root = base.join("workspace");
         let outside = base.join("outside");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("secret.txt"), "secret").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&outside)?;
+        fs::write(outside.join("secret.txt"), "secret")?;
+        std::os::unix::fs::symlink(&outside, root.join("escape"))?;
 
         let escaped = root.join("escape");
         assert!(ensure_canonical_within_root(&root, &escaped).is_err());
         assert!(ensure_canonical_within_root(&root, &root).is_ok());
-        fs::remove_dir_all(&base).unwrap();
+        assert!(ensure_canonical_within_root(&root, &root.join("missing")).is_err());
+
+        fs::remove_dir_all(&base)?;
+        Ok(())
     }
 }
