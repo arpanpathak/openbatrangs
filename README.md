@@ -15,10 +15,17 @@ A terminal coding agent for local language models, on any hardware.
 [![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-fcc624?style=for-the-badge&logo=linux&logoColor=black)](#install)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20silicon%20%7C%20Intel-000000?style=for-the-badge&logo=apple&logoColor=white)](#install)
 
+<img src="assets/demo.gif" alt="openbatrangs adding a median function and its tests to a Rust crate" width="900">
+
 </div>
 
-With openbatrangs, you run a coding agent in your terminal on a model you host
-yourself, on a laptop, a workstation, a GPU server or an edge device.
+## Your model, your hardware, no subscription
+
+You don't need a Claude subscription or any other paid coding assistant for
+agentic coding. Serve an open model such as Qwen3-Coder, Gemma 4 or Nemotron on
+your own GPU, or on a GPU cloud VM rented by the hour, and run openbatrangs on
+your laptop against it. Your code stays on machines you control, and you pay
+only for the hardware or the VM time.
 
 - **Engines:** TensorRT Edge-LLM, TensorRT-LLM, vLLM, SGLang, llama.cpp, Ollama,
   and any server with OpenAI's chat completions API.
@@ -28,10 +35,11 @@ yourself, on a laptop, a workstation, a GPU server or an edge device.
   searching the web.
 - **Modes:** `agent` with every tool, `plan` with read-only tools, and `chat`
   with none.
-- **Safety:** `--confirm` for a prompt before each file write and command, and
-  `--read-only` for no writes or commands at all. Every command runs with
-  `$HOME` and tool caches inside the project's `.agent/` folder, without
-  keyboard input, and under a timeout.
+- **Safety:** a `y` or `n` prompt before each file write and shell command in
+  the terminal UI, and with `--confirm` for one-shot tasks. `--read-only` for
+  no writes or commands at all. Every command runs with `$HOME` and tool caches
+  inside the project's `.agent/` folder, without keyboard input, and under a
+  timeout.
 - **Web search:** `web_search` and `web_read` through a
   [SearXNG](https://github.com/searxng/searxng) instance.
 - **Terminal UI:** a transcript with syntax-highlighted code, slash commands, a
@@ -45,10 +53,10 @@ yourself, on a laptop, a workstation, a GPU server or an edge device.
 | | Engine | Option |
 |---|---|---|
 | <img src="assets/engines/nvidia.png" alt="" height="28"> | [TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) | `--openai-url` |
-| <img src="assets/engines/nvidia.png" alt="" height="28"> | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) (`trtllm-serve`) | `--openai-url` |
+| <img src="assets/engines/nvidia.png" alt="" height="28"> | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | `--openai-url` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="assets/engines/vllm-dark.png"><img src="assets/engines/vllm-light.png" alt="" height="24"></picture> | [vLLM](https://github.com/vllm-project/vllm) | `--openai-url` |
 | <img src="assets/engines/sglang.svg" alt="" height="28"> | [SGLang](https://github.com/sgl-project/sglang) | `--openai-url` |
-| <img src="assets/engines/llamacpp.jpg" alt="" height="28"> | [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) | `--openai-url` |
+| <img src="assets/engines/llamacpp.jpg" alt="" height="28"> | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `--openai-url` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="assets/engines/ollama-dark.png"><img src="assets/engines/ollama.svg" alt="" height="28"></picture> | [Ollama](https://ollama.com) | `--ollama-url` |
 
 The logos belong to their owners. Their sources are listed in
@@ -56,13 +64,24 @@ The logos belong to their owners. Their sources are listed in
 
 ## Install
 
-Run the installer to get the release binary for your system and architecture.
+Install openbatrangs on Linux or macOS with one command.
 
 ```sh
 curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
 ```
 
-You can also download a binary yourself.
+You get the release binary for your system and architecture, checked against
+the release's SHA-256 checksums, in `~/.local/bin`, or in `/usr/local/bin` when
+you run the installer as root. To choose another version or folder, set these
+two variables.
+
+```sh
+curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh \
+  | OPENBATRANGS_VERSION=v0.2.3 OPENBATRANGS_INSTALL_DIR=/opt/bin sh
+```
+
+Run the same command again to update. To download a binary yourself, pick the
+file for your system from the [latest release](https://github.com/arpanpathak/openbatrangs/releases/latest).
 
 | System | File |
 |---|---|
@@ -70,13 +89,6 @@ You can also download a binary yourself.
 | Linux, ARM64 | `openbatrangs-aarch64-unknown-linux-gnu` |
 | macOS, Apple silicon | `openbatrangs-aarch64-apple-darwin` |
 | macOS, Intel | `openbatrangs-x86_64-apple-darwin` |
-
-```sh
-curl -fsSL -o openbatrangs \
-  https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-unknown-linux-gnu
-chmod +x openbatrangs
-sudo mv openbatrangs /usr/local/bin/
-```
 
 To build from source, install Rust with [rustup](https://rustup.rs) and run the
 command below. `rust-toolchain.toml` pins Rust 1.100.0, and you get that
@@ -86,37 +98,88 @@ version through rustup on the first build.
 cargo install --git https://github.com/arpanpathak/openbatrangs --locked
 ```
 
-## Usage
+## Quick start
 
-Pass the base URL of your server, including `/v1`, to `--openai-url`. If the
-server needs a key, save the key in a file and pass that file to
-`--api-key-file`.
+Start a model server on your GPU machine, then point openbatrangs at it from
+any machine that can reach it. In these examples, you serve Qwen3-Coder
+30B-A3B, a coding model with tool calling, or Qwen3.6 35B-A3B on TensorRT
+Edge-LLM. On a GPU cloud VM, open the port in its firewall, or forward it over
+SSH with `ssh -N -L 8000:127.0.0.1:8000 gpu-vm`.
+
+### TensorRT Edge-LLM
 
 ```sh
-openbatrangs --openai-url http://127.0.0.1:8000/v1                          # open the terminal UI
-openbatrangs --openai-url http://127.0.0.1:8000/v1 "fix the failing test"   # run one task and exit
-openbatrangs --openai-url https://gpu-box.example.com/v1 --api-key-file ~/.config/gpu-box/key
-openbatrangs --openai-url http://127.0.0.1:8000/v1 --model Qwen3.6-35B-A3B-NVFP4 --confirm "update the CLI docs"
-openbatrangs --openai-url http://127.0.0.1:8000/v1 --read-only --cwd ~/code/app "suggest a refactoring plan"
+tensorrt-edgellm-serve ~/models/Qwen3.6-35B-A3B-NVFP4 --host 0.0.0.0 --port 8000 \
+  --served-model-name Qwen3.6-35B-A3B-NVFP4 --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_xml --enable-auto-tool-choice
+openbatrangs --openai-url http://gpu-vm:8000/v1
 ```
 
-If you leave out `--model`, you get the first model your server lists. To see
-the others, type `/models` in the terminal UI or run `openbatrangs list-models`.
-To limit the context window, pass `--max-ctx`.
+### TensorRT-LLM
+
+```sh
+trtllm-serve Qwen/Qwen3-Coder-30B-A3B-Instruct --host 0.0.0.0 --port 8000
+openbatrangs --openai-url http://gpu-vm:8000/v1
+```
+
+### vLLM
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct --port 8000 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder
+openbatrangs --openai-url http://gpu-vm:8000/v1
+```
+
+### SGLang
+
+```sh
+python -m sglang.launch_server --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 --port 8000 --tool-call-parser qwen3_coder
+openbatrangs --openai-url http://gpu-vm:8000/v1
+```
+
+### llama.cpp
+
+```sh
+llama-server -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --jinja --host 0.0.0.0 --port 8000
+openbatrangs --openai-url http://gpu-vm:8000/v1
+```
 
 ### Ollama
 
+```sh
+ollama pull qwen3-coder:30b
+openbatrangs --model qwen3-coder:30b
+```
+
 Without `--openai-url`, you connect to Ollama at `http://localhost:11434`. If
-Ollama is installed but not running, `ollama serve` is started for you. If none
-of your installed models suits coding, a recommended model is downloaded, unless
-you pass `--no-auto-pull`.
+Ollama is installed but not running, `ollama serve` is started for you. To
+install Ollama and download a coding model, run `openbatrangs setup`. With
+`openbatrangs list-models`, you see a score for agentic coding on your hardware
+for each installed model.
+
+## Usage
 
 ```sh
-openbatrangs setup                          # install and start Ollama, download a coding model
-openbatrangs list-models                    # installed models and their agent scores
-openbatrangs doctor                         # check Ollama and get a model recommendation
-openbatrangs --model qwen2.5-coder:7b "explain this repository"
+openbatrangs --openai-url http://gpu-vm:8000/v1                          # open the terminal UI
+openbatrangs --openai-url http://gpu-vm:8000/v1 "fix the failing test"   # run one task and exit
+openbatrangs --openai-url http://gpu-vm:8000/v1 --confirm "update the CLI docs"
+openbatrangs --openai-url http://gpu-vm:8000/v1 --read-only "suggest a refactoring plan"
+openbatrangs --openai-url https://gpu-vm.example.com/v1 --api-key-file ~/.config/gpu-vm/key
 ```
+
+| Option | Effect |
+|---|---|
+| `--openai-url <url>` | the server's base URL, including `/v1` |
+| `--api-key-file <path>` | a file whose contents are sent as a bearer token |
+| `--model <name>` | the model to use, instead of the first one the server lists |
+| `--cwd <path>` | the project folder, instead of the current one |
+| `--confirm` | a prompt before each file write and shell command |
+| `--read-only` | no file writes or shell commands |
+| `--max-steps <n>` | the step limit, 40 by default |
+| `--max-ctx <tokens>` | an upper limit on the context window |
+| `--no-think` | thinking off, for thinking models |
+| `--searxng-url <url>` | the SearXNG instance for web search |
 
 ### Web search
 
@@ -124,7 +187,7 @@ For web search, run a SearXNG instance at `http://127.0.0.1:8888`, or point
 `--searxng-url` or `OPENBATRANGS_SEARXNG_URL` at another one.
 
 ```sh
-ssh -fN -L 18888:127.0.0.1:8888 gpu-box     # forward SearXNG from a remote machine
+ssh -fN -L 18888:127.0.0.1:8888 gpu-vm      # forward SearXNG from a remote machine
 openbatrangs --searxng-url http://127.0.0.1:18888
 ```
 
@@ -135,11 +198,8 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/help` | list the commands |
 | `/status` | show the current settings and model |
 | `/mode agent\|plan\|chat` | switch between every tool, read-only planning and plain chat |
-| `/model <tag>` | switch to an installed model |
+| `/model <name>` | switch to another model |
 | `/models` | open the model picker |
-| `/pull <tag>` | download a model from Ollama |
-| `/setup` | install and start Ollama and download a model |
-| `/doctor` | check Ollama and get a model recommendation |
 | `/read-only` | turn read-only mode on or off |
 | `/confirm` | turn the prompt before writes and commands on or off |
 | `/yolo` | turn off every prompt |
@@ -149,6 +209,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/perf` | show or hide the performance panel |
 | `/mouse on\|off` | use the mouse wheel and scrollbar, or the terminal's own text selection |
 | `/clear` | clear the transcript |
+| `/pull <tag>`, `/setup`, `/doctor` | download a model, install Ollama, or check it (Ollama only) |
 | `/exit`, `/quit` | leave openbatrangs |
 
 Press Ctrl+C to stop a running task, then type a correction to continue the same
