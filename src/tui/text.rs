@@ -15,9 +15,9 @@
 //! - Unicode grapheme clusters: <https://www.unicode.org/reports/tr29/>
 //! - Ratatui wrapping: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 
-use crate::constants::tui::VIM_TERMINALS;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::Chars;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -25,57 +25,63 @@ use unicode_width::UnicodeWidthStr;
 ///
 /// # Parameters
 ///
-/// - `s`: input string potentially containing terminal escape sequences.
+/// - `text`: input string potentially containing terminal escape sequences.
 ///
 /// # Returns
 ///
 /// The input with all ANSI/OSC escape sequences removed.
-pub(crate) fn strip_ansi(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => skip_escape_sequence(&mut chars),
-            _ => out.push(c),
-        }
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut plain = String::new();
+    let mut characters = text.chars();
+
+    while let Some(character) = characters.next() {
+        keep_unless_escape(&mut plain, character, &mut characters);
     }
-    out
+
+    plain
+}
+
+/// Append `character` to `plain`, or skip the escape sequence it starts.
+fn keep_unless_escape(plain: &mut String, character: char, characters: &mut Chars<'_>) {
+    if character == '\x1b' {
+        skip_escape_sequence(characters);
+        return;
+    }
+
+    plain.push(character);
 }
 
 /// Consume and discard one ANSI escape sequence after the initial ESC character.
-fn skip_escape_sequence(chars: &mut std::str::Chars<'_>) {
-    match chars.next() {
-        // OSC: ESC ] ... BEL / ST
-        Some(']') => {
-            for n in chars.by_ref() {
-                match n {
-                    '\x07' => break,
-                    '\x1b' => {
-                        // Consume the backslash of ESC \ (ST) as well.
-                        let _ = chars.next();
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // CSI: ESC [ params... final byte in 0x40..=0x7E
-        Some('[') => {
-            for n in chars.by_ref() {
-                if n.is_ascii() && ('\u{40}'..='\u{7e}').contains(&n) {
-                    break;
-                }
-            }
-        }
-        // Other single-character escape sequences need no further bytes.
+///
+/// Other single-character escape sequences need no further characters.
+fn skip_escape_sequence(characters: &mut Chars<'_>) {
+    match characters.next() {
+        Some(']') => skip_operating_system_command(characters),
+        Some('[') => skip_control_sequence(characters),
         Some(_) | None => {}
     }
+}
+
+/// Skip an OSC sequence (`ESC ] ...`), which ends at BEL or at the string
+/// terminator `ESC \`.
+fn skip_operating_system_command(characters: &mut Chars<'_>) {
+    let terminator = characters.find(|character| matches!(character, '\x07' | '\x1b'));
+
+    if terminator == Some('\x1b') {
+        characters.next();
+    }
+}
+
+/// Skip a CSI sequence (`ESC [ ...`), which ends at a final byte in `0x40..=0x7E`.
+fn skip_control_sequence(characters: &mut Chars<'_>) {
+    characters.find(|character| ('\u{40}'..='\u{7e}').contains(character));
 }
 
 /// Number of visual rows a line of `display_width` cells occupies when wrapped
 /// at `max_text_width` cells. Empty lines still occupy one row.
 pub(crate) fn wrapped_line_count(display_width: usize, max_text_width: usize) -> usize {
     let max_text_width = max_text_width.max(1);
+
     match display_width {
         0 => 1,
         _ => display_width.div_ceil(max_text_width),
@@ -97,26 +103,61 @@ pub(crate) fn text_wrapped_height(text: &str, max_text_width: usize) -> usize {
 /// and never silently clipped by the input box.
 pub(crate) fn wrap_text_to_lines(text: &str, max_text_width: usize) -> Vec<String> {
     let max_text_width = max_text_width.max(1);
-    let mut rows = Vec::new();
-    for line in text.split('\n') {
-        if line.is_empty() {
-            rows.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        for grapheme in line.graphemes(true) {
-            let grapheme_width = grapheme.width();
-            if current_width + grapheme_width > max_text_width && current_width > 0 {
-                rows.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            current.push_str(grapheme);
-            current_width += grapheme_width;
-        }
-        rows.push(current);
+
+    text.split('\n')
+        .flat_map(|line| wrap_line(line, max_text_width))
+        .collect()
+}
+
+/// Wrap one source line (no newlines) into rows of at most `max_text_width`
+/// cells. An empty line becomes one empty row.
+fn wrap_line(line: &str, max_text_width: usize) -> Vec<String> {
+    let mut rows = WrappedRows::default();
+
+    for grapheme in line.graphemes(true) {
+        rows.push(grapheme, max_text_width);
     }
-    rows
+
+    rows.finish()
+}
+
+/// Rows built so far while wrapping one line.
+#[derive(Default)]
+struct WrappedRows {
+    /// Rows that are already full.
+    full_rows: Vec<String>,
+    /// The row being filled.
+    row: String,
+    /// Display width of `row` in cells.
+    row_width: usize,
+}
+
+impl WrappedRows {
+    /// Add one grapheme, starting a new row first when it does not fit.
+    fn push(&mut self, grapheme: &str, max_text_width: usize) {
+        let grapheme_width = grapheme.width();
+
+        if !fits_on_row(self.row_width, grapheme_width, max_text_width) {
+            self.full_rows.push(std::mem::take(&mut self.row));
+            self.row_width = 0;
+        }
+
+        self.row.push_str(grapheme);
+        self.row_width += grapheme_width;
+    }
+
+    /// All rows, including the last partly filled one.
+    fn finish(mut self) -> Vec<String> {
+        self.full_rows.push(self.row);
+        self.full_rows
+    }
+}
+
+/// Whether a grapheme of `grapheme_width` cells fits on a row that already
+/// holds `row_width` cells. An empty row takes any grapheme, so a grapheme
+/// wider than the row is never dropped.
+fn fits_on_row(row_width: usize, grapheme_width: usize, max_text_width: usize) -> bool {
+    row_width == 0 || row_width + grapheme_width <= max_text_width
 }
 
 /// Map every visual row of `text` back to its source line index.
@@ -125,10 +166,12 @@ pub(crate) fn wrap_text_to_lines(text: &str, max_text_width: usize) -> Vec<Strin
 pub(crate) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec<usize> {
     let max_text_width = max_text_width.max(1);
     let mut indices = Vec::new();
+
     for (index, line) in text.split('\n').enumerate() {
         let rows = wrapped_line_count(line.width(), max_text_width);
         indices.extend(std::iter::repeat_n(index, rows));
     }
+
     indices
 }
 
@@ -142,12 +185,14 @@ pub(crate) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec
 ///
 /// `(name, arg)` — both empty strings when the line does not start with `/`.
 pub(crate) fn split_command(line: &str) -> (&str, &str) {
-    if !line.starts_with('/') {
+    let Some(command) = line.strip_prefix('/') else {
         return ("", "");
-    }
-    let mut parts = line[1..].splitn(2, char::is_whitespace);
+    };
+
+    let mut parts = command.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
     let arg = parts.next().unwrap_or_default().trim();
+
     (name, arg)
 }
 
@@ -163,24 +208,39 @@ pub(crate) fn extract_path_from_line(line: &str, cwd: &Path) -> Option<PathBuf> 
 }
 
 /// Open a file in `vim` inside a new terminal window.
-pub(crate) fn open_in_vim(path: &Path) {
-    let path_str = path.to_string_lossy().to_string();
-    for terminal in VIM_TERMINALS.iter().copied() {
-        let spawned = match terminal {
-            "gnome-terminal" => Command::new(terminal)
-                .arg("--")
-                .arg("vim")
-                .arg(&path_str)
-                .spawn(),
-            _ => Command::new(terminal)
-                .arg("-e")
-                .arg("vim")
-                .arg(&path_str)
-                .spawn(),
-        };
-        if spawned.is_ok() {
-            return;
-        }
+///
+/// # Parameters
+///
+/// - `path`: the file to open.
+/// - `terminals`: terminal emulators to try, in order.
+///
+/// # Returns
+///
+/// The first terminal that started, or `None` when none of them could be started.
+pub(crate) fn open_in_vim<'a>(path: &Path, terminals: &[&'a str]) -> Option<&'a str> {
+    terminals
+        .iter()
+        .copied()
+        .find(|terminal| vim_command(terminal, path).spawn().is_ok())
+}
+
+/// The command that runs `vim path` inside `terminal`.
+fn vim_command(terminal: &str, path: &Path) -> Command {
+    let mut command = Command::new(terminal);
+
+    command
+        .arg(command_separator(terminal))
+        .arg("vim")
+        .arg(path);
+
+    command
+}
+
+/// The flag that introduces the program a terminal emulator should run.
+fn command_separator(terminal: &str) -> &'static str {
+    match terminal {
+        "gnome-terminal" => "--",
+        _ => "-e",
     }
 }
 
@@ -221,6 +281,71 @@ mod tests {
     #[test]
     fn visual_line_indices_map_wrapped_rows_to_sources() {
         assert_eq!(chat_visual_line_indices("aaaaaa\nbb", 3), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn strip_ansi_drops_single_character_escapes_and_a_trailing_escape() {
+        assert_eq!(strip_ansi("a\x1b7b\x1b"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_an_unterminated_operating_system_command() {
+        assert_eq!(strip_ansi("a\x1b]0;title"), "a");
+    }
+
+    #[test]
+    fn wrap_text_to_lines_keeps_empty_lines_and_wide_graphemes() {
+        assert_eq!(
+            wrap_text_to_lines("ab\n\ncd", 1),
+            vec!["a", "b", "", "c", "d"]
+        );
+        assert_eq!(wrap_text_to_lines("😀😀", 1), vec!["😀", "😀"]);
+        assert_eq!(wrap_text_to_lines("", 0), vec![""]);
+    }
+
+    #[test]
+    fn extract_path_from_line_finds_absolute_and_relative_files() -> anyhow::Result<()> {
+        let workspace = crate::test_support::unique_temp_dir("openbatrangs-tui-text");
+        let file = workspace.join("notes.txt");
+        std::fs::write(&file, "notes")?;
+
+        let absolute = format!("wrote {}", file.display());
+
+        assert_eq!(
+            extract_path_from_line(&absolute, &workspace),
+            Some(file.clone())
+        );
+        assert_eq!(
+            extract_path_from_line("wrote notes.txt", &workspace),
+            Some(file)
+        );
+        assert_eq!(extract_path_from_line("no file here", &workspace), None);
+
+        std::fs::remove_dir_all(workspace)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn open_in_vim_uses_the_first_terminal_that_starts() {
+        let path = Path::new("/tmp/openbatrangs-unused.txt");
+        let terminals = ["openbatrangs-missing-terminal", "true"];
+
+        assert_eq!(open_in_vim(path, &terminals), Some("true"));
+        assert_eq!(open_in_vim(path, &["openbatrangs-missing-terminal"]), None);
+    }
+
+    #[test]
+    fn vim_command_uses_the_separator_each_terminal_expects() {
+        let path = Path::new("/tmp/a.rs");
+        let gnome = vim_command("gnome-terminal", path);
+        let xterm = vim_command("xterm", path);
+
+        let gnome_arguments: Vec<_> = gnome.get_args().collect();
+        let xterm_arguments: Vec<_> = xterm.get_args().collect();
+
+        assert_eq!(gnome_arguments, ["--", "vim", "/tmp/a.rs"]);
+        assert_eq!(xterm_arguments, ["-e", "vim", "/tmp/a.rs"]);
     }
 
     #[test]

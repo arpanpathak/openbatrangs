@@ -20,6 +20,7 @@ use super::ScrollMode;
 use super::app::App;
 use super::text_wrapped_height;
 use crate::constants::tui::{CHAT_SCROLL_STEP, LOG_LOAD_CHUNK};
+use ratatui::layout::Rect;
 
 impl App {
     /// Scroll the chat by `delta` wrapped rows.
@@ -30,13 +31,20 @@ impl App {
     /// chunk.
     pub(super) fn scroll_chat(&mut self, delta: i32) {
         self.scroll_mode = ScrollMode::Manual;
-        let next = self.chat_scroll_offset as i32 + delta;
-        if next <= 0 && delta < 0 && self.log.has_more_history() {
+
+        if self.reaches_unloaded_history(delta) {
             self.log.load_more(LOG_LOAD_CHUNK);
             self.chat_scroll_offset = 0;
-        } else {
-            self.chat_scroll_offset = next.max(0) as usize;
+            return;
         }
+
+        let next = self.chat_scroll_offset as i32 + delta;
+        self.chat_scroll_offset = next.max(0) as usize;
+    }
+
+    /// Whether scrolling by `delta` passes the top while older lines wait on disk.
+    fn reaches_unloaded_history(&self, delta: i32) -> bool {
+        scrolls_past_top(self.chat_scroll_offset, delta) && self.log.has_more_history()
     }
 
     /// Scroll by one full viewport page (`PageUp`/`PageDown`).
@@ -49,6 +57,7 @@ impl App {
             .map(|area| area.height.saturating_sub(2).max(1) as usize)
             .unwrap_or(CHAT_SCROLL_STEP);
         let delta = (visible_height as i32).saturating_mul(direction);
+
         self.scroll_chat(delta);
     }
 
@@ -58,40 +67,64 @@ impl App {
     ///
     /// `true` when the event landed on the scrollbar and was consumed.
     pub(super) fn handle_scrollbar_click(&mut self, column: u16, row: u16) -> bool {
-        let Some(area) = self.last_chat_area else {
+        let clicked_area = self
+            .last_chat_area
+            .filter(|area| is_on_scrollbar(*area, column, row));
+
+        let Some(area) = clicked_area else {
             return false;
         };
-        let is_on_scrollbar = column == area.x + area.width.saturating_sub(2);
-        let is_inside_track = row > area.y && row < area.y + area.height.saturating_sub(1);
-        if !is_on_scrollbar || !is_inside_track {
-            return false;
-        }
 
+        self.scroll_to_track_row(area, (row - area.y - 1) as usize);
+
+        true
+    }
+
+    /// Jump to the offset that `track_row` (counted from the top of the
+    /// scrollbar track) stands for, in proportion to the wrapped content.
+    fn scroll_to_track_row(&mut self, area: Rect, track_row: usize) {
         let visible_height = area.height.saturating_sub(2).max(1) as usize;
         let max_text_width = (area.width as usize).saturating_sub(2).max(1);
         let content_height = text_wrapped_height(&self.chat_text(), max_text_width);
         let max_scroll = content_height.saturating_sub(visible_height);
-        let relative = (row - area.y - 1) as usize;
-        let track_height = visible_height.saturating_sub(1).max(1) as f64;
-        let ratio = relative as f64 / track_height;
-        let offset = (max_scroll as f64 * ratio).round() as usize;
-        let offset = offset.min(max_scroll);
 
-        self.scroll_mode = if offset >= max_scroll {
-            ScrollMode::Follow
-        } else {
-            ScrollMode::Manual
-        };
+        let track_height = visible_height.saturating_sub(1).max(1) as f64;
+        let ratio = track_row as f64 / track_height;
+        let offset = ((max_scroll as f64 * ratio).round() as usize).min(max_scroll);
+
+        self.scroll_mode = scroll_mode_at(offset, max_scroll);
         self.chat_scroll_offset = offset;
-        true
     }
+}
+
+/// Whether moving from `offset` by `delta` rows scrolls up to or past the top.
+fn scrolls_past_top(offset: usize, delta: i32) -> bool {
+    delta < 0 && offset as i32 + delta <= 0
+}
+
+/// Whether the cell at `column`, `row` lies on the scrollbar track of `area`.
+fn is_on_scrollbar(area: Rect, column: u16, row: u16) -> bool {
+    column == area.x + area.width.saturating_sub(2) && is_inside_track(area, row)
+}
+
+/// Whether `row` lies between the top and bottom borders of `area`.
+pub(super) fn is_inside_track(area: Rect, row: u16) -> bool {
+    row > area.y && row < area.y + area.height.saturating_sub(1)
+}
+
+/// Follow new output when the offset is at the bottom, otherwise stay put.
+fn scroll_mode_at(offset: usize, max_scroll: usize) -> ScrollMode {
+    if offset >= max_scroll {
+        return ScrollMode::Follow;
+    }
+
+    ScrollMode::Manual
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use ratatui::layout::Rect;
     use std::sync::{Arc, Mutex};
 
     fn test_app() -> App {
@@ -210,6 +243,21 @@ mod tests {
         assert!(app.handle_scrollbar_click(scrollbar_col, 18));
         // At the bottom of the scrollbar, should be Follow mode
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
+    }
+
+    #[test]
+    fn scrolling_up_past_the_top_loads_older_lines_from_disk() {
+        let mut app = test_app();
+        app.log = crate::tui::session::SessionLog::new(2);
+        for index in 0..5 {
+            app.log.push(format!("line {index}"));
+        }
+        app.chat_scroll_offset = 3;
+
+        app.scroll_chat(-3);
+
+        assert_eq!(app.chat_scroll_offset, 0);
+        assert!(app.log.text().starts_with("line 0"));
     }
 
     #[test]

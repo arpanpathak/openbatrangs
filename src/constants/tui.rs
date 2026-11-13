@@ -30,6 +30,33 @@ pub const PREFIXED_COMMANDS: &[(&str, &[&str])] = &[
     ("mouse ", &["on", "off"]),
 ];
 
+/// Lines printed by `/help`: every slash command, then the key bindings.
+pub const HELP_LINES: &[&str] = &[
+    "═══ Commands ═══",
+    "  /help              — show this help",
+    "  /exit, /quit       — leave the TUI",
+    "  /status            — show current settings and model",
+    "  /mode agent|plan|chat — agent=tools, plan=read-only, chat=no tools",
+    "  /model <tag>       — switch to a specific installed model",
+    "  /models            — open model picker",
+    "  /pull <tag>        — download a model from Ollama",
+    "  /setup             — install/start Ollama + pull a model",
+    "  /doctor            — check Ollama + best model recommendation",
+    "  /read-only         — toggle read-only mode (no writes/commands)",
+    "  /confirm           — toggle confirm before writes/commands",
+    "  /yolo              — disable confirmations (careful!)",
+    "  /thinking on|off   — show/hide model reasoning",
+    "  /steps <n>         — set max agent iterations",
+    "  /cwd <path>        — change workspace directory",
+    "  /perf              — toggle performance panel",
+    "  /mouse on|off      — wheel/scrollbar (off = native select/copy)",
+    "  /clear             — clear chat log",
+    "",
+    "═══ Keys ═══",
+    "  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel",
+    "  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete",
+];
+
 /// Spinner frames shown while the agent is working.
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -50,6 +77,10 @@ pub const MAX_CHAT_HISTORY_MESSAGES: usize = 40;
 
 /// Redraw interval in milliseconds (drives the spinner).
 pub const TICK_MILLIS: u64 = 80;
+
+/// Most background events handled between two redraws. Streaming tokens
+/// arrive in bursts, and one redraw per batch keeps the terminal responsive.
+pub const MAX_BACKGROUND_EVENTS_PER_FRAME: usize = 32;
 
 /// Width of the model picker popup as a percentage of the screen.
 pub const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;

@@ -8,6 +8,7 @@ use super::app::App;
 use super::split_command;
 use super::{ScrollMode, UiEvent, run_pull_worker, run_setup_worker};
 use crate::cli::AgentMode;
+use crate::constants::tui::HELP_LINES;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -28,7 +29,7 @@ impl App {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success; network errors are logged to chat instead of propagated.
+    /// `Ok(())` on success, or the network error of `/models`, `/model` or `/doctor`.
     pub(super) async fn run_slash_command(
         &mut self,
         client: &OllamaClient,
@@ -36,19 +37,20 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<()> {
         let (name, arg) = split_command(line);
+
         match name {
             "help" | "h" => self.log_help(),
             "status" => self.log_status(),
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
             "model" => self.handle_model_command(client, arg).await?,
-            "pull" => self.handle_pull_command(client, arg, tx).await?,
+            "pull" => self.handle_pull_command(client, arg, tx),
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
             "steps" => self.handle_steps_command(arg),
             "cwd" => self.handle_cwd_command(arg),
             "doctor" => self.handle_doctor_command(client).await?,
-            "setup" => self.handle_setup_command(client, tx).await?,
+            "setup" => self.handle_setup_command(client, tx),
             "clear" => self.clear_chat(),
             "perf" => self.toggle_perf(),
             "mode" => self.handle_mode_command(arg),
@@ -57,110 +59,50 @@ impl App {
             "yolo" => self.handle_yolo_command(),
             _ => self.log_unknown_command(name),
         }
+
         Ok(())
     }
 
     /// Print the full list of slash commands and key bindings to the chat log.
     fn log_help(&mut self) {
-        self.log.push("═══ Commands ═══".to_string());
-        self.log
-            .push("  /help              — show this help".to_string());
-        self.log
-            .push("  /exit, /quit       — leave the TUI".to_string());
-        self.log
-            .push("  /status            — show current settings and model".to_string());
-        self.log.push(
-            "  /mode agent|plan|chat — agent=tools, plan=read-only, chat=no tools".to_string(),
-        );
-        self.log
-            .push("  /model <tag>       — switch to a specific installed model".to_string());
-        self.log
-            .push("  /models            — open model picker".to_string());
-        self.log
-            .push("  /pull <tag>        — download a model from Ollama".to_string());
-        self.log
-            .push("  /setup             — install/start Ollama + pull a model".to_string());
-        self.log
-            .push("  /doctor            — check Ollama + best model recommendation".to_string());
-        self.log
-            .push("  /read-only         — toggle read-only mode (no writes/commands)".to_string());
-        self.log
-            .push("  /confirm           — toggle confirm before writes/commands".to_string());
-        self.log
-            .push("  /yolo              — disable confirmations (careful!)".to_string());
-        self.log
-            .push("  /thinking on|off   — show/hide model reasoning".to_string());
-        self.log
-            .push("  /steps <n>         — set max agent iterations".to_string());
-        self.log
-            .push("  /cwd <path>        — change workspace directory".to_string());
-        self.log
-            .push("  /perf              — toggle performance panel".to_string());
-        self.log
-            .push("  /mouse on|off      — wheel/scrollbar (off = native select/copy)".to_string());
-        self.log
-            .push("  /clear             — clear chat log".to_string());
-        self.log.push("".to_string());
-        self.log.push("═══ Keys ═══".to_string());
-        self.log
-            .push("  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel".to_string());
-        self.log
-            .push("  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete".to_string());
+        let lines = HELP_LINES.iter().map(|line| line.to_string()).collect();
+
+        self.log.push_lines(lines);
     }
 
     /// Print the current configuration and model status to the chat log.
     fn log_status(&mut self) {
-        let mode = match self.run_config.mode {
-            AgentMode::Agent => "agent (full tools)",
-            AgentMode::Plan => "plan (read-only, no writes)",
-            AgentMode::Chat => "chat (no tools, conversation only)",
-        };
-        self.log.push("═══ Current Status ═══".to_string());
-        self.log.push(format!("  Mode:       {mode}"));
-        self.log.push(format!(
-            "  Model:      {}",
-            self.model.as_deref().unwrap_or("auto (best available)")
-        ));
-        if let Some(info) = &self.model_info {
-            self.log.push(format!("  Model info: {info}"));
-        }
-        self.log.push(format!("  Server:     {}", self.server_url));
-        self.log
-            .push(format!("  Workspace:  {}", self.run_config.cwd.display()));
-        self.log
-            .push(format!("  Max steps:  {}", self.run_config.max_steps));
-        self.log.push(format!(
-            "  Read-only:  {}",
-            if self.run_config.is_read_only {
-                "ON"
-            } else {
-                "OFF"
-            }
-        ));
-        self.log.push(format!(
-            "  Confirm:    {}",
-            if self.run_config.should_confirm {
-                "ON"
-            } else {
-                "OFF (yolo)"
-            }
-        ));
-        self.log.push(format!(
-            "  Thinking:   {}",
-            if self.run_config.show_thinking {
-                "ON"
-            } else {
-                "OFF"
-            }
-        ));
-        self.log.push(format!(
-            "  Mouse:      {}",
-            if self.mouse_capture { "ON" } else { "OFF" }
-        ));
-        self.log.push(format!(
-            "  Perf panel: {}",
-            if self.show_perf { "ON" } else { "OFF" }
-        ));
+        let lines = self.status_lines();
+
+        self.log.push_lines(lines);
+    }
+
+    /// The lines `/status` prints: mode, model, server, and every setting.
+    fn status_lines(&self) -> Vec<String> {
+        let model = self.model.as_deref().unwrap_or("auto (best available)");
+        let model_info = self
+            .model_info
+            .as_ref()
+            .map(|info| format!("  Model info: {info}"));
+        let config = &self.run_config;
+
+        let head = vec![
+            "═══ Current Status ═══".to_string(),
+            format!("  Mode:       {}", mode_description(config.mode)),
+            format!("  Model:      {model}"),
+        ];
+        let settings = vec![
+            format!("  Server:     {}", self.server_url),
+            format!("  Workspace:  {}", config.cwd.display()),
+            format!("  Max steps:  {}", config.max_steps),
+            format!("  Read-only:  {}", on_off(config.is_read_only)),
+            format!("  Confirm:    {}", confirm_label(config.should_confirm)),
+            format!("  Thinking:   {}", on_off(config.show_thinking)),
+            format!("  Mouse:      {}", on_off(self.mouse_capture)),
+            format!("  Perf panel: {}", on_off(self.show_perf)),
+        ];
+
+        head.into_iter().chain(model_info).chain(settings).collect()
     }
 
     /// Open the model picker popup, populated from installed Ollama tags.
@@ -170,14 +112,22 @@ impl App {
     /// - `client`: Ollama client for fetching installed model tags.
     async fn show_model_picker(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
         let tags = client.tags().await?;
-        if tags.is_empty() {
+
+        self.open_model_picker(tags.into_iter().map(|model| model.name).collect());
+
+        Ok(())
+    }
+
+    /// Open the picker on `models`, or point to `/setup` when there are none.
+    fn open_model_picker(&mut self, models: Vec<String>) {
+        if models.is_empty() {
             self.log
                 .push("No models installed. Run /setup.".to_string());
-        } else {
-            self.open_picker(tags.into_iter().map(|model| model.name).collect());
-            self.status = "select model".to_string();
+            return;
         }
-        Ok(())
+
+        self.open_picker(models);
+        self.status = "select model".to_string();
     }
 
     /// Switch to a specific model by tag, or show the current model if no arg.
@@ -196,15 +146,37 @@ impl App {
             return Ok(());
         }
 
+        self.switch_to_installed_model(client, arg).await
+    }
+
+    /// Activate `name` when the server has it installed, or explain how to pull it.
+    async fn switch_to_installed_model(
+        &mut self,
+        client: &OllamaClient,
+        name: &str,
+    ) -> anyhow::Result<()> {
         let tags = client.tags().await?;
-        if model_installed(&tags, arg) {
-            self.activate_model(client, arg).await;
-        } else {
-            self.log.push(format!(
-                "❌ Model '{arg}' is not installed. Pull it first with /pull {arg}."
-            ));
-        }
+
+        self.activate_if_installed(client, &tags, name).await;
+
         Ok(())
+    }
+
+    /// Activate `name` when it is one of `tags`, or explain how to pull it.
+    async fn activate_if_installed(
+        &mut self,
+        client: &OllamaClient,
+        tags: &[OllamaModel],
+        name: &str,
+    ) {
+        if !model_installed(tags, name) {
+            self.log.push(format!(
+                "❌ Model '{name}' is not installed. Pull it first with /pull {name}."
+            ));
+            return;
+        }
+
+        self.activate_model(client, name).await;
     }
 
     /// Print the currently selected model name to the chat log.
@@ -223,7 +195,7 @@ impl App {
     ///
     /// - `client`: Ollama client for refreshing model info.
     /// - `name`: the model tag to activate.
-    async fn activate_model(&mut self, client: &OllamaClient, name: &str) {
+    pub(super) async fn activate_model(&mut self, client: &OllamaClient, name: &str) {
         self.model = Some(name.to_string());
         self.log.push(format!("✅ Model set to {name}"));
         self.refresh_model_info(client).await;
@@ -236,27 +208,38 @@ impl App {
     /// - `client`: Ollama client for the pull operation.
     /// - `arg`: model tag to pull.
     /// - `tx`: channel for progress events.
-    async fn handle_pull_command(
+    fn handle_pull_command(
         &mut self,
         client: &OllamaClient,
         arg: &str,
         tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> anyhow::Result<()> {
-        let name = arg.trim().to_string();
+    ) {
+        let name = arg.trim();
+
         if name.is_empty() {
             self.log.push("Usage: /pull <model-tag>".to_string());
-            return Ok(());
+            return;
         }
+
+        self.pull_unless_busy(client, name.to_string(), tx);
+    }
+
+    /// Start pulling `name`, or refuse while another task runs.
+    fn pull_unless_busy(
+        &mut self,
+        client: &OllamaClient,
+        name: String,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         if self.is_running {
             self.log
                 .push("⚠️  Busy — finish the current task before pulling a model.".to_string());
-            return Ok(());
+            return;
         }
 
         self.log
             .push(format!("⬇️  Pulling model '{name}' in background..."));
         self.start_pull(client, name, tx);
-        Ok(())
     }
 
     /// Spawn a background task to pull a model and track it as the current task.
@@ -279,31 +262,24 @@ impl App {
 
         let client = client.clone();
         let tx = tx.clone();
-        let handle = tokio::spawn(async move {
-            run_pull_worker(client, name, tx).await;
-        });
+        let handle = tokio::spawn(run_pull_worker(client, name, tx));
+
         self.current_task = Some(handle);
     }
 
     /// Toggle read-only mode on/off, preventing or allowing file writes and commands.
     fn toggle_read_only(&mut self) {
         self.run_config.is_read_only = !self.run_config.is_read_only;
-        let state = if self.run_config.is_read_only {
-            "ON"
-        } else {
-            "OFF"
-        };
+
+        let state = on_off(self.run_config.is_read_only);
         self.log.push(format!("Read-only mode: {state}"));
     }
 
     /// Toggle confirmation prompts on/off for writes and shell commands.
     fn toggle_confirm(&mut self) {
         self.run_config.should_confirm = !self.run_config.should_confirm;
-        let state = if self.run_config.should_confirm {
-            "ON"
-        } else {
-            "OFF"
-        };
+
+        let state = on_off(self.run_config.should_confirm);
         self.log.push(format!("Confirm mode: {state}"));
     }
 
@@ -313,24 +289,13 @@ impl App {
     ///
     /// - `arg`: one of "agent", "plan", or "chat".
     fn handle_mode_command(&mut self, arg: &str) {
-        match arg {
-            "agent" => {
-                self.run_config.mode = AgentMode::Agent;
-                self.log
-                    .push("Mode: agent (full tools enabled)".to_string());
-            }
-            "plan" => {
-                self.run_config.mode = AgentMode::Plan;
-                self.log
-                    .push("Mode: plan (read-only, explores and plans)".to_string());
-            }
-            "chat" => {
-                self.run_config.mode = AgentMode::Chat;
-                self.log
-                    .push("Mode: chat (no tools, conversation + code)".to_string());
-            }
-            _ => self.log.push("Usage: /mode agent|plan|chat".to_string()),
-        }
+        let Some(mode) = parse_mode(arg) else {
+            self.log.push("Usage: /mode agent|plan|chat".to_string());
+            return;
+        };
+
+        self.run_config.mode = mode;
+        self.log.push(mode_switch_message(mode).to_string());
     }
 
     /// Toggle or display the model reasoning/thinking display.
@@ -339,26 +304,17 @@ impl App {
     ///
     /// - `arg`: "on", "off", or empty to show current state.
     fn handle_thinking_command(&mut self, arg: &str) {
-        match arg {
-            "on" => {
-                self.run_config.show_thinking = true;
-                self.log.push("Thinking display: ON".to_string());
-            }
-            "off" => {
-                self.run_config.show_thinking = false;
-                self.log.push("Thinking display: OFF".to_string());
-            }
-            _ => {
-                let state = if self.run_config.show_thinking {
-                    "ON"
-                } else {
-                    "OFF"
-                };
-                self.log.push(format!(
-                    "Thinking display: {state} · Usage: /thinking on|off"
-                ));
-            }
-        }
+        let Some(show_thinking) = parse_on_off(arg) else {
+            let state = on_off(self.run_config.show_thinking);
+            self.log.push(format!(
+                "Thinking display: {state} · Usage: /thinking on|off"
+            ));
+            return;
+        };
+
+        self.run_config.show_thinking = show_thinking;
+        self.log
+            .push(format!("Thinking display: {}", on_off(show_thinking)));
     }
 
     /// Toggle mouse capture: on for wheel/scrollbar, off for native select/copy.
@@ -367,26 +323,15 @@ impl App {
     ///
     /// - `arg`: "on", "off", or empty to show current state.
     fn handle_mouse_command(&mut self, arg: &str) {
-        match arg {
-            "on" => {
-                self.mouse_capture = true;
-                self.log.push(
-                    "Mouse mode: ON (wheel scroll + click-to-open, selection via Shift+drag)"
-                        .to_string(),
-                );
-            }
-            "off" => {
-                self.mouse_capture = false;
-                self.log.push(
-                    "Mouse mode: OFF (native select/copy, scroll with PgUp/PgDn)".to_string(),
-                );
-            }
-            _ => {
-                let state = if self.mouse_capture { "ON" } else { "OFF" };
-                self.log
-                    .push(format!("Mouse mode: {state} · Usage: /mouse on|off"));
-            }
-        }
+        let Some(mouse_capture) = parse_on_off(arg) else {
+            let state = on_off(self.mouse_capture);
+            self.log
+                .push(format!("Mouse mode: {state} · Usage: /mouse on|off"));
+            return;
+        };
+
+        self.mouse_capture = mouse_capture;
+        self.log.push(mouse_mode_message(mouse_capture).to_string());
     }
 
     /// Disable confirmation prompts ("YOLO mode") for writes and commands.
@@ -404,13 +349,13 @@ impl App {
     ///
     /// - `arg`: positive integer string, or empty/invalid to show usage.
     fn handle_steps_command(&mut self, arg: &str) {
-        match arg.parse::<usize>() {
-            Ok(steps) if steps > 0 => {
-                self.run_config.max_steps = steps;
-                self.log.push(format!("Max steps set to {steps}"));
-            }
-            _ => self.log.push("Usage: /steps <positive number>".to_string()),
-        }
+        let Some(steps) = positive_number(arg) else {
+            self.log.push("Usage: /steps <positive number>".to_string());
+            return;
+        };
+
+        self.run_config.max_steps = steps;
+        self.log.push(format!("Max steps set to {steps}"));
     }
 
     /// Show or change the agent's working directory.
@@ -422,13 +367,14 @@ impl App {
         if arg.is_empty() {
             self.log
                 .push(format!("Workspace: {}", self.run_config.cwd.display()));
-        } else {
-            self.run_config.cwd = PathBuf::from(arg);
-            self.log.push(format!(
-                "Workspace set to {}",
-                self.run_config.cwd.display()
-            ));
+            return;
         }
+
+        self.run_config.cwd = PathBuf::from(arg);
+        self.log.push(format!(
+            "Workspace set to {}",
+            self.run_config.cwd.display()
+        ));
     }
 
     /// Run connectivity and model-recommendation diagnostics, logging results.
@@ -437,9 +383,10 @@ impl App {
     ///
     /// - `client`: Ollama client for checking server status and installed models.
     async fn handle_doctor_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
-        for line in crate::commands::doctor_lines(client, self.min_context).await? {
-            self.log.push(line);
-        }
+        let lines = crate::commands::doctor_lines(client, self.min_context).await?;
+
+        self.log.push_lines(lines);
+
         Ok(())
     }
 
@@ -449,15 +396,11 @@ impl App {
     ///
     /// - `client`: Ollama client for setup operations.
     /// - `tx`: channel for progress events.
-    async fn handle_setup_command(
-        &mut self,
-        client: &OllamaClient,
-        tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> anyhow::Result<()> {
+    fn handle_setup_command(&mut self, client: &OllamaClient, tx: &mpsc::UnboundedSender<UiEvent>) {
         if self.is_running {
             self.log
                 .push("⚠️  Busy — finish the current task before running setup.".to_string());
-            return Ok(());
+            return;
         }
 
         self.log
@@ -467,13 +410,9 @@ impl App {
         self.last_action = "setup".to_string();
         self.scroll_mode = ScrollMode::Follow;
 
-        let client = client.clone();
-        let tx = tx.clone();
-        let handle = tokio::spawn(async move {
-            run_setup_worker(client, tx).await;
-        });
+        let handle = tokio::spawn(run_setup_worker(client.clone(), tx.clone()));
+
         self.current_task = Some(handle);
-        Ok(())
     }
 
     /// Clear the chat log, live output, prompt, and conversation history.
@@ -484,6 +423,7 @@ impl App {
         self.interrupted_task = None;
         self.agent_conversation = None;
         self.chat_history.clear();
+
         self.scroll_mode = ScrollMode::Follow;
         self.chat_scroll_offset = 0;
     }
@@ -491,10 +431,9 @@ impl App {
     /// Toggle the live GPU/CPU/RAM performance panel on/off.
     fn toggle_perf(&mut self) {
         self.show_perf = !self.show_perf;
-        self.log.push(format!(
-            "Perf panel: {}",
-            if self.show_perf { "ON" } else { "OFF" }
-        ));
+
+        self.log
+            .push(format!("Perf panel: {}", on_off(self.show_perf)));
     }
 
     /// Log a "command not found" message with a hint to use `/help`.
@@ -506,6 +445,72 @@ impl App {
         self.log
             .push(format!("Unknown command: /{name}. Try /help"));
     }
+}
+
+/// `"ON"` or `"OFF"` for a setting.
+fn on_off(enabled: bool) -> &'static str {
+    match enabled {
+        true => "ON",
+        false => "OFF",
+    }
+}
+
+/// The `/status` label for the confirmation setting; off means yolo mode.
+fn confirm_label(should_confirm: bool) -> &'static str {
+    match should_confirm {
+        true => "ON",
+        false => "OFF (yolo)",
+    }
+}
+
+/// What each agent mode allows, as shown by `/status`.
+fn mode_description(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Agent => "agent (full tools)",
+        AgentMode::Plan => "plan (read-only, no writes)",
+        AgentMode::Chat => "chat (no tools, conversation only)",
+    }
+}
+
+/// The agent mode named by a `/mode` argument, or `None` for an unknown name.
+fn parse_mode(arg: &str) -> Option<AgentMode> {
+    match arg {
+        "agent" => Some(AgentMode::Agent),
+        "plan" => Some(AgentMode::Plan),
+        "chat" => Some(AgentMode::Chat),
+        _ => None,
+    }
+}
+
+/// The message logged after `/mode` switches to `mode`.
+fn mode_switch_message(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Agent => "Mode: agent (full tools enabled)",
+        AgentMode::Plan => "Mode: plan (read-only, explores and plans)",
+        AgentMode::Chat => "Mode: chat (no tools, conversation + code)",
+    }
+}
+
+/// `Some(true)` for `"on"`, `Some(false)` for `"off"`, `None` for anything else.
+fn parse_on_off(arg: &str) -> Option<bool> {
+    match arg {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// The message logged after `/mouse on` or `/mouse off`.
+fn mouse_mode_message(mouse_capture: bool) -> &'static str {
+    match mouse_capture {
+        true => "Mouse mode: ON (wheel scroll + click-to-open, selection via Shift+drag)",
+        false => "Mouse mode: OFF (native select/copy, scroll with PgUp/PgDn)",
+    }
+}
+
+/// `arg` as a number above zero, or `None`.
+fn positive_number(arg: &str) -> Option<usize> {
+    arg.parse::<usize>().ok().filter(|number| *number > 0)
 }
 
 #[cfg(test)]
@@ -545,7 +550,7 @@ mod tests {
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         let client = OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
-        app.handle_pull_command(&client, "", &tx).await.unwrap();
+        app.handle_pull_command(&client, "", &tx);
         assert!(app.log.iter().any(|line| line.contains("Usage: /pull")));
         assert!(!app.is_running);
         assert!(app.current_task.is_none());
@@ -779,6 +784,186 @@ mod tests {
         assert_eq!(app.live, "");
         assert_eq!(app.chat_scroll_offset, 0);
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
+    }
+
+    /// A mock Ollama server with one installed model, `qwen2.5-coder:7b`.
+    async fn server_with_one_model() -> anyhow::Result<OllamaClient> {
+        let base_url = crate::test_support::spawn_mock_server(|_path| {
+            crate::test_support::MockResponse::json(
+                "200 OK",
+                r#"{"models":[{"name":"qwen2.5-coder:7b","size":4700000000}]}"#,
+            )
+        })
+        .await;
+
+        OllamaClient::new(&base_url)
+    }
+
+    /// An app with default settings.
+    fn test_app() -> App {
+        let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
+        App::new(&cli, Arc::new(Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn every_slash_command_runs_through_the_dispatcher() -> anyhow::Result<()> {
+        let client = server_with_one_model().await?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let commands = [
+            "/h",
+            "/model",
+            "/model qwen2.5-coder:7b",
+            "/model",
+            "/model missing:1b",
+            "/status",
+            "/read-only",
+            "/confirm",
+            "/steps 3",
+            "/cwd",
+            "/doctor",
+            "/perf",
+            "/mode chat",
+            "/thinking",
+            "/thinking off",
+            "/mouse",
+            "/mouse on",
+            "/yolo",
+            "/nope",
+            "/models",
+            "/exit",
+        ];
+
+        let results = run_commands(&mut app, &client, &commands, &tx).await;
+
+        let text = app.log.text();
+        assert!(results.iter().all(Result::is_ok));
+        assert!(text.contains("Auto mode"));
+        assert!(text.contains("Current model: qwen2.5-coder:7b"));
+        assert!(text.contains("  Model info: model: qwen2.5-coder:7b · 4.7 GB"));
+        assert!(text.contains("❌ Model 'missing:1b' is not installed."));
+        assert!(text.contains("Ollama reachable"));
+        assert!(text.contains("Thinking display: ON · Usage"));
+        assert!(text.contains("Mouse mode: ON · Usage"));
+        assert!(text.contains("Mouse mode: ON (wheel scroll"));
+        assert!(app.is_showing_picker());
+        assert_eq!(app.status, "select model");
+        assert!(app.should_quit);
+
+        Ok(())
+    }
+
+    /// Run each slash command in order and collect the results.
+    async fn run_commands(
+        app: &mut App,
+        client: &OllamaClient,
+        commands: &[&str],
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> Vec<anyhow::Result<()>> {
+        let mut results = Vec::new();
+
+        for command in commands {
+            results.push(app.run_slash_command(client, command, tx).await);
+        }
+
+        results
+    }
+
+    #[test]
+    fn status_shows_every_setting() {
+        let mut app = test_app();
+        app.run_config.mode = AgentMode::Plan;
+        app.run_config.should_confirm = false;
+        app.mouse_capture = false;
+
+        let mut lines = app.status_lines();
+
+        assert!(lines.contains(&"  Mode:       plan (read-only, no writes)".to_string()));
+        assert!(lines.contains(&"  Confirm:    OFF (yolo)".to_string()));
+        assert!(lines.contains(&"  Mouse:      OFF".to_string()));
+
+        app.run_config.mode = AgentMode::Chat;
+        lines = app.status_lines();
+
+        assert!(lines.contains(&"  Mode:       chat (no tools, conversation only)".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_picker_needs_installed_models() -> anyhow::Result<()> {
+        let base_url = crate::test_support::spawn_mock_server(|_path| {
+            crate::test_support::MockResponse::json("200 OK", r#"{"models":[]}"#)
+        })
+        .await;
+        let client = OllamaClient::new(&base_url)?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.run_slash_command(&client, "/models", &tx).await?;
+
+        assert!(!app.is_showing_picker());
+        assert!(app.log.text().contains("No models installed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pull_and_setup_start_in_the_background_unless_busy() -> anyhow::Result<()> {
+        let client = server_with_one_model().await?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.run_slash_command(&client, "/pull qwen2.5-coder:3b", &tx)
+            .await?;
+
+        assert!(app.is_running);
+        assert_eq!(app.last_action, "pulling qwen2.5-coder:3b");
+
+        app.run_slash_command(&client, "/pull llama3.2:3b", &tx)
+            .await?;
+        app.run_slash_command(&client, "/setup", &tx).await?;
+
+        assert!(
+            app.log
+                .text()
+                .contains("Busy — finish the current task before pulling")
+        );
+        assert!(
+            app.log
+                .text()
+                .contains("Busy — finish the current task before running setup")
+        );
+
+        let mut idle_app = test_app();
+        idle_app.run_slash_command(&client, "/setup", &tx).await?;
+
+        assert!(idle_app.is_running);
+        assert_eq!(idle_app.status, "running setup");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_runs_through_the_dispatcher() -> anyhow::Result<()> {
+        let client = OllamaClient::new("http://127.0.0.1:1")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.log.push("old line".to_string());
+
+        app.run_slash_command(&client, "/clear", &tx).await?;
+
+        assert!(app.log.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_mode_switch_messages_name_each_mode() {
+        let mut app = test_app();
+
+        app.handle_mode_command("plan");
+        app.handle_mode_command("agent");
+
+        assert!(app.log.text().contains("Mode: agent (full tools enabled)"));
     }
 
     #[test]
