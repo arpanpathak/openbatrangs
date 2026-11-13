@@ -56,7 +56,7 @@ pub(super) enum ScrollMode {
 use crate::cli::Cli;
 use crate::constants::tui::{KEYBOARD_FLAGS, MAX_BACKGROUND_EVENTS_PER_FRAME, TICK_MILLIS};
 use crate::ollama::OllamaClient;
-use crate::perf::TegrastatsGuard;
+use crate::perf::{ServerPoller, TegrastatsGuard};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -164,8 +164,11 @@ async fn run_app<W: Write>(
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
 
+    let server_poller = ServerPoller::start_for_remote(client);
+
     let mut app = app::App::new(cli, tegrastats_shared);
     app.server_url = client.base_url.clone();
+    app.server_feed = server_poller.as_ref().map(ServerPoller::feed);
     app.refresh_model_info(client).await;
 
     run_loop(terminal, &mut app, events, client).await

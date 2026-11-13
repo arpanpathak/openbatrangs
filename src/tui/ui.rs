@@ -49,7 +49,10 @@ pub(super) fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     render_transcript(frame, app, chunks[1]);
     render_status_line(frame, app, chunks[2]);
 
-    if perf_visible(app, frame.area().height) {
+    let perf_on_screen = perf_visible(app, frame.area().height);
+    app.set_perf_on_screen(perf_on_screen);
+
+    if perf_on_screen {
         render_perf_panel(frame, app, chunks[3]);
     }
 
@@ -680,6 +683,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentEvent;
     use crate::cli::Cli;
+    use crate::perf::{ServerStats, ServerStatsFeed};
     use clap::Parser;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -962,5 +966,151 @@ mod tests {
         assert!(content.contains("Confirmation required"));
         assert!(content.contains("write file 'a.txt'?"));
         assert!(content.contains("Press y to confirm"));
+    }
+
+    /// The `/v1/system` body thor-tigress-agent publishes.
+    const THOR_SYSTEM: &str = r#"{"host":"thor","sampled_at_unix_ms":1794560000000,"gpu":{"name":"NVIDIA Thor","utilization_percent":37.0,"memory_used_bytes":90194313216,"memory_total_bytes":131072000000,"memory_is_unified":true,"power_watts":4.37,"temperature_celsius":41.0},"cpu":{"utilization_percent":12.0,"cores":14},"models":[{"id":"Gemma-4-26B-A4B-NVFP4","engine":"tensorrt-edgellm"}]}"#;
+
+    /// vLLM metrics for two engines.
+    const VLLM_METRICS: &str = "\
+vllm:num_requests_running{engine=\"0\"} 2.0
+vllm:num_requests_running{engine=\"1\"} 1.0
+vllm:num_requests_waiting{engine=\"0\"} 1.0
+vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
+";
+
+    /// Width of the test terminal.
+    const TERMINAL_WIDTH: u16 = 90;
+
+    /// An app whose model server is at `server_url`, with `stats` published
+    /// when the server is on another host.
+    fn app_with_server(server_url: &str, stats: Option<ServerStats>) -> App {
+        app_with_feed(server_url, stats.map(feed_holding))
+    }
+
+    /// An app whose model server is at `server_url`, reading server stats
+    /// from `feed`.
+    fn app_with_feed(server_url: &str, feed: Option<ServerStatsFeed>) -> App {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        app.server_url = server_url.to_string();
+        app.server_feed = feed;
+
+        app
+    }
+
+    /// A feed that holds `stats`, as if one poll had finished.
+    fn feed_holding(stats: ServerStats) -> ServerStatsFeed {
+        let feed = ServerStatsFeed::default();
+        feed.store(stats);
+
+        feed
+    }
+
+    /// The text inside the perf panel's borders, one entry per row, drawn on
+    /// a 90 by 40 terminal.
+    fn perf_panel_text(app: &mut App) -> anyhow::Result<Vec<String>> {
+        let mut terminal = Terminal::new(TestBackend::new(TERMINAL_WIDTH, 40))?;
+        terminal.draw(|frame| super::ui(frame, app))?;
+
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(TERMINAL_WIDTH))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+
+        Ok(panel_rows(&rows))
+    }
+
+    /// The rows between the perf panel's top and bottom borders, without the
+    /// side borders.
+    fn panel_rows(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .skip_while(|row| !row.contains(" perf "))
+            .skip(1)
+            .take_while(|row| row.trim_start().starts_with('│'))
+            .map(|row| row.trim().trim_matches('│').trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn remote_server_with_a_system_report_comes_above_this_machine() -> anyhow::Result<()> {
+        let stats = ServerStats::from_bodies(Some(THOR_SYSTEM), None, None);
+        let mut app = app_with_server("http://10.0.0.5:8079/v1", Some(stats));
+
+        let panel = perf_panel_text(&mut app)?;
+        println!("{}", panel.join("\n"));
+
+        assert_eq!(
+            panel[..3],
+            [
+                "server thor · NVIDIA Thor · GPU 37% · 4.4 W · 41 °C",
+                "memory 84.0/122.1 GB (shared with CPU) · CPU 12% · 14 cores",
+                "this machine",
+            ]
+        );
+        assert!(panel[3].starts_with("GPU n/a"));
+        assert!(panel[5].starts_with("RAM "));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_server_with_only_metrics_shows_the_engine_load() -> anyhow::Result<()> {
+        let stats = ServerStats::from_bodies(None, Some(VLLM_METRICS), None);
+        let mut app = app_with_server("http://10.0.0.5:8000/v1", Some(stats));
+
+        let panel = perf_panel_text(&mut app)?;
+        println!("{}", panel.join("\n"));
+
+        assert_eq!(
+            panel[..2],
+            [
+                "server 10.0.0.5 · requests 3 running · 1 waiting · KV cache 34%",
+                "this machine",
+            ]
+        );
+        assert_eq!(panel.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_server_that_publishes_nothing_says_so() -> anyhow::Result<()> {
+        let mut app = app_with_server("http://thor:8079/v1", Some(ServerStats::default()));
+
+        let panel = perf_panel_text(&mut app)?;
+        println!("{}", panel.join("\n"));
+
+        assert_eq!(panel[..2], ["no server stats published", "this machine"]);
+        assert!(panel[2].starts_with("GPU n/a"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_server_before_the_first_poll_shows_waiting() -> anyhow::Result<()> {
+        let feed = ServerStatsFeed::default();
+        let mut app = app_with_feed("http://thor:8079/v1", Some(feed));
+
+        let panel = perf_panel_text(&mut app)?;
+        println!("{}", panel.join("\n"));
+
+        assert_eq!(panel[..2], ["waiting for server stats", "this machine"]);
+        assert!(panel[2].starts_with("GPU n/a"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_server_shows_only_this_machine_without_a_heading() -> anyhow::Result<()> {
+        let mut app = app_with_server("http://127.0.0.1:11434", None);
+
+        let panel = perf_panel_text(&mut app)?;
+        println!("{}", panel.join("\n"));
+
+        assert_eq!(panel.len(), 3);
+        assert!(panel[0].starts_with("GPU n/a"));
+        assert!(panel[1].starts_with("CPU --"));
+        assert!(panel[2].starts_with("RAM "));
+        Ok(())
     }
 }
