@@ -127,13 +127,14 @@ impl HistorySink for ChannelHistorySink {
     }
 }
 
-/// Prior context handed to a worker: the chat-mode conversation and the
-/// agent-mode resume snapshot.
+/// Prior context handed to a worker: the session's turns and the agent-mode
+/// resume snapshot.
 ///
-/// Bundling the two keeps [`run_agent_worker`]'s signature small; only one
-/// of them is used per run, depending on the mode.
+/// Bundling the two keeps [`run_agent_worker`]'s signature small.
 pub(crate) struct WorkerHistory {
-    /// Prior conversation messages for chat mode.
+    /// The session's tasks and answers, ending with the current task. Chat
+    /// mode sends them as the conversation; agent and plan modes put the
+    /// earlier ones in the first message.
     pub chat: Vec<ChatMessage>,
     /// Prior agent conversation (OpenAI message shape) to resume from.
     pub resume: Option<Vec<Value>>,
@@ -169,19 +170,20 @@ pub(crate) async fn run_agent_worker(
     match config.mode {
         AgentMode::Chat => run_chat_worker(client, config, model_slot, prefs, prior.chat, tx).await,
         AgentMode::Agent | AgentMode::Plan => {
-            run_tool_agent(client, config, model_slot, prefs, task, prior.resume, tx).await
+            run_tool_agent(client, config, model_slot, prefs, task, prior, tx).await
         }
     }
 }
 
-/// Run the tool-using agent (agent and plan modes).
+/// Run the tool-using agent (agent and plan modes) with the session's
+/// earlier turns, or with the interrupted conversation it continues.
 async fn run_tool_agent(
     client: OllamaClient,
     config: AgentRunConfig,
     model_slot: Option<String>,
     prefs: ModelPrefs,
     task: String,
-    resume: Option<Vec<Value>>,
+    prior: WorkerHistory,
     tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<()> {
     let selected = select_model(&client, &model_slot, &prefs, &tx).await?;
@@ -192,7 +194,8 @@ async fn run_tool_agent(
     let mut confirmer = ChannelConfirmer { tx: tx.clone() };
     let mut history = ChannelHistorySink { tx };
     let continuation = RunContinuation {
-        messages: resume,
+        messages: prior.resume,
+        earlier: earlier_turns(prior.chat),
         sink: Some(&mut history),
     };
 
@@ -206,6 +209,14 @@ async fn run_tool_agent(
         &mut confirmer,
     )
     .await
+}
+
+/// The chat turns before the current task. The TUI records the task as
+/// the last turn before the run starts; the run gets it as its task instead.
+fn earlier_turns(mut chat: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    chat.pop();
+
+    chat
 }
 
 /// Pick the model to run, logging pull and selection progress in the chat.
@@ -579,6 +590,19 @@ mod tests {
         assert!(!result, "dropped UI must be treated as 'no'");
 
         Ok(())
+    }
+
+    #[test]
+    fn the_current_task_is_not_an_earlier_turn() {
+        let turn = |content: &str| ChatMessage {
+            role: Role::User,
+            content: content.to_string(),
+        };
+
+        let earlier = earlier_turns(vec![turn("first task"), turn("current task")]);
+
+        assert_eq!(earlier.len(), 1);
+        assert_eq!(earlier[0].content, "first task");
     }
 
     #[test]

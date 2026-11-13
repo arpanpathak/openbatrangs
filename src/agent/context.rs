@@ -6,8 +6,9 @@
 //! the system message, original task, and newest tool exchanges stay verbatim.
 
 use crate::constants::agent::{
-    CHARS_PER_TOKEN, COMPACT_NOTE_MAX_CHARS, CONTEXT_RESERVE_TOKENS, KEEP_RECENT_MESSAGES,
-    MAX_OUTPUT_TOKENS, MAX_RECENT_MESSAGE_CHARS, MIN_OUTPUT_TOKENS, TOOL_RESULT_PREFIX,
+    CHARS_PER_TOKEN, COMPACT_NOTE_MAX_CHARS, CONTEXT_RESERVE_TOKENS, EARLIER_TURNS_BUDGET_PERCENT,
+    EARLIER_TURNS_HEADING, KEEP_RECENT_MESSAGES, MAX_EARLIER_TURN_CHARS, MAX_OUTPUT_TOKENS,
+    MAX_RECENT_MESSAGE_CHARS, MIN_OUTPUT_TOKENS, TOOL_RESULT_PREFIX,
 };
 use crate::ollama::{ChatMessage, Role};
 use serde_json::Value;
@@ -138,7 +139,7 @@ fn shrink_task_if_needed(compacted: &mut [ChatMessage], budget: usize) {
 }
 
 /// Number of prompt characters that leave room for [`MIN_OUTPUT_TOKENS`] output.
-fn max_prompt_chars(num_ctx: u64) -> usize {
+pub(crate) fn max_prompt_chars(num_ctx: u64) -> usize {
     let budget_tokens = num_ctx
         .saturating_sub(MIN_OUTPUT_TOKENS)
         .saturating_sub(CONTEXT_RESERVE_TOKENS)
@@ -252,6 +253,60 @@ fn argument_text(value: &Value) -> Cow<'_, str> {
     }
 }
 
+/// The earlier turns of the conversation, as a section for a new task's
+/// first message. The newest turns are kept when they do not all fit in
+/// [`EARLIER_TURNS_BUDGET_PERCENT`] of the prompt budget. Empty when there
+/// are no earlier turns.
+pub(crate) fn earlier_turns_section(turns: &[ChatMessage], num_ctx: u64) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+
+    let budget = max_prompt_chars(num_ctx) * EARLIER_TURNS_BUDGET_PERCENT / 100;
+    let lines: Vec<String> = turns.iter().map(earlier_turn_line).collect();
+    let first_kept = first_line_that_fits(&lines, budget);
+
+    format!(
+        "\n\n{EARLIER_TURNS_HEADING}\n{}",
+        lines[first_kept..].join("\n")
+    )
+}
+
+/// One earlier turn as `User: …` or `Assistant: …`, shortened to
+/// [`MAX_EARLIER_TURN_CHARS`].
+fn earlier_turn_line(turn: &ChatMessage) -> String {
+    let text = truncate_chars(turn.content.trim(), MAX_EARLIER_TURN_CHARS);
+
+    format!("{}: {text}", role_label(&turn.role))
+}
+
+/// The label of a role in the earlier turns.
+fn role_label(role: &Role) -> &'static str {
+    match role {
+        Role::System => "System",
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+        Role::Tool => "Tool",
+    }
+}
+
+/// Index of the oldest line from which all later lines fit in `max_chars`,
+/// counting one newline after each line.
+fn first_line_that_fits(lines: &[String], max_chars: usize) -> usize {
+    let mut used = 0;
+
+    let fitting = lines
+        .iter()
+        .rev()
+        .take_while(|line| {
+            used += line.len() + 1;
+            used <= max_chars
+        })
+        .count();
+
+    lines.len() - fitting
+}
+
 /// First line of text, truncated.
 fn head(text: &str, max_chars: usize) -> String {
     let line = text.lines().next().unwrap_or("").trim();
@@ -259,7 +314,7 @@ fn head(text: &str, max_chars: usize) -> String {
 }
 
 /// Truncate a string and append an omission marker.
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -527,5 +582,34 @@ mod tests {
         assert_eq!(arg(&args, "text").as_ref(), "value");
         assert_eq!(arg(&args, "count").as_ref(), "3");
         assert_eq!(arg(&args, "missing").as_ref(), "");
+    }
+
+    #[test]
+    fn no_earlier_turns_give_no_section() {
+        assert_eq!(earlier_turns_section(&[], 8_192), "");
+    }
+
+    #[test]
+    fn earlier_turns_keep_the_newest_when_they_do_not_fit() {
+        let turns: Vec<ChatMessage> = (0..200)
+            .map(|index| message(Role::User, format!("task {index} {}", "z".repeat(500))))
+            .collect();
+
+        let section = earlier_turns_section(&turns, 8_192);
+
+        assert!(section.starts_with("\n\nEarlier in this conversation:\nUser: task "));
+        assert!(section.contains("task 199 "));
+        assert!(!section.contains("task 0 "));
+        assert!(section.len() <= max_prompt_chars(8_192) / 4 + 64);
+    }
+
+    #[test]
+    fn every_role_has_a_label() {
+        let labels: Vec<&str> = [Role::System, Role::User, Role::Assistant, Role::Tool]
+            .iter()
+            .map(role_label)
+            .collect();
+
+        assert_eq!(labels, ["System", "User", "Assistant", "Tool"]);
     }
 }

@@ -43,13 +43,13 @@ mod summary;
 mod tool;
 
 use crate::constants::agent::MIN_CONTEXT_TOKENS;
-use crate::ollama::OllamaClient;
+use crate::ollama::{ChatMessage, OllamaClient};
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
-pub(crate) use context::{compact_context, max_output_tokens};
+pub(crate) use context::{compact_context, earlier_turns_section, max_output_tokens};
 pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind};
 pub(crate) use tool::describe_call;
 
@@ -66,15 +66,19 @@ pub trait HistorySink: Send {
     fn save(&mut self, messages: Vec<Value>);
 }
 
-/// The interrupted run this run continues, plus the sink that keeps the
+/// What a run knows from earlier in the session: the interrupted run it
+/// continues, the earlier tasks and answers, and the sink that keeps the
 /// TUI's resume copy up to date for the next interrupt.
 ///
-/// Bundling the two keeps [`run_agent`]'s signature small: the conversation
-/// to resume from and the channel that snapshots this run belong together.
+/// Bundling them keeps [`run_agent`]'s signature small.
+#[derive(Default)]
 pub struct RunContinuation<'a> {
     /// Prior conversation in OpenAI `/chat/completions` shape; `None` for a
     /// fresh start.
     pub messages: Option<Vec<Value>>,
+    /// Earlier tasks and answers of this session, oldest first. A fresh run
+    /// puts them in its first message, so the model knows what was said.
+    pub earlier: Vec<ChatMessage>,
     /// Sink receiving conversation snapshots; `None` in one-shot mode.
     pub sink: Option<&'a mut dyn HistorySink>,
 }
