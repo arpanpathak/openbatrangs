@@ -91,22 +91,48 @@ impl SessionLog {
     /// - `line`: the chat line to store.
     pub(super) fn push(&mut self, line: String) {
         self.memory.push(line);
+
         if self.memory.len() <= self.max_memory {
             return;
         }
 
-        let evicted = self.memory.remove(0);
-        if let Some(offset) = append_line(&self.path, self.disk_len, &evicted) {
-            self.disk_offsets.push(offset);
-            self.disk_len = offset + evicted.len() as u64 + 1;
-            // Keep the loaded prefix contiguous with the live window: a line
-            // evicted while the user is reading older history still belongs
-            // between the prefix and the in-memory tail.
-            if !self.prefix.is_empty() {
-                self.prefix.push(evicted);
-                self.enforce_prefix_cap();
-            }
+        self.evict_oldest_line();
+    }
+
+    /// Append several lines in order.
+    pub(super) fn push_lines(&mut self, lines: Vec<String>) {
+        for line in lines {
+            self.push(line);
         }
+    }
+
+    /// Move the oldest in-memory line to the disk file.
+    ///
+    /// A line that cannot be written is dropped, so a full disk never stops
+    /// the chat.
+    fn evict_oldest_line(&mut self) {
+        let evicted = self.memory.remove(0);
+
+        let Some(offset) = append_line(&self.path, self.disk_len, &evicted) else {
+            return;
+        };
+
+        self.disk_offsets.push(offset);
+        self.disk_len = offset + evicted.len() as u64 + 1;
+
+        self.extend_loaded_prefix(evicted);
+    }
+
+    /// Keep the loaded prefix contiguous with the live window: a line evicted
+    /// while the user is reading older history still belongs between the
+    /// prefix and the in-memory tail.
+    fn extend_loaded_prefix(&mut self, evicted: String) {
+        if self.prefix.is_empty() {
+            return;
+        }
+
+        self.prefix.push(evicted);
+        self.enforce_prefix_cap();
     }
 
     /// Discard all in-memory and disk-backed history, resetting the log.
@@ -116,16 +142,24 @@ impl SessionLog {
         self.prefix_start = 0;
         self.disk_offsets.clear();
         self.disk_len = 0;
-        let _ = std::fs::write(&self.path, "");
+
+        // A temp file that cannot be truncated only wastes disk space.
+        std::fs::write(&self.path, "").ok();
     }
 
     /// True when older lines exist on disk that have not been loaded yet.
     pub(super) fn has_more_history(&self) -> bool {
+        self.unloaded_line_count() > 0
+    }
+
+    /// Number of disk lines older than the loaded prefix. These are the lines
+    /// at indices `0..count` of `disk_offsets`.
+    fn unloaded_line_count(&self) -> usize {
         if self.prefix.is_empty() {
-            !self.disk_offsets.is_empty()
-        } else {
-            self.prefix_start > 0
+            return self.disk_offsets.len();
         }
+
+        self.prefix_start
     }
 
     /// Load up to `chunk` older lines from disk into the visible prefix.
@@ -137,48 +171,40 @@ impl SessionLog {
     /// # Returns
     /// `true` if at least one line was loaded.
     pub(super) fn load_more(&mut self, chunk: usize) -> bool {
-        let end = if self.prefix.is_empty() {
-            if self.disk_offsets.is_empty() {
-                return false;
-            }
-            self.disk_offsets.len()
-        } else {
-            if self.prefix_start == 0 {
-                return false;
-            }
-            self.prefix_start
-        };
+        let end = self.unloaded_line_count();
         let start = end.saturating_sub(chunk);
-        let Some(offset) = self.disk_offsets.get(start).copied() else {
-            return false;
-        };
-        let Ok(file) = File::open(&self.path) else {
-            return false;
-        };
-        let mut reader = BufReader::new(file);
-        if reader.seek(SeekFrom::Start(offset)).is_err() {
-            return false;
-        }
+        let loaded = self.read_disk_lines(start, end);
 
-        let mut loaded = Vec::with_capacity(end - start);
-        for line in reader.lines().take(end - start) {
-            match line {
-                Ok(line) => loaded.push(line),
-                Err(_) => break,
-            }
-        }
         if loaded.is_empty() {
             return false;
         }
 
-        if self.prefix.is_empty() {
-            self.prefix = loaded;
-        } else {
-            self.prefix.splice(0..0, loaded);
-        }
+        self.prefix.splice(0..0, loaded);
         self.prefix_start = start;
         self.enforce_prefix_cap();
+
         true
+    }
+
+    /// Read the evicted lines with indices `start..end` from the disk file.
+    ///
+    /// # Returns
+    /// The lines in order; fewer (or none) when the file cannot be read.
+    fn read_disk_lines(&self, start: usize, end: usize) -> Vec<String> {
+        let reader = self
+            .disk_offsets
+            .get(start)
+            .and_then(|offset| open_at(&self.path, *offset).ok());
+
+        let Some(reader) = reader else {
+            return Vec::new();
+        };
+
+        reader
+            .lines()
+            .take(end - start)
+            .map_while(Result::ok)
+            .collect()
     }
 
     /// Drop the oldest loaded lines when the prefix window grows too large.
@@ -192,25 +218,26 @@ impl SessionLog {
         if self.prefix_start == 0 {
             return;
         }
+
         let excess = self.prefix.len().saturating_sub(self.max_prefix);
-        if excess > 0 {
-            self.prefix.drain(0..excess);
-            self.prefix_start += excess;
-        }
+
+        self.prefix.drain(..excess);
+        self.prefix_start += excess;
     }
 
     /// Full visible text: loaded history followed by the in-memory window.
     pub(super) fn text(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.prefix.is_empty() {
-            parts.push(self.prefix.join("\n"));
-        }
-        if !self.memory.is_empty() {
-            parts.push(self.memory.join("\n"));
-        }
-        parts.join("\n")
+        let lines: Vec<&str> = self
+            .prefix
+            .iter()
+            .chain(&self.memory)
+            .map(String::as_str)
+            .collect();
+
+        lines.join("\n")
     }
 
+    /// The in-memory lines, oldest first.
     #[cfg(test)]
     pub(super) fn iter(&self) -> std::slice::Iter<'_, String> {
         self.memory.iter()
@@ -223,6 +250,7 @@ impl SessionLog {
 }
 
 impl Drop for SessionLog {
+    /// Delete the temporary file. A file that is already gone needs no cleanup.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -235,8 +263,19 @@ fn append_line(path: &Path, offset: u64, line: &str) -> Option<u64> {
         .append(true)
         .open(path)
         .ok()?;
+
     writeln!(file, "{line}").ok()?;
+
     Some(offset)
+}
+
+/// Open `path` for reading, positioned at byte `offset`.
+fn open_at(path: &Path, offset: u64) -> std::io::Result<BufReader<File>> {
+    let mut reader = BufReader::new(File::open(path)?);
+
+    reader.seek(SeekFrom::Start(offset))?;
+
+    Ok(reader)
 }
 
 #[cfg(test)]
@@ -420,6 +459,42 @@ mod tests {
     fn load_more_returns_false_when_nothing_to_load() {
         let mut log = SessionLog::new(10);
         assert!(!log.load_more(5));
+    }
+
+    #[test]
+    fn load_more_returns_false_when_the_disk_file_is_gone() -> anyhow::Result<()> {
+        let mut log = SessionLog::new(1);
+        log.push("line 0".to_string());
+        log.push("line 1".to_string());
+
+        std::fs::remove_file(&log.path)?;
+
+        assert!(!log.load_more(5));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_written_is_dropped() {
+        let mut log = SessionLog::new(1);
+        log.path = std::env::temp_dir()
+            .join("openbatrangs-missing-dir")
+            .join("session.log");
+
+        log.push("line 0".to_string());
+        log.push("line 1".to_string());
+
+        assert!(!log.has_more_history());
+        assert_eq!(log.text(), "line 1");
+    }
+
+    #[test]
+    fn push_lines_appends_in_order() {
+        let mut log = SessionLog::new(10);
+
+        log.push_lines(vec!["a".to_string(), "b".to_string()]);
+
+        assert_eq!(log.text(), "a\nb");
     }
 
     #[test]

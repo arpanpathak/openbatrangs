@@ -1,20 +1,25 @@
 //! TUI application state and event handling.
 
 use super::chat::ChatRenderCache;
+use super::scroll::is_inside_track;
 use super::session::SessionLog;
+use super::worker::send_event;
 use super::{
-    ScrollMode, UiEvent, WorkerHistory, chat_visual_line_indices, open_in_vim, run_agent_worker,
+    ScrollMode, UiEvent, WorkerHistory, chat_visual_line_indices, extract_path_from_line,
+    open_in_vim, run_agent_worker,
 };
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
-    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED,
+    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
-use crate::ollama::{ChatMessage, OllamaClient, OllamaModel};
+use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
 use crate::perf::{PerfMonitor, SystemStats};
-use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -29,6 +34,23 @@ pub(super) struct PickerState {
     pub(super) models: Vec<String>,
     /// Index of the currently highlighted model.
     pub(super) selected: usize,
+}
+
+impl PickerState {
+    /// Highlight the model above the current one.
+    fn select_previous(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Highlight the model below the current one, stopping at the last.
+    fn select_next(&mut self) {
+        self.selected = (self.selected + 1).min(self.models.len().saturating_sub(1));
+    }
+
+    /// The highlighted model tag, or `None` when the list is empty.
+    fn highlighted_model(&self) -> Option<String> {
+        self.models.get(self.selected).cloned()
+    }
 }
 
 /// Pending tool-confirmation dialog state.
@@ -50,6 +72,82 @@ pub(super) enum ActiveModal {
     Picker(PickerState),
     /// A tool-confirmation prompt is displayed.
     Confirm(PendingConfirmation),
+}
+
+/// Where a key press goes, decided by the open modal.
+enum KeyTarget {
+    /// A key release; terminals with the kitty protocol report one per key.
+    Ignored,
+    /// The tool-confirmation dialog.
+    Confirmation,
+    /// The model picker.
+    Picker,
+    /// The input line.
+    Input,
+}
+
+/// What a key press does in the input line.
+#[derive(Debug, PartialEq)]
+enum InputAction {
+    /// Cancel the running task and clear the input (Ctrl+C).
+    Cancel,
+    /// Insert a newline (Ctrl+J, or Enter with Shift, Ctrl or Alt).
+    Newline,
+    /// Insert a typed character.
+    Insert(char),
+    /// Delete the character before the cursor.
+    Backspace,
+    /// Delete the character at the cursor.
+    Delete,
+    /// Move the cursor one character left.
+    Left,
+    /// Move the cursor one character right.
+    Right,
+    /// Move the cursor to the start of the input.
+    Home,
+    /// Move the cursor to the end of the input.
+    End,
+    /// Previous suggestion or older history entry.
+    Up,
+    /// Next suggestion or newer history entry.
+    Down,
+    /// Scroll the chat up one page.
+    PageUp,
+    /// Scroll the chat down one page.
+    PageDown,
+    /// Accept the highlighted suggestion (Tab).
+    Complete,
+    /// Submit the input as a task or slash command.
+    Submit,
+    /// Do nothing. Esc lands here on purpose: it must neither quit the TUI
+    /// nor destroy text the user is composing.
+    Nothing,
+}
+
+/// What a key press does while the tool-confirmation dialog is open.
+#[derive(Debug, PartialEq)]
+enum ConfirmationKey {
+    /// Cancel the whole task (Ctrl+C).
+    CancelTask,
+    /// Answer the prompt: `true` runs the tool, `false` aborts it.
+    Answer(bool),
+    /// Leave the dialog open.
+    Ignore,
+}
+
+/// What a key press does while the model picker is open.
+#[derive(Debug, PartialEq)]
+enum PickerKey {
+    /// Highlight the model above.
+    Up,
+    /// Highlight the model below.
+    Down,
+    /// Switch to the highlighted model and close the picker.
+    Choose,
+    /// Close the picker without changing the model.
+    Close,
+    /// Leave the picker as it is.
+    Ignore,
 }
 
 /// Central TUI application state.
@@ -146,6 +244,8 @@ pub(super) struct App {
     pub(super) last_chunk_at: Option<Instant>,
     /// Cache of the last syntax-highlighted chat rendering result.
     pub(super) chat_render: ChatRenderCache,
+    /// Terminal emulators tried, in order, when a clicked file opens in vim.
+    pub(super) editor_terminals: &'static [&'static str],
 }
 
 impl App {
@@ -213,6 +313,7 @@ impl App {
             rate_window_start: None,
             last_chunk_at: None,
             chat_render: ChatRenderCache::new(),
+            editor_terminals: VIM_TERMINALS,
         }
     }
 
@@ -296,11 +397,8 @@ impl App {
     ///
     /// A formatted string like `"model: qwen2.5-coder:7b · 7.6 GB · agent · server http://localhost:11434"`.
     pub(super) fn model_info_line(&self) -> String {
-        let mode = match self.run_config.mode {
-            AgentMode::Agent => "agent",
-            AgentMode::Plan => "plan",
-            AgentMode::Chat => "chat",
-        };
+        let mode = mode_name(self.run_config.mode);
+
         match &self.model_info {
             Some(info) => format!("{info} · mode: {mode} · server {}", self.server_url),
             None => format!(
@@ -379,39 +477,54 @@ impl App {
         self.status = "running".to_string();
         self.last_action.clear();
         self.scroll_mode = ScrollMode::Follow;
+        self.reset_stream_metrics();
+        self.remember_chat_turn(Role::User, task.clone());
+
+        let prior = WorkerHistory {
+            chat: self.chat_history.clone(),
+            resume,
+        };
+        let prefs = ModelPrefs {
+            model: self.model.clone(),
+            is_auto_pull_disabled: self.is_auto_pull_disabled,
+            min_context: self.min_context,
+        };
+        let worker = run_agent_worker(
+            client.clone(),
+            self.run_config.clone(),
+            self.model.clone(),
+            prefs,
+            task,
+            prior,
+            tx.clone(),
+        );
+        let done_tx = tx.clone();
+
+        let handle = tokio::spawn(async move {
+            let result = worker.await;
+            send_done(&done_tx, result);
+        });
+
+        self.current_task = Some(handle);
+    }
+
+    /// Zero the token-rate counters before a new task streams its reply.
+    fn reset_stream_metrics(&mut self) {
         self.stream_chars = 0;
         self.stream_started_at = None;
         self.tokens_per_sec = 0.0;
         self.rate_window_chars = 0;
         self.rate_window_start = None;
         self.last_chunk_at = None;
-        if self.run_config.mode == AgentMode::Chat {
-            self.remember_chat(ChatMessage {
-                role: crate::ollama::Role::User,
-                content: task.clone(),
-            });
+    }
+
+    /// Add a turn to the chat history in chat mode; other modes keep none.
+    fn remember_chat_turn(&mut self, role: Role, content: String) {
+        if self.run_config.mode != AgentMode::Chat {
+            return;
         }
 
-        let chat_history = self.chat_history.clone();
-        let tx2 = tx.clone();
-        let client2 = client.clone();
-        let run_config = self.run_config.clone();
-        let model = self.model.clone();
-        let prefs = ModelPrefs {
-            model: model.clone(),
-            is_auto_pull_disabled: self.is_auto_pull_disabled,
-            min_context: self.min_context,
-        };
-        let handle = tokio::spawn(async move {
-            let prior = WorkerHistory {
-                chat: chat_history,
-                resume,
-            };
-            let result =
-                run_agent_worker(client2, run_config, model, prefs, task, prior, tx2.clone()).await;
-            let _ = tx2.send(UiEvent::Done(result.map_err(|e| format!("{e:#}"))));
-        });
-        self.current_task = Some(handle);
+        self.remember_chat(ChatMessage { role, content });
     }
 
     /// Process a UI event from a background worker (log, chunk, done, pull, confirm).
@@ -428,125 +541,205 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         match event {
-            UiEvent::Log(msg) => {
-                if msg.starts_with("🔧") {
-                    self.last_action = msg.trim().to_string();
-                }
-                self.flush_live();
-                if !msg.is_empty() {
-                    self.log.push(msg);
-                }
-            }
-            UiEvent::Chunk(msg) => {
-                let now = Instant::now();
-                if self.stream_started_at.is_none() {
-                    self.stream_started_at = Some(now);
-                }
-                self.stream_chars += msg.chars().count() as u64;
-                let resumed = self
-                    .last_chunk_at
-                    .is_some_and(|last| now.duration_since(last) > STREAM_GAP);
-                self.last_chunk_at = Some(now);
-                if resumed || self.rate_window_start.is_none() {
-                    self.rate_window_start = Some(now);
-                    self.rate_window_chars = 0;
-                }
-                self.rate_window_chars += msg.chars().count() as u64;
-                if let Some(window_start) = self.rate_window_start {
-                    let elapsed = now.duration_since(window_start).as_secs_f64();
-                    if elapsed >= TOKEN_RATE_MIN_ELAPSED {
-                        self.tokens_per_sec =
-                            (self.rate_window_chars as f64 / CHARS_PER_TOKEN) / elapsed;
-                        self.rate_window_chars = 0;
-                        self.rate_window_start = Some(now);
-                    }
-                }
-                self.live.push_str(&msg);
-                if self.live.len() > MAX_LIVE_CHARS {
-                    // Spill the overflow into the disk-backed log instead of
-                    // truncating, so long code is never silently lost.
-                    let overflow = std::mem::take(&mut self.live);
-                    self.log.push(overflow);
-                    self.log.push("… (output continued)".to_string());
-                }
-            }
-            UiEvent::History(messages) => {
-                self.agent_conversation = Some(messages);
-            }
-            UiEvent::Done(result) => {
-                self.current_task = None;
-                self.agent_conversation = None;
-                let assistant_text = std::mem::take(&mut self.live);
-                if !assistant_text.is_empty() {
-                    self.log.push(assistant_text.clone());
-                    if self.run_config.mode == AgentMode::Chat {
-                        self.remember_chat(ChatMessage {
-                            role: crate::ollama::Role::Assistant,
-                            content: assistant_text,
-                        });
-                    }
-                }
-                match result {
-                    Ok(()) => {
-                        self.log.push(String::new());
-                        self.log.push("✅ Agent finished.".to_string());
-                    }
-                    Err(error) => {
-                        self.log.push(format!("⚠️ {error}"));
-                    }
-                }
-                self.is_running = false;
-                self.last_action.clear();
-                if let Some((next, resume)) = self.task_queue.pop_front() {
-                    self.log.push("▶️  Starting next queued task.".to_string());
-                    self.start_task(next, resume, client, tx);
-                } else {
-                    self.status = "ready".to_string();
-                }
-            }
-            UiEvent::PullDone { name, result } => {
-                self.current_task = None;
-                self.is_running = false;
-                self.status = "ready".to_string();
-                self.last_action.clear();
-                match result {
-                    Ok(()) => {
-                        self.log.push(String::new());
-                        self.log.push(format!("✅ Model ready: {name}"));
-                        self.log.push(format!("Now select it with /model {name}"));
-                    }
-                    Err(error) => {
-                        self.log
-                            .push(format!("❌ Failed to pull model '{name}': {error}"));
-                    }
-                }
-            }
-            UiEvent::SetupDone(result) => {
-                self.current_task = None;
-                self.is_running = false;
-                self.status = "ready".to_string();
-                self.last_action.clear();
-                match result {
-                    Ok(()) => {
-                        self.log.push(String::new());
-                        self.log.push("✅ Setup finished.".to_string());
-                    }
-                    Err(error) => {
-                        self.log.push(format!("⚠️ Setup failed: {error}"));
-                    }
-                }
-            }
+            UiEvent::Log(line) => self.on_log(line),
+            UiEvent::Chunk(chunk) => self.on_chunk(&chunk),
+            UiEvent::History(messages) => self.agent_conversation = Some(messages),
+            UiEvent::Done(result) => self.on_done(result, client, tx),
+            UiEvent::PullDone { name, result } => self.on_pull_done(&name, result),
+            UiEvent::SetupDone(result) => self.on_setup_done(result),
             UiEvent::ConfirmRequest { prompt, response } => {
-                self.open_confirmation(prompt, response);
-                self.status = "confirm".to_string();
+                self.on_confirm_request(prompt, response)
             }
         }
+    }
+
+    /// Append a worker log line after any streamed text, and remember tool
+    /// calls (lines starting with 🔧) as the current action.
+    fn on_log(&mut self, line: String) {
+        self.note_tool_action(&line);
+        self.flush_live();
+
+        if !line.is_empty() {
+            self.log.push(line);
+        }
+    }
+
+    /// Show a tool-call line as the current action in the status bar.
+    fn note_tool_action(&mut self, line: &str) {
+        if line.starts_with("🔧") {
+            self.last_action = line.trim().to_string();
+        }
+    }
+
+    /// Add a streamed chunk to the live output and update the token rate.
+    fn on_chunk(&mut self, chunk: &str) {
+        let now = Instant::now();
+        let chunk_chars = chunk.chars().count() as u64;
+
+        self.stream_started_at = self.stream_started_at.or(Some(now));
+        self.stream_chars += chunk_chars;
+
+        let window_start = self.rate_window_start_at(now);
+        self.rate_window_chars += chunk_chars;
+        self.update_token_rate(now, window_start);
+
+        self.append_live(chunk);
+    }
+
+    /// Start of the rate-measurement window that a chunk arriving at `now`
+    /// belongs to. A first chunk, or one after a pause longer than
+    /// [`STREAM_GAP`], opens a new window.
+    fn rate_window_start_at(&mut self, now: Instant) -> Instant {
+        let resumed = self
+            .last_chunk_at
+            .is_some_and(|last| now.duration_since(last) > STREAM_GAP);
+        self.last_chunk_at = Some(now);
+
+        match (resumed, self.rate_window_start) {
+            (false, Some(window_start)) => window_start,
+            (true, _) | (false, None) => self.open_rate_window(now),
+        }
+    }
+
+    /// Open a new rate-measurement window at `now`.
+    fn open_rate_window(&mut self, now: Instant) -> Instant {
+        self.rate_window_start = Some(now);
+        self.rate_window_chars = 0;
+
+        now
+    }
+
+    /// Recompute tokens per second once the window is long enough to measure.
+    fn update_token_rate(&mut self, now: Instant, window_start: Instant) {
+        let elapsed = now.duration_since(window_start).as_secs_f64();
+
+        if elapsed < TOKEN_RATE_MIN_ELAPSED {
+            return;
+        }
+
+        self.tokens_per_sec = (self.rate_window_chars as f64 / CHARS_PER_TOKEN) / elapsed;
+        self.open_rate_window(now);
+    }
+
+    /// Append streamed text to the live output.
+    ///
+    /// Overflow spills into the disk-backed log instead of being truncated,
+    /// so long code is never silently lost.
+    fn append_live(&mut self, chunk: &str) {
+        self.live.push_str(chunk);
+
+        if self.live.len() <= MAX_LIVE_CHARS {
+            return;
+        }
+
+        let overflow = std::mem::take(&mut self.live);
+        self.log.push(overflow);
+        self.log.push("… (output continued)".to_string());
+    }
+
+    /// Finish an agent task: save the reply, log the result, and start the
+    /// next queued task.
+    fn on_done(
+        &mut self,
+        result: Result<(), String>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        self.current_task = None;
+        self.agent_conversation = None;
+
+        self.save_assistant_reply();
+        self.log_task_result(result);
+
+        self.is_running = false;
+        self.last_action.clear();
+        self.start_next_queued_task(client, tx);
+    }
+
+    /// Move the streamed reply into the log, and into the chat history in chat mode.
+    fn save_assistant_reply(&mut self) {
+        let reply = std::mem::take(&mut self.live);
+
+        if reply.is_empty() {
+            return;
+        }
+
+        self.log.push(reply.clone());
+        self.remember_chat_turn(Role::Assistant, reply);
+    }
+
+    /// Log how an agent task ended.
+    fn log_task_result(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self
+                .log
+                .push_lines(vec![String::new(), "✅ Agent finished.".to_string()]),
+            Err(error) => self.log.push(format!("⚠️ {error}")),
+        }
+    }
+
+    /// Start the oldest queued task, or go idle when the queue is empty.
+    fn start_next_queued_task(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let Some((next, resume)) = self.task_queue.pop_front() else {
+            self.is_running = false;
+            self.status = "ready".to_string();
+            return;
+        };
+
+        self.log.push("▶️  Starting next queued task.".to_string());
+        self.start_task(next, resume, client, tx);
+    }
+
+    /// Finish a `/pull` and tell the user how to use the model.
+    fn on_pull_done(&mut self, name: &str, result: Result<(), String>) {
+        self.finish_background_job();
+
+        let lines = match result {
+            Ok(()) => vec![
+                String::new(),
+                format!("✅ Model ready: {name}"),
+                format!("Now select it with /model {name}"),
+            ],
+            Err(error) => vec![format!("❌ Failed to pull model '{name}': {error}")],
+        };
+
+        self.log.push_lines(lines);
+    }
+
+    /// Finish a `/setup` and log its result.
+    fn on_setup_done(&mut self, result: Result<(), String>) {
+        self.finish_background_job();
+
+        let lines = match result {
+            Ok(()) => vec![String::new(), "✅ Setup finished.".to_string()],
+            Err(error) => vec![format!("⚠️ Setup failed: {error}")],
+        };
+
+        self.log.push_lines(lines);
+    }
+
+    /// Mark a background pull or setup as finished and the app as ready.
+    fn finish_background_job(&mut self) {
+        self.current_task = None;
+        self.is_running = false;
+        self.status = "ready".to_string();
+        self.last_action.clear();
+    }
+
+    /// Show the worker's yes/no question in the confirmation dialog.
+    fn on_confirm_request(&mut self, prompt: String, response: tokio::sync::oneshot::Sender<bool>) {
+        self.open_confirmation(prompt, response);
+        self.status = "confirm".to_string();
     }
 
     /// Dispatch a keyboard event to the appropriate handler.
     ///
     /// Confirmation and picker modals intercept keys before the main input
-    /// handler. Returns `true` when the app should quit.
+    /// handler.
     ///
     /// # Parameters
     ///
@@ -556,83 +749,86 @@ impl App {
     ///
     /// # Returns
     ///
-    /// `Ok(true)` if the TUI should exit, `Ok(false)` otherwise.
+    /// `true` if the TUI should exit, `false` otherwise.
     pub(super) async fn handle_key(
         &mut self,
-        key: event::KeyEvent,
+        key: KeyEvent,
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> anyhow::Result<bool> {
-        // `setup_terminal` pushes `REPORT_EVENT_TYPES`, so terminals that speak
-        // the kitty keyboard protocol deliver a Press *and* a Release event for
-        // every keystroke (plus Repeat while a key is held). Acting on all
-        // three types inserts each character twice, so only press-like events
-        // are dispatched. Terminals without the protocol always report Press.
-        if !matches!(
-            key.kind,
-            event::KeyEventKind::Press | event::KeyEventKind::Repeat
-        ) {
-            return Ok(false);
+    ) -> bool {
+        match self.key_target(&key) {
+            KeyTarget::Ignored => {}
+            KeyTarget::Confirmation => self.handle_confirmation_key(key, client, tx),
+            KeyTarget::Picker => self.handle_picker_key(key, client).await,
+            KeyTarget::Input => self.handle_input_key(key, client, tx).await,
         }
 
-        if self.is_confirming() {
-            self.handle_confirmation_key(key, client, tx);
-            return Ok(false);
+        self.should_quit
+    }
+
+    /// Where `key` goes: nowhere for a release, else the open modal or the input.
+    ///
+    /// `setup_terminal` pushes `REPORT_EVENT_TYPES`, so terminals that speak
+    /// the kitty keyboard protocol deliver a Press *and* a Release event for
+    /// every keystroke (plus Repeat while a key is held). Acting on all three
+    /// types inserts each character twice, so only press-like events are
+    /// dispatched. Terminals without the protocol always report Press.
+    fn key_target(&self, key: &KeyEvent) -> KeyTarget {
+        let is_press = matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat);
+
+        match (is_press, &self.modal) {
+            (false, _) => KeyTarget::Ignored,
+            (true, Some(ActiveModal::Confirm(_))) => KeyTarget::Confirmation,
+            (true, Some(ActiveModal::Picker(_))) => KeyTarget::Picker,
+            (true, None) => KeyTarget::Input,
+        }
+    }
+
+    /// Edit the input line, scroll, or submit, depending on the key.
+    async fn handle_input_key(
+        &mut self,
+        key: KeyEvent,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        match input_action(&key) {
+            InputAction::Cancel => self.cancel_and_clear_input(client, tx),
+            InputAction::Newline => self.insert_newline(),
+            InputAction::Insert(character) => self.insert_char(character),
+            InputAction::Backspace => self.backspace(),
+            InputAction::Delete => self.delete(),
+            InputAction::Left => self.move_left(),
+            InputAction::Right => self.move_right(),
+            InputAction::Home => self.move_home(),
+            InputAction::End => self.move_end(),
+            InputAction::Up => self.move_up(),
+            InputAction::Down => self.move_down(),
+            InputAction::PageUp => self.scroll_chat_page(-1),
+            InputAction::PageDown => self.scroll_chat_page(1),
+            InputAction::Complete => self.accept_suggestion(),
+            InputAction::Submit => self.submit_input(client, tx).await,
+            InputAction::Nothing => {}
+        }
+    }
+
+    /// Ctrl+C in the input line: cancel any running or queued work, then
+    /// clear the input so half-typed text does not sit in the box.
+    fn cancel_and_clear_input(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if self.has_work() {
+            self.cancel_task(client, tx);
         }
 
-        if self.is_showing_picker() {
-            self.handle_picker_key(key, client).await;
-            return Ok(false);
-        }
+        self.input.clear();
+        self.cursor = 0;
+    }
 
-        match key.code {
-            KeyCode::Char(character)
-                if character == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                if self.is_running || !self.task_queue.is_empty() {
-                    self.cancel_task(client, tx);
-                }
-                // Always clear the input line: Ctrl+C should not leave
-                // half-typed text sitting in the box after a cancel.
-                self.input.clear();
-                self.cursor = 0;
-            }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_newline();
-            }
-            KeyCode::Char(character) if character != '\r' => self.insert_char(character),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.move_left(),
-            KeyCode::Right => self.move_right(),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Up => self.move_up(),
-            KeyCode::Down => self.move_down(),
-            KeyCode::PageUp => self.scroll_chat_page(-1),
-            KeyCode::PageDown => self.scroll_chat_page(1),
-            KeyCode::Tab => self.accept_suggestion(),
-            KeyCode::Enter => {
-                let modifiers = key.modifiers;
-                if modifiers.contains(KeyModifiers::SHIFT)
-                    || modifiers.contains(KeyModifiers::CONTROL)
-                    || modifiers.contains(KeyModifiers::ALT)
-                {
-                    self.insert_newline();
-                } else {
-                    return self.submit_input(client, tx).await;
-                }
-            }
-            KeyCode::Esc => {
-                // Esc is intentionally a no-op in the main input area: it must
-                // neither quit the TUI nor destroy text the user is composing.
-                // Picker/confirmation popups handle Esc themselves before this
-                // match is reached. Use /quit, /exit, or Ctrl+C at idle to
-                // leave the app.
-            }
-            _ => {}
-        }
-        Ok(self.should_quit)
+    /// Whether a task is running or waiting in the queue.
+    fn has_work(&self) -> bool {
+        self.is_running || !self.task_queue.is_empty()
     }
 
     /// Abort the running task and resolve any pending confirmation.
@@ -649,36 +845,64 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        if let Some(handle) = self.current_task.take() {
-            handle.abort();
-        }
-        if let Some(pending) = self.take_confirmation() {
-            let _ = pending.response.send(false);
-        }
-        if self.run_config.mode != AgentMode::Chat && self.is_running {
-            self.interrupted_task = self.current_prompt.clone();
-        }
-        if self.run_config.mode == AgentMode::Chat
-            && self
-                .chat_history
-                .last()
-                .is_some_and(|message| message.role == crate::ollama::Role::User)
-        {
-            self.chat_history.pop();
-        }
+        self.abort_current_task();
+        self.reject_pending_confirmation();
+        self.remember_interrupted_task();
+        self.forget_unanswered_question();
+
         self.last_action.clear();
         self.scroll_mode = ScrollMode::Follow;
         self.flush_live();
         self.log.push("⛔ Cancelled.".to_string());
+
         // Keep the queue moving: cancelling the active task should not strand
         // tasks the user already queued behind it.
-        if let Some((next, resume)) = self.task_queue.pop_front() {
-            self.log.push("▶️  Starting next queued task.".to_string());
-            self.start_task(next, resume, client, tx);
-        } else {
-            self.is_running = false;
-            self.status = "ready".to_string();
+        self.start_next_queued_task(client, tx);
+    }
+
+    /// Stop the background task, if one is running.
+    fn abort_current_task(&mut self) {
+        if let Some(handle) = self.current_task.take() {
+            handle.abort();
         }
+    }
+
+    /// Answer "no" to an open confirmation dialog and close it.
+    fn reject_pending_confirmation(&mut self) {
+        if let Some(pending) = self.take_confirmation() {
+            send_answer(pending, false);
+        }
+    }
+
+    /// Keep the prompt of a cancelled agent run, so the next message is
+    /// treated as a correction of it.
+    fn remember_interrupted_task(&mut self) {
+        if self.is_running_agent() {
+            self.interrupted_task = self.current_prompt.clone();
+        }
+    }
+
+    /// Whether an agent or plan task is running (chat mode has no tools to resume).
+    fn is_running_agent(&self) -> bool {
+        self.is_running && self.run_config.mode != AgentMode::Chat
+    }
+
+    /// Drop a chat question whose answer was cancelled, so the history does
+    /// not end with an unanswered turn.
+    fn forget_unanswered_question(&mut self) {
+        if self.is_awaiting_chat_reply() {
+            self.chat_history.pop();
+        }
+    }
+
+    /// Whether the chat history ends with a user turn in chat mode.
+    fn is_awaiting_chat_reply(&self) -> bool {
+        let ends_with_question = self
+            .chat_history
+            .last()
+            .is_some_and(|message| message.role == Role::User);
+
+        self.run_config.mode == AgentMode::Chat && ends_with_question
     }
 
     /// Handle a mouse event: scroll, scrollbar drag, or click-to-open file.
@@ -689,23 +913,35 @@ impl App {
     /// # Parameters
     ///
     /// - `event`: the crossterm mouse event to process.
-    pub(super) fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
         if self.is_confirming() {
             return;
         }
+
+        self.apply_mouse_event(event);
+    }
+
+    /// Scroll on the wheel, drag the scrollbar, or open a clicked file.
+    fn apply_mouse_event(&mut self, event: MouseEvent) {
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
             MouseEventKind::ScrollDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
-            MouseEventKind::Down(MouseButton::Left)
-                if !self.handle_scrollbar_click(event.column, event.row) =>
-            {
-                self.open_clicked_file(event.column, event.row);
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.handle_scrollbar_click(event.column, event.row);
-            }
+            MouseEventKind::Down(MouseButton::Left) => self.click_chat(event.column, event.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_scrollbar(event.column, event.row),
             _ => {}
         }
+    }
+
+    /// A left click: jump on the scrollbar, or open the file on the clicked line.
+    fn click_chat(&mut self, column: u16, row: u16) {
+        if !self.handle_scrollbar_click(column, row) {
+            self.open_clicked_file(column, row);
+        }
+    }
+
+    /// A left drag moves the scrollbar; a drag elsewhere does nothing.
+    fn drag_scrollbar(&mut self, column: u16, row: u16) {
+        self.handle_scrollbar_click(column, row);
     }
 
     /// Open the file referenced in a clicked chat line in an external editor.
@@ -715,40 +951,46 @@ impl App {
     ///
     /// # Parameters
     ///
-    /// - `column`: x coordinate of the click in terminal columns.
+    /// - `column`: x coordinate of the click in terminal columns. It is not
+    ///   used: any file path on the clicked line opens, so the user does not
+    ///   have to hit the path exactly.
     /// - `row`: y coordinate of the click in terminal rows.
     pub(super) fn open_clicked_file(&mut self, _column: u16, row: u16) {
-        let Some(area) = self.last_chat_area else {
+        let path = self
+            .clicked_chat_line(row)
+            .and_then(|line| extract_path_from_line(&line, &self.run_config.cwd));
+
+        let Some(path) = path else {
             return;
         };
-        if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
-            return;
-        }
-        let relative = (row - area.y - 1) as usize;
+
+        self.log
+            .push(format!("📂 Opening {} in vim...", path.display()));
+        open_in_vim(&path, self.editor_terminals);
+    }
+
+    /// The source chat line drawn at terminal row `row`, or `None` when the
+    /// row is a border or below the text.
+    fn clicked_chat_line(&self, row: u16) -> Option<String> {
+        let area = self.last_chat_area?;
+        let text_row = is_inside_track(area, row).then(|| (row - area.y - 1) as usize)?;
+
         let chat_text = self.chat_text();
         let max_text_width = (area.width as usize).saturating_sub(2).max(1);
         let visual_lines = chat_visual_line_indices(&chat_text, max_text_width);
-        let content_height = visual_lines.len().max(1);
+        let scroll = self.chat_scroll_for(area, visual_lines.len().max(1));
+        let source_index = *visual_lines.get(scroll + text_row)?;
+
+        chat_text.split('\n').nth(source_index).map(str::to_string)
+    }
+
+    /// The first visible wrapped row of a chat `content_height` rows tall in `area`.
+    fn chat_scroll_for(&self, area: Rect, content_height: usize) -> usize {
         let visible_height = area.height.saturating_sub(2) as usize;
-        let scroll = match self.scroll_mode {
+
+        match self.scroll_mode {
             ScrollMode::Follow => content_height.saturating_sub(visible_height),
             ScrollMode::Manual => self.chat_scroll_offset.min(content_height),
-        };
-        let visual_index = scroll + relative;
-        let Some(source_index) = visual_lines.get(visual_index).copied() else {
-            return;
-        };
-        let lines: Vec<&str> = chat_text.split('\n').collect();
-        let Some(line) = lines.get(source_index) else {
-            return;
-        };
-        // Column is intentionally unused: we open any file path found on the
-        // clicked source line rather than requiring the user to precisely hit
-        // the path token. Scrollbar clicks are already filtered by handle_mouse.
-        if let Some(path) = super::extract_path_from_line(line, &self.run_config.cwd) {
-            self.log
-                .push(format!("📂 Opening {} in vim...", path.display()));
-            open_in_vim(&path);
         }
     }
 
@@ -763,14 +1005,13 @@ impl App {
     ///
     /// The complete chat text ready for rendering or scroll calculations.
     pub(super) fn chat_text(&self) -> String {
-        let mut chat_text = self.log.text();
-        if !self.live.is_empty() {
-            if !chat_text.is_empty() {
-                chat_text.push('\n');
-            }
-            chat_text.push_str(&self.live);
-        }
-        chat_text
+        let log_text = self.log.text();
+        let parts: Vec<&str> = [log_text.as_str(), self.live.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect();
+
+        parts.join("\n")
     }
 
     /// Resolve a pending tool confirmation from a single keypress.
@@ -779,32 +1020,32 @@ impl App {
     /// keys are ignored so the modal stays open. Ctrl+C cancels the whole task.
     fn handle_confirmation_key(
         &mut self,
-        key: event::KeyEvent,
+        key: KeyEvent,
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
+        match confirmation_key(&key) {
+            ConfirmationKey::CancelTask => self.cancel_task(client, tx),
+            ConfirmationKey::Answer(answer) => self.answer_confirmation(answer),
+            ConfirmationKey::Ignore => {}
+        }
+    }
+
+    /// Send `answer` to the waiting worker and close the dialog.
+    fn answer_confirmation(&mut self, answer: bool) {
         let Some(pending) = self.take_confirmation() else {
             return;
         };
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            let _ = pending.response.send(false);
-            self.cancel_task(client, tx);
-            return;
-        }
-        let answer = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => Some(false),
-            _ => None,
-        };
-        let Some(answer) = answer else {
-            // Unrelated key — put the confirmation back so the modal stays open.
-            self.open_confirmation(pending.prompt, pending.response);
-            return;
-        };
+
+        self.log_aborted_tool(answer);
+        send_answer(pending, answer);
+    }
+
+    /// Note in the chat that the user refused a tool.
+    fn log_aborted_tool(&mut self, answer: bool) {
         if !answer {
             self.log.push("⛔ Tool aborted by user.".to_string());
         }
-        let _ = pending.response.send(answer);
     }
 
     /// Handle keyboard navigation within the model picker popup.
@@ -816,28 +1057,30 @@ impl App {
     ///
     /// - `key`: the key event to process.
     /// - `client`: Ollama client for refreshing model info after selection.
-    async fn handle_picker_key(&mut self, key: event::KeyEvent, client: &OllamaClient) {
-        let Some(picker) = self.picker_mut() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Down => {
-                picker.selected = (picker.selected + 1).min(picker.models.len().saturating_sub(1));
-            }
-            KeyCode::Enter => {
-                if let Some(name) = picker.models.get(picker.selected).cloned() {
-                    self.model = Some(name.clone());
-                    self.log.push(format!("✅ Model set to {name}"));
-                    self.refresh_model_info(client).await;
-                }
-                self.close_modal();
-            }
-            KeyCode::Esc => self.close_modal(),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.close_modal();
-            }
-            _ => {}
+    async fn handle_picker_key(&mut self, key: KeyEvent, client: &OllamaClient) {
+        match picker_key(&key) {
+            PickerKey::Up => self.update_picker(PickerState::select_previous),
+            PickerKey::Down => self.update_picker(PickerState::select_next),
+            PickerKey::Choose => self.choose_highlighted_model(client).await,
+            PickerKey::Close => self.close_modal(),
+            PickerKey::Ignore => {}
+        }
+    }
+
+    /// Apply `change` to the picker, if it is open.
+    fn update_picker(&mut self, change: fn(&mut PickerState)) {
+        if let Some(picker) = self.picker_mut() {
+            change(picker);
+        }
+    }
+
+    /// Close the picker and switch to the model it highlighted.
+    async fn choose_highlighted_model(&mut self, client: &OllamaClient) {
+        let chosen = self.picker().and_then(PickerState::highlighted_model);
+        self.close_modal();
+
+        if let Some(name) = chosen {
+            self.activate_model(client, &name).await;
         }
     }
 
@@ -850,62 +1093,128 @@ impl App {
     ///
     /// - `client`: Ollama client for network-dependent commands and tasks.
     /// - `tx`: channel for background task events.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(true)` if the TUI should quit, `Ok(false)` otherwise.
-    async fn submit_input(
-        &mut self,
-        client: &OllamaClient,
-        tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> anyhow::Result<bool> {
-        let submitted = self.input.trim().to_string();
-        let had_interrupted = self.interrupted_task.is_some();
-        let (interrupted, mut task) =
-            continue_interrupted_task(self.interrupted_task.take(), submitted.clone());
-        self.interrupted_task = interrupted;
-        self.input.clear();
-        self.cursor = 0;
-        self.history_idx = None;
-        self.selected = 0;
-        if task.is_empty() {
-            return Ok(false);
-        }
+    async fn submit_input(&mut self, client: &OllamaClient, tx: &mpsc::UnboundedSender<UiEvent>) {
+        let submitted = self.take_input();
 
-        // A correction of an interrupted run resumes the stored conversation:
-        // the correction becomes the next user turn instead of a restated
-        // task blob. Without a snapshot, or for slash commands, the merged
-        // prompt above is the fallback.
-        let resuming =
-            had_interrupted && !task.starts_with('/') && self.agent_conversation.is_some();
-        let resume = if resuming {
-            task = submitted;
-            self.agent_conversation.take()
-        } else {
-            None
+        let Some((task, resume)) = self.task_for_submission(submitted) else {
+            return;
         };
 
         self.history.push(task.clone());
         self.scroll_mode = ScrollMode::Follow;
-        if !task.starts_with('/') {
-            self.current_prompt = Some(task.clone());
-            self.log.push("─".repeat(CHAT_SEPARATOR_LENGTH));
-            self.log.push(format!("You: {task}"));
+        self.run_submitted(task, resume, client, tx).await;
+    }
+
+    /// Take the trimmed input and reset the input line, history position,
+    /// and suggestion highlight.
+    fn take_input(&mut self) -> String {
+        let submitted = self.input.trim().to_string();
+
+        self.input.clear();
+        self.cursor = 0;
+        self.history_idx = None;
+        self.selected = 0;
+
+        submitted
+    }
+
+    /// The task to run for `submitted` text, with the conversation to resume.
+    ///
+    /// After Ctrl+C on an agent run, the next message corrects that run:
+    /// it resumes the stored conversation as the next user turn, or without
+    /// a stored conversation it is merged into the original prompt. A slash
+    /// command leaves the interrupted run waiting for the next message.
+    ///
+    /// # Returns
+    ///
+    /// `None` when there is nothing to run (empty input, nothing interrupted).
+    fn task_for_submission(&mut self, submitted: String) -> Option<(String, Option<Vec<Value>>)> {
+        let Some(interrupted) = self.interrupted_task.take() else {
+            return (!submitted.is_empty()).then_some((submitted, None));
+        };
+
+        Some(self.task_after_interrupt(interrupted, submitted))
+    }
+
+    /// The task for text submitted after an interrupt. A slash command runs
+    /// as is and keeps the interrupted task waiting; other text corrects it.
+    fn task_after_interrupt(
+        &mut self,
+        interrupted: String,
+        submitted: String,
+    ) -> (String, Option<Vec<Value>>) {
+        if submitted.starts_with('/') {
+            self.interrupted_task = Some(interrupted);
+            return (submitted, None);
         }
+
+        self.correct_interrupted_task(&interrupted, submitted)
+    }
+
+    /// Resume the interrupted conversation with `correction` as the next user
+    /// turn, or merge the correction into the original prompt when no
+    /// conversation was stored.
+    fn correct_interrupted_task(
+        &mut self,
+        interrupted: &str,
+        correction: String,
+    ) -> (String, Option<Vec<Value>>) {
+        match self.agent_conversation.take() {
+            Some(conversation) => (correction, Some(conversation)),
+            None => (corrected_task_prompt(interrupted, &correction), None),
+        }
+    }
+
+    /// Run a slash command, or log the task and start or queue it.
+    async fn run_submitted(
+        &mut self,
+        task: String,
+        resume: Option<Vec<Value>>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         if task.starts_with('/') {
-            // Slash commands can hit the network (models, doctor, pull, ...).
-            // Log failures into the chat instead of tearing down the whole TUI.
-            if let Err(error) = self.run_slash_command(client, &task, tx).await {
-                self.log.push(format!("⚠️ {error:#}"));
-            }
-        } else if self.is_running {
+            self.run_logged_slash_command(client, &task, tx).await;
+            return;
+        }
+
+        self.current_prompt = Some(task.clone());
+        self.log.push("─".repeat(CHAT_SEPARATOR_LENGTH));
+        self.log.push(format!("You: {task}"));
+        self.start_or_queue(task, resume, client, tx);
+    }
+
+    /// Run a slash command and log its error in the chat.
+    ///
+    /// Slash commands can hit the network (models, doctor, pull, ...), and a
+    /// failure must not tear down the whole TUI.
+    async fn run_logged_slash_command(
+        &mut self,
+        client: &OllamaClient,
+        command: &str,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if let Err(error) = self.run_slash_command(client, command, tx).await {
+            self.log.push(format!("⚠️ {error:#}"));
+        }
+    }
+
+    /// Start `task` now, or queue it while another task runs.
+    fn start_or_queue(
+        &mut self,
+        task: String,
+        resume: Option<Vec<Value>>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if self.is_running {
             self.task_queue.push_back((task, resume));
             self.log
                 .push("⏳ Queued — will run after the current task.".to_string());
-        } else {
-            self.start_task(task, resume, client, tx);
+            return;
         }
-        Ok(self.should_quit)
+
+        self.start_task(task, resume, client, tx);
     }
 
     /// Format the current system stats into display lines for the perf panel.
@@ -915,94 +1224,186 @@ impl App {
     /// A `Vec<String>` with GPU, CPU/tokens, and RAM lines for rendering.
     pub(super) fn perf_lines(&self) -> Vec<String> {
         let stats = &self.system_stats;
-        let mut gpu_parts: Vec<String> = Vec::new();
-        if let Some(name) = &stats.gpu_name {
-            gpu_parts.push(name.clone());
-        }
-        if let Some(util) = stats.gpu_util_percent {
-            gpu_parts.push(format!("{util:.0}%"));
-        }
-        if let (Some(used), Some(total)) = (stats.gpu_memory_used_mb, stats.gpu_memory_total_mb) {
-            gpu_parts.push(format!("{used}/{total} MB"));
-        }
-        if let Some(power) = stats.gpu_power_watts {
-            gpu_parts.push(format!("{power:.1}W"));
-        }
-        if let Some(temp) = stats.gpu_temp_c {
-            gpu_parts.push(format!("{temp:.0}°C"));
-        }
-        let gpu = if gpu_parts.is_empty() {
-            "GPU n/a".to_string()
-        } else {
-            format!("GPU {}", gpu_parts.join(" · "))
-        };
-
         let cpu = stats
             .cpu_util_percent
             .map(|util| format!("{util:.0}%"))
             .unwrap_or_else(|| "--".to_string());
-        let memory_used_gb = stats.memory_used_mb as f64 / MIB_PER_GIB;
-        let memory_total_gb = stats.memory_total_mb as f64 / MIB_PER_GIB;
-        let memory_shared_gb = stats.memory_shared_mb as f64 / MIB_PER_GIB;
-        let memory_buffers_gb = stats.memory_buffers_mb as f64 / MIB_PER_GIB;
-        let memory_cached_gb = stats.memory_cached_mb as f64 / MIB_PER_GIB;
-        let memory_free_gb = stats.memory_free_mb as f64 / MIB_PER_GIB;
+
         let system = format!(
             "CPU {cpu} · {} cores · ⚡ {:.1} tok/s",
             stats.cpu_cores, self.tokens_per_sec
         );
-        let ram = format!(
-            "RAM {memory_used_gb:.1}/{memory_total_gb:.1} GB · sh {memory_shared_gb:.1} · buf {memory_buffers_gb:.1} · cache {memory_cached_gb:.1} · free {memory_free_gb:.1}"
-        );
-        vec![gpu, system, ram]
+
+        vec![gpu_line(stats), system, ram_line(stats)]
     }
 }
 
-/// Fold a corrective steering message into the interrupted task's prompt.
-///
-/// Without a stored conversation snapshot the correction must carry the
-/// original task text with it; with one, [`App::submit_input`] replaces the
-/// merged prompt with the raw correction and resumes the conversation.
-fn continue_interrupted_task(
-    interrupted: Option<String>,
-    submitted: String,
-) -> (Option<String>, String) {
-    match (interrupted, submitted.starts_with('/')) {
-        (Some(previous), false) => (
-            None,
-            format!(
-                "Continue the interrupted task below. Preserve its original goal and existing workspace changes; treat the new user message as corrective steering. Inspect the workspace before acting; do not restart from scratch or repeat rejected work.\n\nOriginal task: {previous}\n\nUser correction / next instruction: {submitted}"
-            ),
-        ),
-        (interrupted, _) => (interrupted, submitted),
+/// The perf panel's GPU line: each metric the sampler reported, or `GPU n/a`.
+fn gpu_line(stats: &SystemStats) -> String {
+    let memory = stats
+        .gpu_memory_used_mb
+        .zip(stats.gpu_memory_total_mb)
+        .map(|(used, total)| format!("{used}/{total} MB"));
+    let reported = [
+        stats.gpu_name.clone(),
+        stats.gpu_util_percent.map(|util| format!("{util:.0}%")),
+        memory,
+        stats.gpu_power_watts.map(|power| format!("{power:.1}W")),
+        stats.gpu_temp_c.map(|temp| format!("{temp:.0}°C")),
+    ];
+    let parts: Vec<String> = reported.into_iter().flatten().collect();
+
+    if parts.is_empty() {
+        return "GPU n/a".to_string();
     }
+
+    format!("GPU {}", parts.join(" · "))
+}
+
+/// The perf panel's RAM line, in GiB.
+fn ram_line(stats: &SystemStats) -> String {
+    let gib = |mebibytes: u64| mebibytes as f64 / MIB_PER_GIB;
+
+    format!(
+        "RAM {:.1}/{:.1} GB · sh {:.1} · buf {:.1} · cache {:.1} · free {:.1}",
+        gib(stats.memory_used_mb),
+        gib(stats.memory_total_mb),
+        gib(stats.memory_shared_mb),
+        gib(stats.memory_buffers_mb),
+        gib(stats.memory_cached_mb),
+        gib(stats.memory_free_mb)
+    )
+}
+
+/// The lowercase name of an agent mode, as the header shows it.
+fn mode_name(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Agent => "agent",
+        AgentMode::Plan => "plan",
+        AgentMode::Chat => "chat",
+    }
+}
+
+/// What a key press does in the input line.
+fn input_action(key: &KeyEvent) -> InputAction {
+    let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match (key.code, is_control) {
+        (KeyCode::Char('c'), true) => InputAction::Cancel,
+        (KeyCode::Char('j'), true) => InputAction::Newline,
+        (KeyCode::Char('\r'), _) => InputAction::Nothing,
+        (KeyCode::Char(character), _) => InputAction::Insert(character),
+        (KeyCode::Backspace, _) => InputAction::Backspace,
+        (KeyCode::Delete, _) => InputAction::Delete,
+        (KeyCode::Left, _) => InputAction::Left,
+        (KeyCode::Right, _) => InputAction::Right,
+        (KeyCode::Home, _) => InputAction::Home,
+        (KeyCode::End, _) => InputAction::End,
+        (KeyCode::Up, _) => InputAction::Up,
+        (KeyCode::Down, _) => InputAction::Down,
+        (KeyCode::PageUp, _) => InputAction::PageUp,
+        (KeyCode::PageDown, _) => InputAction::PageDown,
+        (KeyCode::Tab, _) => InputAction::Complete,
+        (KeyCode::Enter, _) => enter_action(key.modifiers),
+        _ => InputAction::Nothing,
+    }
+}
+
+/// Enter with Shift, Ctrl or Alt inserts a newline; plain Enter submits.
+fn enter_action(modifiers: KeyModifiers) -> InputAction {
+    let newline_modifiers = KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT;
+
+    match modifiers.intersects(newline_modifiers) {
+        true => InputAction::Newline,
+        false => InputAction::Submit,
+    }
+}
+
+/// What a key press does while the confirmation dialog is open.
+fn confirmation_key(key: &KeyEvent) -> ConfirmationKey {
+    let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match (key.code, is_control) {
+        (KeyCode::Char('c'), true) => ConfirmationKey::CancelTask,
+        (KeyCode::Char('y' | 'Y'), _) => ConfirmationKey::Answer(true),
+        (KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter, _) => {
+            ConfirmationKey::Answer(false)
+        }
+        _ => ConfirmationKey::Ignore,
+    }
+}
+
+/// What a key press does while the model picker is open.
+fn picker_key(key: &KeyEvent) -> PickerKey {
+    let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match (key.code, is_control) {
+        (KeyCode::Up, _) => PickerKey::Up,
+        (KeyCode::Down, _) => PickerKey::Down,
+        (KeyCode::Enter, _) => PickerKey::Choose,
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => PickerKey::Close,
+        _ => PickerKey::Ignore,
+    }
+}
+
+/// Send a yes/no answer to the worker waiting on a confirmation.
+///
+/// A worker that was cancelled no longer listens, and then the answer is not needed.
+fn send_answer(pending: PendingConfirmation, answer: bool) {
+    pending.response.send(answer).ok();
+}
+
+/// Report a finished agent task to the event loop.
+fn send_done(tx: &mpsc::UnboundedSender<UiEvent>, result: anyhow::Result<()>) {
+    send_event(
+        tx,
+        UiEvent::Done(result.map_err(|error| format!("{error:#}"))),
+    );
+}
+
+/// The prompt for a correction of an interrupted task when no conversation
+/// was stored: the correction must carry the original task text with it.
+fn corrected_task_prompt(previous: &str, correction: &str) -> String {
+    format!(
+        "Continue the interrupted task below. Preserve its original goal and existing workspace changes; treat the new user message as corrective steering. Inspect the workspace before acting; do not restart from scratch or repeat rejected work.\n\nOriginal task: {previous}\n\nUser correction / next instruction: {correction}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
+    use crossterm::event;
+
+    use clap::Parser;
 
     #[test]
-    fn follow_up_after_ctrl_c_keeps_original_task_and_adds_correction() {
-        let (interrupted, prompt) = continue_interrupted_task(
-            Some("write a stable softmax kernel".to_string()),
-            "use CUDA Oxide, not CUDA C++".to_string(),
-        );
-        assert!(interrupted.is_none());
+    fn follow_up_after_ctrl_c_keeps_original_task_and_adds_correction() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.interrupted_task = Some("write a stable softmax kernel".to_string());
+
+        let submission = app.task_for_submission("use CUDA Oxide, not CUDA C++".to_string());
+
+        let (prompt, resume) = submission.context("a correction must produce a task")?;
+        assert!(app.interrupted_task.is_none());
         assert!(prompt.contains("write a stable softmax kernel"));
         assert!(prompt.contains("use CUDA Oxide, not CUDA C++"));
         assert!(prompt.contains("Inspect the workspace"));
+        assert_eq!(resume, None);
+
+        Ok(())
     }
 
     #[test]
     fn slash_command_does_not_consume_interrupted_task() {
-        let (interrupted, command) =
-            continue_interrupted_task(Some("original task".to_string()), "/help".to_string());
-        assert_eq!(interrupted.as_deref(), Some("original task"));
-        assert_eq!(command, "/help");
-    }
+        let mut app = test_app();
+        app.interrupted_task = Some("original task".to_string());
 
-    use clap::Parser;
+        let submission = app.task_for_submission("/help".to_string());
+
+        assert_eq!(submission, Some(("/help".to_string(), None)));
+        assert_eq!(app.interrupted_task.as_deref(), Some("original task"));
+    }
 
     #[test]
     fn unicode_paste_does_not_panic() {
@@ -1058,8 +1459,8 @@ mod tests {
         let mut release = press;
         release.kind = event::KeyEventKind::Release;
 
-        app.handle_key(press, &client, &tx).await.unwrap();
-        app.handle_key(release, &client, &tx).await.unwrap();
+        app.handle_key(press, &client, &tx).await;
+        app.handle_key(release, &client, &tx).await;
 
         assert_eq!(
             app.input, "a",
@@ -1076,7 +1477,7 @@ mod tests {
 
         let mut key = event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         key.kind = event::KeyEventKind::Repeat;
-        app.handle_key(key, &client, &tx).await.unwrap();
+        app.handle_key(key, &client, &tx).await;
 
         assert_eq!(app.input, "a");
     }
@@ -1398,8 +1799,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_correction_after_interrupt_carries_the_conversation() {
-        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+    async fn a_correction_after_interrupt_carries_the_conversation() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1")?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
@@ -1407,36 +1808,43 @@ mod tests {
         app.current_prompt = Some("write a softmax kernel".to_string());
         app.agent_conversation = Some(vec![serde_json::json!({"role": "user", "content": "task"})]);
         app.input = "use cuda oxide instead".to_string();
-        app.submit_input(&client, &tx).await.unwrap();
+        app.submit_input(&client, &tx).await;
 
-        let Some((queued, resume)) = app.task_queue.pop_front() else {
-            panic!("expected the correction to queue behind the running task");
-        };
+        let (queued, resume) = app
+            .task_queue
+            .pop_front()
+            .context("expected the correction to queue behind the running task")?;
         assert_eq!(queued, "use cuda oxide instead");
         assert!(
             resume.is_some(),
             "the interrupted conversation must ride with the correction"
         );
         assert_eq!(app.agent_conversation, None);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_correction_without_a_snapshot_falls_back_to_the_merged_prompt() {
-        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+    async fn a_correction_without_a_snapshot_falls_back_to_the_merged_prompt() -> anyhow::Result<()>
+    {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1")?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.is_running = true;
         app.interrupted_task = Some("write a softmax kernel".to_string());
         app.current_prompt = Some("write a softmax kernel".to_string());
         app.input = "use cuda oxide instead".to_string();
-        app.submit_input(&client, &tx).await.unwrap();
+        app.submit_input(&client, &tx).await;
 
-        let Some((queued, resume)) = app.task_queue.pop_front() else {
-            panic!("expected the correction to queue behind the running task");
-        };
+        let (queued, resume) = app
+            .task_queue
+            .pop_front()
+            .context("expected the correction to queue behind the running task")?;
         assert!(queued.contains("Original task: write a softmax kernel"));
         assert!(queued.contains("use cuda oxide instead"));
         assert_eq!(resume, None);
+
+        Ok(())
     }
 
     #[test]
@@ -1463,7 +1871,7 @@ mod tests {
         app.input = "hello".to_string();
         app.cursor = 5;
         let key = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        let result = app.handle_key(key, &client, &tx).await;
         assert!(!result);
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
@@ -1481,7 +1889,7 @@ mod tests {
         app.input = "hello".to_string();
         app.cursor = 5;
         let key = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        let result = app.handle_key(key, &client, &tx).await;
         assert!(!result, "Esc must not quit the TUI");
         assert_eq!(app.input, "hello", "Esc must not clear composed input");
         assert_eq!(app.cursor, 5);
@@ -1489,7 +1897,7 @@ mod tests {
 
         // Esc on an already-empty input is also a no-op quit-wise.
         let key = event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        let result = app.handle_key(key, &client, &tx).await.unwrap();
+        let result = app.handle_key(key, &client, &tx).await;
         assert!(!result, "Esc on empty input must not quit the TUI");
         assert!(!app.should_quit);
     }
@@ -1572,18 +1980,491 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slash_command_network_error_is_logged_not_fatal() {
+    async fn slash_command_network_error_is_logged_not_fatal() -> anyhow::Result<()> {
         // Point at a port that refuses connections so the command fails fast.
-        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1").unwrap();
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:1")?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.input = "/model missing-model".to_string();
-        let result = app.submit_input(&client, &tx).await;
-        assert!(result.is_ok(), "TUI must survive slash-command failures");
+        app.submit_input(&client, &tx).await;
         assert!(
             app.log.iter().any(|line| line.contains('⚠')),
             "expected an error logged to chat"
         );
+
+        Ok(())
+    }
+
+    /// A client for a port that refuses connections, so network calls fail fast.
+    fn refused_client() -> anyhow::Result<OllamaClient> {
+        OllamaClient::new("http://127.0.0.1:1")
+    }
+
+    /// A key press with no modifiers.
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A key press with Ctrl held.
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Feed each key to the app in order.
+    async fn type_keys(
+        app: &mut App,
+        keys: &[KeyEvent],
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        for key in keys {
+            app.handle_key(*key, client, tx).await;
+        }
+    }
+
+    /// A mouse event of `kind` at `column`, `row`.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn input_keys_map_to_their_actions() {
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        assert_eq!(input_action(&ctrl(KeyCode::Char('c'))), InputAction::Cancel);
+        assert_eq!(
+            input_action(&ctrl(KeyCode::Char('j'))),
+            InputAction::Newline
+        );
+        assert_eq!(
+            input_action(&ctrl(KeyCode::Char('a'))),
+            InputAction::Insert('a')
+        );
+        assert_eq!(
+            input_action(&press(KeyCode::Char('\r'))),
+            InputAction::Nothing
+        );
+        assert_eq!(input_action(&press(KeyCode::Enter)), InputAction::Submit);
+        assert_eq!(input_action(&shift_enter), InputAction::Newline);
+        assert_eq!(input_action(&press(KeyCode::F(1))), InputAction::Nothing);
+    }
+
+    #[tokio::test]
+    async fn editing_keys_change_the_input_line() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        let keys = [
+            press(KeyCode::Char('a')),
+            press(KeyCode::Char('b')),
+            press(KeyCode::Left),
+            press(KeyCode::Backspace),
+            press(KeyCode::Right),
+            press(KeyCode::Home),
+            press(KeyCode::Delete),
+            press(KeyCode::End),
+            ctrl(KeyCode::Char('j')),
+            press(KeyCode::Char('c')),
+        ];
+        type_keys(&mut app, &keys, &client, &tx).await;
+
+        assert_eq!(app.input, "\nc");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn navigation_keys_scroll_complete_and_recall_history() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.history = vec!["earlier task".to_string()];
+
+        type_keys(&mut app, &[press(KeyCode::Up)], &client, &tx).await;
+        assert_eq!(app.input, "earlier task");
+
+        type_keys(&mut app, &[press(KeyCode::Down)], &client, &tx).await;
+        assert!(app.input.is_empty());
+
+        type_keys(&mut app, &[press(KeyCode::PageDown)], &client, &tx).await;
+        assert_eq!(app.chat_scroll_offset, CHAT_SCROLL_STEP);
+
+        type_keys(&mut app, &[press(KeyCode::PageUp)], &client, &tx).await;
+        assert_eq!(app.chat_scroll_offset, 0);
+
+        app.insert_text("/mod");
+        type_keys(&mut app, &[press(KeyCode::Tab)], &client, &tx).await;
+        assert_eq!(app.input, "/models");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enter_submits_a_slash_command_and_quit_ends_the_app() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.insert_text("/help");
+        let after_help = app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert!(!after_help);
+        assert!(app.log.iter().any(|line| line.contains("Commands")));
+
+        app.insert_text("/quit");
+        let after_quit = app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert!(after_quit);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_input_submits_nothing() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert!(app.history.is_empty());
+        assert!(app.transcript_is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_runs_in_the_background_and_reports_done() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.insert_text("write a kernel");
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert!(app.is_running);
+        assert_eq!(app.current_prompt.as_deref(), Some("write a kernel"));
+
+        // The refused connection fails model selection before any log line.
+        let event = rx.recv().await;
+
+        assert!(matches!(event, Some(UiEvent::Done(Err(_)))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_while_running_cancels_and_aborts_the_task() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+        app.current_prompt = Some("long task".to_string());
+        app.current_task = Some(tokio::spawn(std::future::pending::<()>()));
+        app.input = "half typed".to_string();
+
+        app.handle_key(ctrl(KeyCode::Char('c')), &client, &tx).await;
+
+        assert!(app.current_task.is_none());
+        assert!(!app.is_running);
+        assert!(app.input.is_empty());
+        assert_eq!(app.interrupted_task.as_deref(), Some("long task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keys_reach_the_open_confirmation_dialog() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        app.open_confirmation("write file 'a.txt'?".to_string(), response_tx);
+
+        app.handle_key(press(KeyCode::Char('Y')), &client, &tx)
+            .await;
+
+        assert_eq!(response_rx.try_recv(), Ok(true));
+        assert!(app.input.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn an_answer_without_a_dialog_is_ignored() {
+        let mut app = test_app();
+
+        app.answer_confirmation(false);
+
+        assert!(app.transcript_is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_picker_moves_chooses_and_closes() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.open_picker(vec!["first".to_string(), "second".to_string()]);
+
+        let keys = [
+            press(KeyCode::Down),
+            press(KeyCode::Down),
+            press(KeyCode::Up),
+            press(KeyCode::Down),
+            press(KeyCode::Char('x')),
+        ];
+        type_keys(&mut app, &keys, &client, &tx).await;
+
+        assert_eq!(app.picker().map(|picker| picker.selected), Some(1));
+
+        type_keys(&mut app, &[press(KeyCode::Enter)], &client, &tx).await;
+
+        assert!(!app.is_showing_picker());
+        assert_eq!(app.model.as_deref(), Some("second"));
+
+        app.open_picker(Vec::new());
+        type_keys(&mut app, &[press(KeyCode::Enter)], &client, &tx).await;
+
+        assert!(!app.is_showing_picker());
+
+        app.open_picker(vec!["first".to_string()]);
+        type_keys(&mut app, &[press(KeyCode::Esc)], &client, &tx).await;
+
+        assert!(!app.is_showing_picker());
+        assert_eq!(app.model.as_deref(), Some("second"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn picker_changes_need_an_open_picker() {
+        let mut app = test_app();
+
+        app.update_picker(PickerState::select_next);
+
+        assert!(app.picker().is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_model_info_reads_the_selected_model() -> anyhow::Result<()> {
+        let base_url = crate::test_support::spawn_mock_server(|_path| {
+            crate::test_support::MockResponse::json(
+                "200 OK",
+                r#"{"models":[{"name":"other","size":1},{"name":"chosen","size":0}]}"#,
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url)?;
+        let mut app = test_app();
+        app.model = Some("chosen".to_string());
+        app.server_url = "http://thor:11434".to_string();
+
+        app.refresh_model_info(&client).await;
+
+        assert_eq!(
+            app.model_info_line(),
+            "model: chosen · mode: agent · server http://thor:11434"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_header_line_names_the_mode() {
+        let mut app = test_app();
+
+        app.run_config.mode = AgentMode::Plan;
+        assert!(app.model_info_line().contains("mode: plan"));
+
+        app.run_config.mode = AgentMode::Chat;
+        assert!(app.model_info_line().contains("mode: chat"));
+    }
+
+    #[test]
+    fn a_tool_log_line_becomes_the_current_action() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.live = "partial reply".to_string();
+
+        app.handle_event(
+            UiEvent::Log("🔧 write file 'a.txt'".to_string()),
+            &client,
+            &tx,
+        );
+        app.handle_event(UiEvent::Log(String::new()), &client, &tx);
+
+        assert_eq!(app.last_action, "🔧 write file 'a.txt'");
+        assert_eq!(app.log.text(), "partial reply\n🔧 write file 'a.txt'");
+
+        Ok(())
+    }
+
+    #[test]
+    fn chunks_measure_the_token_rate_per_window() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let now = Instant::now();
+        let one_second_ago = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .context("the clock must be past one second")?;
+
+        app.rate_window_start = Some(one_second_ago);
+        app.last_chunk_at = Some(now);
+        app.handle_event(UiEvent::Chunk("a".repeat(400)), &client, &tx);
+
+        assert!(app.tokens_per_sec > 0.0);
+        assert_eq!(app.rate_window_chars, 0);
+
+        let pause_start = now
+            .checked_sub(STREAM_GAP * 2)
+            .context("the clock must be past the stream gap")?;
+        app.last_chunk_at = Some(pause_start);
+        app.handle_event(UiEvent::Chunk("abcd".to_string()), &client, &tx);
+
+        assert_eq!(app.rate_window_chars, 4);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_tasks_and_setups_are_logged() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.handle_event(
+            UiEvent::Done(Err("model crashed".to_string())),
+            &client,
+            &tx,
+        );
+        app.handle_event(
+            UiEvent::SetupDone(Err("no network".to_string())),
+            &client,
+            &tx,
+        );
+
+        assert!(app.log.text().contains("⚠️ model crashed"));
+        assert!(app.log.text().contains("⚠️ Setup failed: no network"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_submitted_while_running_is_queued() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.is_running = true;
+
+        app.insert_text("second task");
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert_eq!(app.task_queue.len(), 1);
+        assert!(app.log.text().contains("Queued"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_mouse_scrolls_drags_and_is_ignored_behind_a_dialog() {
+        let mut app = test_app();
+        for index in 0..100 {
+            app.log.push(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(app.chat_scroll_offset, CHAT_SCROLL_STEP);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+        assert_eq!(app.chat_scroll_offset, 0);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 38, 18));
+        assert_eq!(app.scroll_mode, ScrollMode::Follow);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 38, 1));
+        assert_eq!(app.chat_scroll_offset, 0);
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, 5, 5));
+        assert_eq!(app.chat_scroll_offset, 0);
+
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        app.open_confirmation("write?".to_string(), response_tx);
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert_eq!(app.chat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn clicking_a_line_with_a_file_path_opens_it() -> anyhow::Result<()> {
+        let workspace = crate::test_support::unique_temp_dir("openbatrangs-tui-click");
+        std::fs::write(workspace.join("notes.txt"), "notes")?;
+
+        let mut app = test_app();
+        app.run_config.cwd = workspace.clone();
+        app.editor_terminals = &["true"];
+        app.log.push("no path here".to_string());
+        app.log.push("wrote notes.txt".to_string());
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 10));
+        app.scroll_mode = ScrollMode::Follow;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+        assert!(!app.log.text().contains("Opening"));
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        assert!(app.log.text().contains("📂 Opening"));
+
+        app.scroll_mode = ScrollMode::Manual;
+        app.chat_scroll_offset = 1;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 0));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 8));
+
+        std::fs::remove_dir_all(workspace)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_click_before_the_first_draw_does_nothing() {
+        let mut app = test_app();
+
+        app.open_clicked_file(5, 5);
+
+        assert!(app.transcript_is_empty());
+    }
+
+    #[test]
+    fn perf_lines_list_every_reported_metric() {
+        let mut app = test_app();
+        app.system_stats = SystemStats {
+            gpu_name: Some("Thor".to_string()),
+            gpu_util_percent: Some(42.0),
+            gpu_memory_used_mb: Some(1024),
+            gpu_memory_total_mb: Some(2048),
+            gpu_power_watts: Some(15.5),
+            gpu_temp_c: Some(50.0),
+            cpu_util_percent: Some(12.0),
+            cpu_cores: 14,
+            memory_used_mb: 2048,
+            ..SystemStats::default()
+        };
+
+        let lines = app.perf_lines();
+
+        assert_eq!(lines[0], "GPU Thor · 42% · 1024/2048 MB · 15.5W · 50°C");
+        assert!(lines[1].starts_with("CPU 12% · 14 cores"));
+        assert!(lines[2].starts_with("RAM 2.0/"));
+
+        app.system_stats = SystemStats::default();
+
+        assert_eq!(app.perf_lines()[0], "GPU n/a");
     }
 }
 
