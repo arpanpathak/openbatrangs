@@ -4,145 +4,75 @@
 //! adding more instructions to the system prompt, these gates reject the
 //! output programmatically before it can be written or accepted.
 
-use super::environment::project_has_build_manifest;
 use super::tool::Tool;
 use crate::constants::tools::SUCCESS_EXIT_MARKER;
-use std::path::Path;
 
 /// Number of times the agent may be asked to keep working before a shallow
 /// finish is allowed to pass. This prevents an infinite loop with a weak model.
 pub(crate) const MAX_FINISH_RETRIES: usize = 3;
 
-/// Tracks how many times a finish was blocked and whether the work was
-/// verified by a successful command.
+/// Rejects a finish that comes after a file change but before a check.
+///
+/// A run that changed no files can always finish. A run that changed files in
+/// a project with a build or test manifest must first run a command that
+/// exits with code 0 after its last change.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileWorkGate {
-    /// Number of shallow-finish attempts already rejected.
+pub(crate) struct FinishGate {
+    /// Number of finishes already rejected.
     retries: usize,
-    /// A `run_command` tool call exited with code 0 at least once.
-    verified: bool,
+    /// Files changed since the last command that exited with code 0.
+    has_unchecked_changes: bool,
 }
 
-impl FileWorkGate {
-    /// Reject a finish that came too early, returning the feedback to send to
-    /// the model, or `None` when the finish may pass.
+impl FinishGate {
+    /// The feedback for the model when a finish now would come before the
+    /// check, or `None` when the finish may pass.
     ///
-    /// # Parameters
-    ///
-    /// - `requires_file_work`: the task asks for files to be written.
-    /// - `is_read_only`: writes and commands are disabled entirely.
-    /// - `changed_files`: number of files written so far.
-    /// - `needs_verification`: the workspace has a build manifest, so a
-    ///   successful build/test is expected before the task counts as done.
-    ///
-    /// Each rejection consumes one retry; after [`MAX_FINISH_RETRIES`] the
-    /// gate lets the finish through, so a model that keeps finishing early
-    /// cannot keep the loop running until the step budget is spent.
-    pub(crate) fn reject_finish(
-        &mut self,
-        requires_file_work: bool,
-        is_read_only: bool,
-        changed_files: usize,
-        needs_verification: bool,
-    ) -> Option<&'static str> {
-        if !self.applies(requires_file_work, is_read_only) {
+    /// `needs_check` is true when the project has a build or test manifest.
+    /// Each rejection uses one retry; after [`MAX_FINISH_RETRIES`] the finish
+    /// passes, so a model that keeps finishing early cannot keep the loop
+    /// running until the step budget is spent.
+    pub(crate) fn reject_finish(&mut self, needs_check: bool) -> Option<&'static str> {
+        let has_retries_left = self.retries < MAX_FINISH_RETRIES;
+        let is_premature = matches!(
+            (needs_check, self.has_unchecked_changes, has_retries_left),
+            (true, true, true)
+        );
+
+        if !is_premature {
             return None;
         }
 
-        let feedback = self.missing_work(changed_files, needs_verification);
-        self.count_rejection(feedback)
+        self.retries += 1;
+        Some(UNVERIFIED_FEEDBACK)
     }
 
-    /// True when the gate checks this finish: the task asks for files, writes
-    /// are allowed, and retries are left.
-    fn applies(&self, requires_file_work: bool, is_read_only: bool) -> bool {
-        let has_retries_left = self.retries < MAX_FINISH_RETRIES;
+    /// Record one step of work: `files_changed` when a tool changed files,
+    /// `command_passed` when a command exited with code 0.
+    pub(crate) fn record(&mut self, files_changed: bool, command_passed: bool) {
+        let has_changes = self.has_unchecked_changes | files_changed;
 
-        matches!(
-            (requires_file_work, is_read_only, has_retries_left),
-            (true, false, true)
-        )
+        self.has_unchecked_changes = has_changes & !command_passed;
     }
 
-    /// The feedback for work that is still missing: no files written, or no
-    /// successful command when one is expected. `None` when nothing is missing.
-    fn missing_work(&self, changed_files: usize, needs_verification: bool) -> Option<&'static str> {
-        if changed_files == 0 {
-            return Some(NO_FILES_FEEDBACK);
-        }
+    /// Record the result of one tool call, given whether it changed files.
+    pub(crate) fn record_tool_result(&mut self, tool: &Tool, result: &str, files_changed: bool) {
+        let is_command = matches!(tool, Tool::RunCommand { .. });
+        let command_passed = is_command && command_succeeded(result);
 
-        let is_unverified = matches!((needs_verification, self.verified), (true, false));
-        is_unverified.then_some(UNVERIFIED_FEEDBACK)
-    }
-
-    /// Use up one retry when `feedback` rejects the finish, and return it.
-    fn count_rejection(&mut self, feedback: Option<&'static str>) -> Option<&'static str> {
-        if feedback.is_some() {
-            self.retries += 1;
-        }
-
-        feedback
-    }
-
-    /// Record a successful verification command (exit code 0).
-    pub(crate) fn record_verification(&mut self) {
-        self.verified = true;
-    }
-
-    /// Record the result of one tool call: a `run_command` that exited with
-    /// code 0 counts as verification.
-    pub(crate) fn record_tool_result(&mut self, tool: &Tool, result: &str) {
-        let is_successful_command =
-            matches!(tool, Tool::RunCommand { .. }) && command_succeeded(result);
-
-        self.verified |= is_successful_command;
+        self.record(files_changed, command_passed);
     }
 }
 
-/// Feedback for a finish before any file was written.
-const NO_FILES_FEEDBACK: &str = "Finish rejected: the task requires file changes, but no files \
-     were written. Write the complete implementation or document first; only then call finish.";
-
-/// Feedback for a finish before a build or test command succeeded.
-const UNVERIFIED_FEEDBACK: &str = "Finish rejected: the work is not verified. Run the build or \
-     test command, read its output, and fix any errors. Only call finish after a command exits \
-     with code 0.";
+/// Feedback for a finish after a file change but before a passing check.
+const UNVERIFIED_FEEDBACK: &str = "Finish rejected: the changed files are not verified. Run the \
+     build or test command, read its output, and fix any errors. Only call finish after a \
+     command exits with code 0.";
 
 /// True when a `run_command` tool result reports a zero exit code.
 pub(crate) fn command_succeeded(output: &str) -> bool {
     output.contains(SUCCESS_EXIT_MARKER)
 }
-
-/// True when a task that asks for files runs in a workspace with a build
-/// manifest, so a successful build or test is expected before it counts as
-/// done.
-pub(crate) fn needs_verification(requires_file_work: bool, cwd: &Path) -> bool {
-    requires_file_work && project_has_build_manifest(cwd)
-}
-
-/// True when a task asks the model to produce or change files.
-pub(crate) fn requires_file_work(task: &str) -> bool {
-    let task = task.to_ascii_lowercase();
-    FILE_WORK_HINTS.iter().any(|hint| task.contains(hint))
-}
-
-/// Words that usually indicate an implementation/document task rather than a
-/// question. Kept intentionally narrow to avoid blocking plain Q&A.
-const FILE_WORK_HINTS: &[&str] = &[
-    "implement",
-    "implementation",
-    "write ",
-    "create ",
-    "add ",
-    "fix ",
-    "refactor",
-    "generate",
-    "full ",
-    "readme",
-    "documentation",
-    "design ",
-    "tests",
-];
 
 /// Phrases that only a stub template contains, each with the reason shown to
 /// the model. Single words such as "placeholder", "stub" or "hello world" are
@@ -218,82 +148,58 @@ mod tests {
     }
 
     #[test]
-    fn detects_file_work_tasks() {
-        assert!(requires_file_work("create a full DSA implementation"));
-        assert!(requires_file_work("write complete README for the project"));
-        assert!(requires_file_work("fix the failing test"));
-        assert!(!requires_file_work("explain what a mutex is"));
-        assert!(!requires_file_work("why is this slow"));
+    fn a_run_without_changes_always_finishes() {
+        let mut gate = FinishGate::default();
+
+        assert_eq!(gate.reject_finish(true), None);
+        assert_eq!(gate.reject_finish(false), None);
     }
 
     #[test]
-    fn gate_blocks_finish_until_files_exist() {
-        let mut gate = FileWorkGate::default();
+    fn a_change_needs_a_passing_check_after_it() -> anyhow::Result<()> {
+        let mut gate = FinishGate::default();
+        let command = Tool::RunCommand {
+            command: "cargo test".to_string(),
+        };
+        let write = Tool::WriteFile {
+            path: "a.rs".to_string(),
+            content: "fn a() {}".to_string(),
+        };
 
-        assert!(gate.reject_finish(true, false, 0, false).is_some());
-        assert_eq!(gate.reject_finish(false, false, 0, false), None);
-        assert_eq!(gate.reject_finish(true, true, 0, false), None);
-        assert_eq!(gate.reject_finish(true, false, 1, false), None);
-    }
+        gate.record_tool_result(&write, "wrote", true);
+        assert_eq!(gate.reject_finish(false), None);
+        let feedback = gate.reject_finish(true).context("an unchecked change")?;
+        assert!(feedback.contains("not verified"), "{feedback}");
 
-    #[test]
-    fn gate_blocks_finish_until_a_command_succeeds() {
-        let mut gate = FileWorkGate::default();
+        gate.record_tool_result(&command, "[exit code 101]", false);
+        assert!(gate.reject_finish(true).is_some());
 
-        assert!(gate.reject_finish(true, false, 1, true).is_some());
-        gate.record_verification();
-        assert_eq!(gate.reject_finish(true, false, 1, true), None);
-    }
+        gate.record_tool_result(&command, "ok\n[exit code 0]\n", false);
+        assert_eq!(gate.reject_finish(true), None);
 
-    #[test]
-    fn gate_stops_after_max_retries() {
-        let mut gate = FileWorkGate::default();
-
-        for _ in 0..MAX_FINISH_RETRIES {
-            assert!(gate.reject_finish(true, false, 0, false).is_some());
-        }
-
+        gate.record_tool_result(&write, "wrote", true);
+        assert!(gate.reject_finish(true).is_some());
         assert_eq!(
-            gate.reject_finish(true, false, 0, false),
+            gate.reject_finish(true),
             None,
             "a weak model must not loop forever"
         );
-    }
-
-    #[test]
-    fn feedback_names_the_rejection_reason() -> anyhow::Result<()> {
-        let mut gate = FileWorkGate::default();
-
-        let no_files = gate
-            .reject_finish(true, false, 0, true)
-            .context("no files written")?;
-        assert!(no_files.contains("no files were written"), "{no_files}");
-
-        let unverified = gate
-            .reject_finish(true, false, 2, true)
-            .context("no command succeeded")?;
-        assert!(unverified.contains("not verified"), "{unverified}");
 
         Ok(())
     }
 
     #[test]
-    fn only_a_successful_command_verifies_the_work() {
-        let mut gate = FileWorkGate::default();
-        let command = Tool::RunCommand {
-            command: "cargo test".to_string(),
-        };
+    fn a_read_does_not_count_as_a_check() {
+        let mut gate = FinishGate::default();
         let read = Tool::ReadFile {
             path: "log.txt".to_string(),
             max_chars: 100,
         };
 
-        gate.record_tool_result(&read, "[exit code 0]");
-        gate.record_tool_result(&command, "[exit code 101]");
-        assert!(gate.reject_finish(true, false, 1, true).is_some());
+        gate.record(true, false);
+        gate.record_tool_result(&read, "[exit code 0]", false);
 
-        gate.record_tool_result(&command, "ok\n[exit code 0]\n");
-        assert_eq!(gate.reject_finish(true, false, 1, true), None);
+        assert!(gate.reject_finish(true).is_some());
     }
 
     #[test]
@@ -302,21 +208,5 @@ mod tests {
         assert!(!command_succeeded(
             "error: could not compile\n[exit code 101]\n"
         ));
-    }
-
-    #[test]
-    fn build_manifest_detection_is_file_based() -> anyhow::Result<()> {
-        let root = crate::test_support::unique_temp_dir("openbatrangs-quality-test");
-
-        assert!(!project_has_build_manifest(&root));
-        assert!(!needs_verification(true, &root));
-
-        std::fs::write(root.join("Cargo.toml"), "[package]")?;
-        assert!(project_has_build_manifest(&root));
-        assert!(needs_verification(true, &root));
-        assert!(!needs_verification(false, &root));
-
-        std::fs::remove_dir_all(root)?;
-        Ok(())
     }
 }

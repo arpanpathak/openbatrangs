@@ -5,39 +5,94 @@
 //! answer. Each step streams that object, prints its `thought` and `answer`
 //! fields as they arrive, and then acts on it:
 //!
-//! - an answer, or a call to `finish`, ends the run unless the file-work gate
+//! - an answer, or a call to `finish`, ends the run unless the finish gate
 //!   rejects it as premature;
+//! - a call to `ask_user` ends the run with the question;
 //! - any other tool call runs, and its result goes back as a user message;
 //! - a reply that is neither, or is not JSON, ends the run with a warning.
+//!
+//! The run is a state machine: [`JsonRun::run`] moves through [`State`]
+//! values, one small function per state, until the run is over.
 
-use super::environment::environment_facts;
-use super::execute::{execute_tool_or_report_error, print_changed_files};
-use super::quality::{FileWorkGate, needs_verification, requires_file_work};
+use super::environment::{environment_facts, project_has_build_manifest};
+use super::execute::{absolute_paths, run_tool_call};
+use super::quality::FinishGate;
 use super::research::task_with_documentation;
 use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
 use super::{
-    AgentConfig, Confirmer, Reporter, RunContinuation, compact_context, effective_context,
-    ensure_workspace_exists, max_output_tokens,
+    AgentConfig, AgentEvent, Confirmer, LoopKind, Reporter, RunContinuation, compact_context,
+    effective_context, ensure_workspace_exists, max_output_tokens,
 };
 use crate::constants::agent::{
     AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
 };
-use crate::constants::ansi::{
-    ANSI_GREEN_CHECK, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA, COLOR_RESET,
-};
+use crate::constants::ansi::{COLOR_DIM, COLOR_RESET};
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient, Role};
 use crate::tools;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// The outcome of one agent iteration.
-#[derive(Debug, PartialEq, Eq)]
-enum AgentStepOutcome {
-    /// The agent answered or hit a terminal parse error.
-    Finished,
-    /// The agent called a tool and should continue to the next step.
-    Continue,
+/// The states of one JSON-loop run.
+enum State {
+    /// Start the next step, or give up when the step budget is spent.
+    Ask,
+    /// Stream the model's reply for the current step.
+    Stream,
+    /// Parse the streamed reply.
+    Parse {
+        /// The raw reply.
+        content: String,
+        /// Whether its answer field was streamed to the reporter.
+        answer_was_streamed: bool,
+    },
+    /// Turn the reply's tool call into a typed tool.
+    CallTool {
+        /// The raw reply.
+        content: String,
+        /// The tool call in the reply.
+        call: ToolCall,
+    },
+    /// Run a tool and send its result back.
+    RunTool {
+        /// The raw reply.
+        content: String,
+        /// Tool name, as the model wrote it.
+        name: String,
+        /// Tool arguments as JSON text.
+        arguments: String,
+        /// The typed tool.
+        tool: Tool,
+    },
+    /// Send a malformed tool call back for a retry.
+    Reject {
+        /// The raw reply.
+        content: String,
+        /// Why the call was rejected.
+        error: anyhow::Error,
+    },
+    /// The model answered or called `finish`.
+    Finish {
+        /// The answer or summary.
+        summary: String,
+        /// Whether the answer was streamed to the reporter.
+        answer_was_streamed: bool,
+    },
+    /// The model asked the user this question.
+    AskUser(String),
+    /// The reply had neither an answer nor a tool call.
+    Empty(String),
+    /// The reply was not JSON.
+    Unparsable {
+        /// The raw reply.
+        content: String,
+        /// The parse error.
+        error: anyhow::Error,
+    },
+    /// The step budget ran out before an answer.
+    GiveUp,
+    /// The run is over.
+    Done,
 }
 
 /// One run of the JSON loop: its limits, its conversation, and its output.
@@ -50,18 +105,18 @@ struct JsonRun<'a, R, C> {
     model: &'a str,
     /// Context window size (tokens) sent to the model.
     num_ctx: u64,
-    /// Whether the original task asks for file output rather than just a chat answer.
-    requires_file_work: bool,
-    /// Whether the workspace has a build manifest, so a successful build or
-    /// test is expected before the task counts as done.
-    needs_verification: bool,
+    /// Whether the project has a build or test manifest, so changed files
+    /// need a passing check before the run may finish.
+    needs_check: bool,
+    /// Number of the current step; 0 before the first.
+    step: usize,
     /// Conversation history sent to the model.
     messages: Vec<ChatMessage>,
     /// Files written successfully during the task.
     changed_files: Vec<String>,
-    /// Gate that rejects shallow finish calls.
-    file_work_gate: FileWorkGate,
-    /// Output sink for status and results.
+    /// Gate that rejects a finish before changed files are checked.
+    finish_gate: FinishGate,
+    /// Receives the run's events.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
     confirmer: &'a mut C,
@@ -90,18 +145,17 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
 
     let num_ctx = effective_context(config.model_context, config.max_ctx);
     let task_with_docs = task_with_documentation(task, config, reporter).await;
-    let requires_file_work = requires_file_work(task);
 
     let run = JsonRun {
         config,
         client,
         model,
         num_ctx,
-        requires_file_work,
-        needs_verification: needs_verification(requires_file_work, &config.cwd),
+        needs_check: project_has_build_manifest(&config.cwd),
+        step: 0,
         messages: initial_messages(&config.cwd, &task_with_docs),
         changed_files: Vec::new(),
-        file_work_gate: FileWorkGate::default(),
+        finish_gate: FinishGate::default(),
         reporter,
         confirmer,
     };
@@ -126,150 +180,123 @@ fn warn_when_resume_is_unsupported<R: Reporter>(
         return;
     }
 
-    reporter.line(
+    reporter.notice(
         "\n⚠️  The previous conversation cannot be resumed: this server uses the JSON tool loop."
             .to_string(),
     );
 }
 
 impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
-    /// Run steps until one finishes, and warn when the budget ran out first.
+    /// Move from state to state until the run is over.
     async fn run(mut self) -> Result<()> {
-        let outcome = self.run_steps().await?;
+        let mut state = State::Ask;
 
-        self.report_unfinished(&outcome);
-        Ok(())
+        loop {
+            state = match state {
+                State::Ask => self.ask(),
+                State::Stream => self.stream().await?,
+                State::Parse {
+                    content,
+                    answer_was_streamed,
+                } => parse_state(content, answer_was_streamed),
+                State::CallTool { content, call } => call_state(content, call),
+                State::RunTool {
+                    content,
+                    name,
+                    arguments,
+                    tool,
+                } => self.run_tool(&content, name, arguments, tool).await,
+                State::Reject { content, error } => self.reject_tool_call(&content, &error),
+                State::Finish {
+                    summary,
+                    answer_was_streamed,
+                } => self.finish(summary, answer_was_streamed),
+                State::AskUser(question) => self.ask_user(question),
+                State::Empty(content) => self.report_empty_reply(&content),
+                State::Unparsable { content, error } => self.report_parse_error(&error, &content),
+                State::GiveUp => self.give_up(),
+                State::Done => return Ok(()),
+            };
+        }
     }
 
-    /// Run steps until one finishes, fails, or the budget is spent; return
-    /// the last outcome.
-    async fn run_steps(&mut self) -> Result<AgentStepOutcome> {
-        let mut outcome = Ok(AgentStepOutcome::Continue);
-        let mut steps = 1..=self.config.max_steps;
+    /// Start the next step, or give up when the budget is spent.
+    fn ask(&mut self) -> State {
+        self.step += 1;
 
-        while let (Ok(AgentStepOutcome::Continue), Some(step)) = (&outcome, steps.next()) {
-            outcome = self.step(step).await;
+        if self.step > self.config.max_steps {
+            return State::GiveUp;
         }
 
-        outcome
-    }
-
-    /// Warn that the step budget ran out when the last step did not finish.
-    fn report_unfinished(&mut self, outcome: &AgentStepOutcome) {
-        if *outcome == AgentStepOutcome::Finished {
-            return;
-        }
-
-        self.reporter.line(format!(
-            "\n⚠️  Reached max steps ({}) without a final answer.",
-            self.config.max_steps
-        ));
-    }
-
-    /// Run one agent iteration: stream a response, parse it, and act on it.
-    async fn step(&mut self, step: usize) -> Result<AgentStepOutcome> {
-        let max_steps = self.config.max_steps;
-        self.reporter.line(step_header(step, max_steps, self.model));
+        self.reporter.report(AgentEvent::StepStarted {
+            step: self.step,
+            max_steps: self.config.max_steps,
+            model: self.model.to_string(),
+            loop_kind: LoopKind::Json,
+        });
 
         // Auto rolling context: keep the system prompt, original task, and the
         // newest tool exchange verbatim; older tool calls/output are rolled into a
         // short note so the prompt always fits the safe per-device `num_ctx`.
         compact_context(&mut self.messages, self.num_ctx);
 
+        State::Stream
+    }
+
+    /// Stream the model's reply, showing its thought and answer as they arrive.
+    async fn stream(&mut self) -> Result<State> {
         let request = chat_request(self.model, &self.messages, self.num_ctx);
         let show_thinking = self.config.show_thinking;
+
         let (content, answer_was_streamed) =
             stream_model_response(self.client, request, self.reporter, show_thinking)
                 .await
-                .with_context(|| format!("model call failed at step {step}"))?;
+                .with_context(|| format!("model call failed at step {}", self.step))?;
 
-        Ok(self.act(&content, answer_was_streamed).await)
+        Ok(State::Parse {
+            content,
+            answer_was_streamed,
+        })
     }
 
-    /// Parse the raw reply and act on it; a reply that is not valid JSON is
-    /// shown as the final response.
-    async fn act(&mut self, content: &str, answer_was_streamed: bool) -> AgentStepOutcome {
-        match parse_agent_response(content) {
-            Ok(response) => {
-                self.act_on_response(content, response, answer_was_streamed)
-                    .await
-            }
-            Err(error) => self.report_parse_error(&error, content),
-        }
-    }
-
-    /// The model may answer, call exactly one tool, or do neither. Matching
-    /// on the pair keeps all three outcomes explicit.
-    async fn act_on_response(
-        &mut self,
-        content: &str,
-        response: AgentResponse,
-        answer_was_streamed: bool,
-    ) -> AgentStepOutcome {
-        match (response.answer, response.tool) {
-            (Some(answer), _) => self.finish(&answer, answer_was_streamed),
-            (None, Some(tool_call)) => self.handle_tool_call(content, tool_call).await,
-            (None, None) => self.report_empty_reply(content),
-        }
-    }
-
-    /// End the run with `summary`, unless the file-work gate rejects the
-    /// finish. A summary that was already streamed live is not printed again.
-    fn finish(&mut self, summary: &str, was_streamed: bool) -> AgentStepOutcome {
-        if let Some(feedback) = self.rejected_finish() {
+    /// End the run with `summary`, unless the finish gate rejects the finish.
+    fn finish(&mut self, summary: String, answer_was_streamed: bool) -> State {
+        if let Some(feedback) = self.finish_gate.reject_finish(self.needs_check) {
             return self.block_finish(feedback);
         }
 
-        self.print_summary(summary, was_streamed);
-        print_changed_files(&self.config.cwd, &self.changed_files, self.reporter);
-        AgentStepOutcome::Finished
-    }
+        let changed_files = absolute_paths(&self.config.cwd, &self.changed_files);
+        self.reporter.report(AgentEvent::Finished {
+            answer: summary,
+            answer_was_streamed,
+            changed_files,
+        });
 
-    /// The gate's feedback when a finish now would be premature.
-    fn rejected_finish(&mut self) -> Option<&'static str> {
-        self.file_work_gate.reject_finish(
-            self.requires_file_work,
-            self.config.is_read_only,
-            self.changed_files.len(),
-            self.needs_verification,
-        )
+        State::Done
     }
 
     /// Send the gate's feedback to the model and keep going.
-    fn block_finish(&mut self, feedback: &str) -> AgentStepOutcome {
+    fn block_finish(&mut self, feedback: &str) -> State {
         self.messages.push(message(Role::User, feedback));
-        self.reporter.line(format!(
+        self.reporter.notice(format!(
             "\n{COLOR_DIM}⚠️  Shallow finish blocked.{COLOR_RESET}"
         ));
 
-        AgentStepOutcome::Continue
+        State::Ask
     }
 
-    /// Print the final summary unless it was already streamed.
-    fn print_summary(&mut self, summary: &str, was_streamed: bool) {
-        if was_streamed {
-            return;
-        }
+    /// Show the question and end the run.
+    fn ask_user(&mut self, question: String) -> State {
+        self.reporter.report(AgentEvent::AskUser { question });
 
-        self.reporter
-            .line(format!("\n{ANSI_GREEN_CHECK} {summary}"));
-    }
-
-    /// Execute a parsed tool call; `finish` ends the run, a malformed call is
-    /// sent back to the model to retry.
-    async fn handle_tool_call(&mut self, content: &str, tool_call: ToolCall) -> AgentStepOutcome {
-        match Tool::from_call(tool_call) {
-            Ok(Tool::Finish { summary }) => self.finish(&summary, false),
-            Ok(tool) => self.run_tool(content, tool).await,
-            Err(error) => self.reject_tool_call(content, &error),
-        }
+        State::Done
     }
 
     /// A malformed call does not end the run: report what the model sent,
     /// send the error back as a user message, and continue, so the next
     /// reply can correct the call.
-    fn reject_tool_call(&mut self, content: &str, error: &anyhow::Error) -> AgentStepOutcome {
-        self.reporter.line(format!(
+    fn reject_tool_call(&mut self, content: &str, error: &anyhow::Error) -> State {
+        self.reporter.notice(format!(
             "\n{COLOR_DIM}⚠️  Tool call rejected: {error}\n   model sent: {}{COLOR_RESET}",
             content.trim()
         ));
@@ -284,61 +311,134 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
             ),
         ));
 
-        AgentStepOutcome::Continue
+        State::Ask
     }
 
     /// Push the assistant JSON, execute the tool, push its result, and
     /// continue to the next step.
-    async fn run_tool(&mut self, content: &str, tool: Tool) -> AgentStepOutcome {
+    async fn run_tool(
+        &mut self,
+        content: &str,
+        name: String,
+        arguments: String,
+        tool: Tool,
+    ) -> State {
+        let id = format!("call_{}", self.step);
         self.messages.push(message(Role::Assistant, content));
-        self.reporter.line(format!(
-            "\n{COLOR_MAGENTA}🔧 {}{COLOR_RESET}",
-            tool.describe()
-        ));
+        self.reporter.report(AgentEvent::ToolCall {
+            id: id.clone(),
+            name,
+            arguments,
+        });
 
+        let changes_before = self.changed_files.len();
         let cwd = &self.config.cwd;
-        let changed_files = &mut self.changed_files;
-        let result_text =
-            execute_tool_or_report_error(self.config, cwd, &tool, changed_files, self.confirmer)
-                .await;
-        self.file_work_gate.record_tool_result(&tool, &result_text);
-        self.reporter
-            .line(format!("{COLOR_DIM}{result_text}{COLOR_RESET}"));
+        let report = run_tool_call(
+            self.config,
+            cwd,
+            &tool,
+            &mut self.changed_files,
+            self.confirmer,
+        )
+        .await;
+        let files_changed = self.changed_files.len() > changes_before;
+        self.finish_gate
+            .record_tool_result(&tool, &report.output, files_changed);
 
-        let tool_result = format!("{TOOL_RESULT_PREFIX}\n{result_text}");
+        let tool_result = format!("{TOOL_RESULT_PREFIX}\n{}", report.output);
+        self.reporter.report(AgentEvent::ToolResult {
+            id,
+            success: report.success,
+            summary: report.summary,
+            output: report.output,
+        });
         self.messages.push(message(Role::User, &tool_result));
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
 
-        AgentStepOutcome::Continue
+        State::Ask
     }
 
     /// Neither field is a model failure; surface it and stop cleanly.
-    fn report_empty_reply(&mut self, content: &str) -> AgentStepOutcome {
-        self.reporter.line(format!(
+    fn report_empty_reply(&mut self, content: &str) -> State {
+        self.reporter.notice(format!(
             "\n⚠️  Model returned neither an answer nor a tool call.\n   model sent: {}",
             content.trim()
         ));
 
         if matches!(content.trim(), "" | "{}") {
-            self.reporter.line(format!(
+            self.reporter.notice(format!(
                 "   An empty reply usually means the context window ran out while the \
                  model was thinking; the window was {} tokens.",
                 self.num_ctx
             ));
         }
 
-        AgentStepOutcome::Finished
+        State::Done
     }
 
     /// Report a JSON parse failure and show the raw model output as fallback.
-    fn report_parse_error(&mut self, error: &anyhow::Error, content: &str) -> AgentStepOutcome {
+    fn report_parse_error(&mut self, error: &anyhow::Error, content: &str) -> State {
         self.reporter
-            .line(format!("\n⚠️  Could not parse model JSON: {error}"));
+            .notice(format!("\n⚠️  Could not parse model JSON: {error}"));
         self.reporter
-            .line("Showing raw model output as the final response.".to_string());
-        self.reporter.line(format!("\n{content}"));
+            .notice("Showing raw model output as the final response.".to_string());
+        self.reporter.notice(format!("\n{content}"));
 
-        AgentStepOutcome::Finished
+        State::Done
+    }
+
+    /// Warn that the step budget ran out without an answer.
+    fn give_up(&mut self) -> State {
+        self.reporter.notice(format!(
+            "\n⚠️  Reached max steps ({}) without a final answer.",
+            self.config.max_steps
+        ));
+
+        State::Done
+    }
+}
+
+/// The state for a streamed reply: act on the parsed JSON, or show the raw
+/// text when it is not JSON.
+fn parse_state(content: String, answer_was_streamed: bool) -> State {
+    match parse_agent_response(&content) {
+        Ok(response) => response_state(content, response, answer_was_streamed),
+        Err(error) => State::Unparsable { content, error },
+    }
+}
+
+/// The model may answer, call exactly one tool, or do neither. Matching on
+/// the pair keeps all three outcomes explicit.
+fn response_state(content: String, response: AgentResponse, answer_was_streamed: bool) -> State {
+    match (response.answer, response.tool) {
+        (Some(summary), _) => State::Finish {
+            summary,
+            answer_was_streamed,
+        },
+        (None, Some(call)) => State::CallTool { content, call },
+        (None, None) => State::Empty(content),
+    }
+}
+
+/// The state for a tool call: `finish` and `ask_user` end the run, a
+/// malformed call goes back to the model, any other tool runs.
+fn call_state(content: String, call: ToolCall) -> State {
+    let name = call.name.clone();
+    let arguments = call.arguments.to_string();
+
+    match Tool::from_call(call) {
+        Ok(Tool::Finish { summary }) => State::Finish {
+            summary,
+            answer_was_streamed: false,
+        },
+        Ok(Tool::AskUser { question }) => State::AskUser(question),
+        Ok(tool) => State::RunTool {
+            content,
+            name,
+            arguments,
+            tool,
+        },
+        Err(error) => State::Reject { content, error },
     }
 }
 
@@ -348,13 +448,6 @@ fn message(role: Role, content: &str) -> ChatMessage {
         role,
         content: content.to_string(),
     }
-}
-
-/// The step header with the step number, max steps, and model name.
-fn step_header(step: usize, max_steps: usize, model: &str) -> String {
-    format!(
-        "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max_steps}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}"
-    )
 }
 
 /// Phrases that signal the user wants information about the current workspace
@@ -474,6 +567,7 @@ mod tests {
     use crate::agent::fakes::{
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_replies, test_config,
     };
+    use crate::constants::ansi::ANSI_GREEN_CHECK;
     use std::path::PathBuf;
 
     /// The output of a JSON-loop run of `task` with `max_steps` steps against
@@ -588,13 +682,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shallow_finish_is_blocked_until_steps_run_out() -> Result<()> {
-        let (output, result) =
-            run_with_replies("write a file", 1, &[r#"{"answer":"done"}"#]).await?;
+    async fn a_change_in_a_cargo_project_is_checked_before_finishing() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-json-check");
+        std::fs::write(root.join("Cargo.toml"), "[package]")?;
+        let replies = [
+            r#"{"tool":{"name":"write_file","arguments":{"path":"a.txt","content":"hi"}}}"#,
+            r#"{"answer":"done"}"#,
+        ];
+        let replies = replies.iter().map(|reply| Reply::ollama_stream(reply));
+        let url = serve_replies(replies.collect()).await?;
+        let client = OllamaClient::new(&url)?;
+        let config = test_config(&root, 2);
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_json_agent(
+            &config,
+            &client,
+            "m",
+            "change a.txt",
+            None,
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        assert!(reporter.output.contains("Shallow finish blocked."));
+        assert!(
+            reporter
+                .output
+                .contains("Reached max steps (2) without a final answer.")
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_question_with_work_words_is_answered_at_once() -> Result<()> {
+        let task = "write and add tests for a directory walker, just show the code";
+        let (output, result) = run_with_replies(task, 3, &[r#"{"answer":"use walkdir"}"#]).await?;
 
         result?;
-        assert!(output.contains("Shallow finish blocked."));
-        assert!(output.contains("Reached max steps (1) without a final answer."));
+        assert!(output.contains("use walkdir"));
+        assert!(!output.contains("Shallow finish blocked."));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_ends_the_run_with_the_question() -> Result<()> {
+        let replies = [r#"{"tool":{"name":"ask_user","arguments":{"question":"Which file?"}}}"#];
+
+        let (output, result) = run_with_replies("fix it", 3, &replies).await?;
+
+        result?;
+        assert!(output.contains("❓ Which file?"));
+        assert!(!output.contains("Step 2/3"));
 
         Ok(())
     }

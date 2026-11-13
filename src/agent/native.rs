@@ -16,14 +16,14 @@
 //! - OpenAI function calling: <https://platform.openai.com/docs/guides/function-calling>
 //! - llama.cpp server, router mode: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
-use super::environment::environment_facts;
-use super::execute::{execute_tool_or_report_error, print_changed_files};
-use super::quality::{FileWorkGate, command_succeeded, needs_verification, requires_file_work};
+use super::environment::{environment_facts, project_has_build_manifest};
+use super::execute::{absolute_paths, run_tool_call};
+use super::quality::{FinishGate, command_succeeded};
 use super::research::task_with_documentation;
 use super::tool::{Tool, ToolCall, strip_code_fence};
 use super::{
-    AgentConfig, Confirmer, HistorySink, Reporter, RunContinuation, effective_context,
-    ensure_workspace_exists,
+    AgentConfig, AgentEvent, Confirmer, HistorySink, LoopKind, Reporter, RunContinuation, TextKind,
+    effective_context, ensure_workspace_exists,
 };
 use crate::constants::agent::{
     AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
@@ -38,13 +38,55 @@ use serde_json::{Value, json};
 /// counts as the answer.
 const MAX_EMPTY_RETRIES: u8 = 2;
 
-/// Whether the loop should keep going after one model turn.
-#[derive(Debug, PartialEq, Eq)]
-enum Progress {
-    /// The model answered; stop.
+/// The text of the tool result that answers an `ask_user` call.
+const QUESTION_SHOWN: &str =
+    "The question is shown to the user; their answer follows as the next message.";
+
+/// The states of one native run. [`Run::run`] moves from state to state
+/// until the run is over.
+enum State {
+    /// Start the next step, or give up when the step budget is spent.
+    Ask,
+    /// Stream the model's reply for the current step.
+    Stream,
+    /// The reply has no structured tool calls: run a call written as text, or
+    /// take the text as the answer.
+    Reply(Turn),
+    /// Run the reply's tool calls.
+    RunTools(Turn),
+    /// The reply was empty.
+    EmptyTurn,
+    /// The reply text is the answer.
+    Answer(String),
+    /// The model called `finish` with this summary.
+    Finish(String),
+    /// The model asked the user this question.
+    AskUser(String),
+    /// The step budget ran out before an answer.
+    GiveUp,
+    /// The run is over.
     Done,
-    /// A tool ran, or a shallow finish was rejected; take another step.
-    More,
+}
+
+/// What the tool calls of one turn asked for besides their results.
+#[derive(Default)]
+struct CallOutcome {
+    /// Summary of the last `finish` call.
+    summary: Option<String>,
+    /// Question of the last `ask_user` call.
+    question: Option<String>,
+}
+
+impl CallOutcome {
+    /// Ask the user when a call asked a question, finish when a call
+    /// finished, and take another step otherwise.
+    fn next_state(self) -> State {
+        match (self.question, self.summary) {
+            (Some(question), _) => State::AskUser(question),
+            (None, Some(summary)) => State::Finish(summary),
+            (None, None) => State::Ask,
+        }
+    }
 }
 
 /// One message in the native conversation, mapped to the OpenAI chat shape.
@@ -136,17 +178,17 @@ impl Message {
         }
     }
 
-    /// The text of a user turn.
-    fn user_text(&self) -> Option<&str> {
-        match self {
-            Self::User(text) => Some(text),
-            _ => None,
-        }
-    }
-
     /// True for a tool result.
     fn is_tool_result(&self) -> bool {
         matches!(self, Self::Tool { .. })
+    }
+
+    /// The text of a tool result.
+    fn tool_content(&self) -> Option<&str> {
+        match self {
+            Self::Tool { content, .. } => Some(content),
+            _ => None,
+        }
     }
 }
 
@@ -296,18 +338,11 @@ impl TurnPrinter {
             return;
         }
 
-        self.start_thinking(reporter);
-        reporter.chunk(text);
-    }
-
-    /// Print the reasoning marker before the first reasoning text.
-    fn start_thinking<R: Reporter>(&mut self, reporter: &mut R) {
-        if self.is_thinking {
-            return;
-        }
-
-        reporter.chunk("💭 ");
         self.is_thinking = true;
+        reporter.report(AgentEvent::Text {
+            kind: TextKind::Reasoning,
+            text: text.to_string(),
+        });
     }
 
     /// End the reasoning line, if one is open.
@@ -316,7 +351,7 @@ impl TurnPrinter {
             return;
         }
 
-        reporter.chunk("\n");
+        reporter.report(AgentEvent::TextEnded(TextKind::Reasoning));
         self.is_thinking = false;
     }
 
@@ -324,7 +359,10 @@ impl TurnPrinter {
     fn content<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
         self.end_thinking(reporter);
         self.turn.content.push_str(text);
-        reporter.chunk(text);
+        reporter.report(AgentEvent::Text {
+            kind: TextKind::Answer,
+            text: text.to_string(),
+        });
     }
 
     /// Add tool-call chunks to the turn.
@@ -356,147 +394,122 @@ struct Run<'a, R, C> {
     num_ctx: u64,
     /// Whether the model is asked to think, from `--no-think` on the client.
     think: bool,
-    /// Whether the task asks for file changes.
-    needs_files: bool,
-    /// Whether a successful build/test is expected before the task counts as done.
-    needs_verification: bool,
+    /// Whether the project has a build or test manifest, so changed files
+    /// need a passing check before the run may finish.
+    needs_check: bool,
+    /// Number of the current step; 0 before the first.
+    step: usize,
     /// Number of consecutive empty model turns answered with a nudge message.
     empty_retries: u8,
     /// Conversation sent to the model.
     messages: Vec<Message>,
     /// Files changed by tools so far.
     changed_files: Vec<String>,
-    /// Gate that rejects shallow finishes.
-    finish_gate: FileWorkGate,
+    /// Gate that rejects a finish before changed files are checked.
+    finish_gate: FinishGate,
     /// Sink receiving conversation snapshots, so an interrupted run can resume.
     sink: Option<&'a mut dyn HistorySink>,
-    /// Output sink.
+    /// Receives the run's events.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
     confirmer: &'a mut C,
 }
 
 impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
-    /// Run until the model answers or the step budget is spent.
+    /// Move from state to state until the run is over.
     async fn run(mut self) -> Result<()> {
-        let progress = self.run_steps().await?;
+        let mut state = State::Ask;
 
-        self.report_unfinished(&progress);
-        Ok(())
+        loop {
+            state = match state {
+                State::Ask => self.ask(),
+                State::Stream => self.stream().await?,
+                State::Reply(turn) => self.reply(turn),
+                State::RunTools(turn) => self.run_tools(turn).await,
+                State::EmptyTurn => self.empty_turn(),
+                State::Answer(text) => self.answer(&text),
+                State::Finish(summary) => self.finish(&summary),
+                State::AskUser(question) => self.ask_user(question),
+                State::GiveUp => self.give_up(),
+                State::Done => return Ok(()),
+            };
+        }
     }
 
-    /// Take steps until one is done, fails, or the budget is spent; return
-    /// the last step's progress.
-    async fn run_steps(&mut self) -> Result<Progress> {
-        let mut progress = Ok(Progress::More);
-        let mut steps = 1..=self.config.max_steps;
+    /// Save the conversation and start the next step, or give up when the
+    /// budget is spent.
+    fn ask(&mut self) -> State {
+        self.save_conversation();
+        self.step += 1;
 
-        while let (Ok(Progress::More), Some(step)) = (&progress, steps.next()) {
-            progress = self.step(step).await;
+        if self.step > self.config.max_steps {
+            return State::GiveUp;
         }
 
-        progress
-    }
-
-    /// Warn that the step budget ran out when the last step was not done.
-    fn report_unfinished(&mut self, progress: &Progress) {
-        if *progress == Progress::Done {
-            return;
-        }
-
-        self.reporter.line(format!(
-            "\n⚠️  Reached max steps ({}) without a final answer.",
-            self.config.max_steps
-        ));
-    }
-
-    /// Stream one model turn, act on it, and snapshot the conversation.
-    async fn step(&mut self, step: usize) -> Result<Progress> {
-        self.reporter
-            .line(step_header(step, self.config.max_steps, self.model));
+        self.reporter.report(AgentEvent::StepStarted {
+            step: self.step,
+            max_steps: self.config.max_steps,
+            model: self.model.to_string(),
+            loop_kind: LoopKind::Native,
+        });
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
 
-        let body = request_body(self.model, &self.messages, self.num_ctx, self.think);
-        let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
-            .await
-            .with_context(|| format!("model call failed at step {step}"))?;
-
-        let progress = self.act(turn).await;
-        self.save_conversation();
-        Ok(progress)
+        State::Stream
     }
 
-    /// Run the turn's tool calls, or treat its text as a tool call or the
-    /// answer.
-    async fn act(&mut self, turn: Turn) -> Progress {
-        if turn.calls.is_empty() {
-            return self.act_on_text(turn).await;
-        }
+    /// Stream the model's reply; a reply with tool calls runs them.
+    async fn stream(&mut self) -> Result<State> {
+        let body = request_body(self.model, &self.messages, self.num_ctx, self.think);
 
-        self.tools(turn).await
+        let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
+            .await
+            .with_context(|| format!("model call failed at step {}", self.step))?;
+
+        Ok(state_after_turn(turn))
     }
 
     /// Run a tool call the model wrote as text; otherwise the text is the
     /// answer, or an empty turn.
-    async fn act_on_text(&mut self, turn: Turn) -> Progress {
+    fn reply(&mut self, turn: Turn) -> State {
         let Some(call) = parse_text_tool_call(&turn.content) else {
-            return self.answer_or_nudge(turn.content);
+            return state_for_text(turn.content);
         };
 
         self.reporter
-            .line("\n⚠️ The model wrote its tool call as text; executing it anyway.".to_string());
-        self.tools(Turn {
+            .notice("\n⚠️ The model wrote its tool call as text; executing it anyway.".to_string());
+
+        State::RunTools(Turn {
             calls: vec![call],
             ..turn
         })
-        .await
-    }
-
-    /// Treat non-empty text as the answer and nudge an empty turn.
-    fn answer_or_nudge(&mut self, content: String) -> Progress {
-        if content.trim().is_empty() {
-            return self.handle_empty_turn();
-        }
-
-        self.answer(content)
     }
 
     /// Answer the first two empty turns in a row with a nudge message; the
-    /// next one counts as an empty answer.
-    fn handle_empty_turn(&mut self) -> Progress {
+    /// next one ends the run.
+    fn empty_turn(&mut self) -> State {
         if self.empty_retries >= MAX_EMPTY_RETRIES {
-            return self.answer(String::new());
+            self.reporter
+                .notice("\n⚠️  The model returned an empty reply.".to_string());
+            return self.done();
         }
 
         self.empty_retries += 1;
         self.messages
             .push(Message::User(EMPTY_TURN_NUDGE.to_string()));
         self.reporter
-            .line("\n⚠️ Empty model turn; prompting it to continue with tools.".to_string());
+            .notice("\n⚠️ Empty model turn; prompting it to continue with tools.".to_string());
 
-        Progress::More
+        State::Ask
     }
 
-    /// Treat a turn without tool calls as the final answer.
-    fn answer(&mut self, text: String) -> Progress {
-        let answer = text.trim();
-
-        if answer.is_empty() {
-            self.reporter
-                .line("\n⚠️  The model returned an empty reply.".to_string());
-            return Progress::Done;
-        }
-
-        self.accept_answer(answer)
-    }
-
-    /// End the run with `answer`, unless the finish gate rejects it; a
+    /// End the run with the reply text, unless the finish gate rejects it; a
     /// rejected answer stays in the conversation with the feedback after it.
-    fn accept_answer(&mut self, answer: &str) -> Progress {
+    fn answer(&mut self, text: &str) -> State {
+        let answer = text.trim();
         self.empty_retries = 0;
 
         let Some(feedback) = self.finish_feedback() else {
-            return self.report_done(answer);
+            return self.report_done(answer, true);
         };
 
         self.messages.push(Message::Assistant {
@@ -506,124 +519,165 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         self.reject_finish(feedback)
     }
 
-    /// Execute the tool calls of one turn; a `finish` call ends the run
-    /// unless the finish gate rejects it.
-    async fn tools(&mut self, turn: Turn) -> Progress {
+    /// Run every tool call of the turn, then finish, ask the user, or take
+    /// another step.
+    async fn run_tools(&mut self, turn: Turn) -> State {
+        let mut outcome = CallOutcome::default();
         self.empty_retries = 0;
         self.messages.push(Message::Assistant {
             content: turn.content,
             calls: turn.calls.clone(),
         });
 
-        let Some(summary) = self.execute(&turn.calls).await else {
-            return Progress::More;
-        };
+        for call in &turn.calls {
+            self.execute_one(call, &mut outcome).await;
+        }
 
-        self.finish(&summary)
+        outcome.next_state()
     }
 
     /// End the run with the `finish` summary, unless the finish gate rejects it.
-    fn finish(&mut self, summary: &str) -> Progress {
+    fn finish(&mut self, summary: &str) -> State {
         let Some(feedback) = self.finish_feedback() else {
-            return self.report_done(summary);
+            return self.report_done(summary, false);
         };
 
         self.reject_finish(feedback)
     }
 
+    /// Show the question and end the run; the user's answer resumes it.
+    fn ask_user(&mut self, question: String) -> State {
+        self.reporter.report(AgentEvent::AskUser { question });
+
+        self.done()
+    }
+
+    /// Warn that the step budget ran out without an answer.
+    fn give_up(&mut self) -> State {
+        self.reporter.notice(format!(
+            "\n⚠️  Reached max steps ({}) without a final answer.",
+            self.config.max_steps
+        ));
+
+        State::Done
+    }
+
+    /// Save the conversation and end the run.
+    fn done(&mut self) -> State {
+        self.save_conversation();
+
+        State::Done
+    }
+
     /// Send the gate's feedback to the model and take another step.
-    fn reject_finish(&mut self, feedback: &str) -> Progress {
+    fn reject_finish(&mut self, feedback: &str) -> State {
         self.messages.push(Message::User(feedback.to_string()));
         self.reporter
-            .line("\n⚠️  Finish rejected: the task is not done.".to_string());
+            .notice("\n⚠️  Finish rejected: the task is not done.".to_string());
 
-        Progress::More
+        State::Ask
     }
 
-    /// Print the final summary and the changed files.
-    fn report_done(&mut self, summary: &str) -> Progress {
-        self.reporter.line(format!("\n✅ {summary}"));
-        print_changed_files(&self.config.cwd, &self.changed_files, self.reporter);
+    /// Report the answer and the changed files, and end the run.
+    fn report_done(&mut self, answer: &str, answer_was_streamed: bool) -> State {
+        let changed_files = absolute_paths(&self.config.cwd, &self.changed_files);
 
-        Progress::Done
+        self.reporter.report(AgentEvent::Finished {
+            answer: answer.to_string(),
+            answer_was_streamed,
+            changed_files,
+        });
+
+        self.done()
     }
 
-    /// Run every call, returning the summary of the last `finish` call.
-    async fn execute(&mut self, calls: &[Invocation]) -> Option<String> {
-        let mut summary = None;
-
-        for call in calls {
-            let finish_summary = self.execute_one(call).await;
-            summary = finish_summary.or(summary);
-        }
-
-        summary
-    }
-
-    /// Run one call and append its result to the conversation; returns the
-    /// summary when the call is `finish`.
-    async fn execute_one(&mut self, call: &Invocation) -> Option<String> {
+    /// Run one call and append its result to the conversation; a `finish`
+    /// or `ask_user` call is recorded in `outcome`.
+    async fn execute_one(&mut self, call: &Invocation, outcome: &mut CallOutcome) {
         let id = call_id(call);
 
         match parse_call(call) {
-            Ok(Tool::Finish { summary }) => self.acknowledge_finish(id, summary),
-            Ok(tool) => self.run_tool(id, tool).await,
+            Ok(Tool::Finish { summary }) => {
+                outcome.summary = Some(self.acknowledge_finish(id, summary))
+            }
+            Ok(Tool::AskUser { question }) => {
+                outcome.question = Some(self.acknowledge_question(id, question))
+            }
+            Ok(tool) => self.run_tool(id, call, tool).await,
             Err(error) => self.reject(id, &error),
         }
     }
 
     /// Answer a `finish` call so every call has its result, and return its
     /// summary.
-    fn acknowledge_finish(&mut self, id: String, summary: String) -> Option<String> {
+    fn acknowledge_finish(&mut self, id: String, summary: String) -> String {
         self.messages.push(Message::Tool {
             id,
             content: "acknowledged".to_string(),
         });
 
-        Some(summary)
+        summary
     }
 
-    /// Execute one tool, print its result, and append it to the conversation.
-    async fn run_tool(&mut self, id: String, tool: Tool) -> Option<String> {
-        self.reporter.line(format!("\n🔧 {}", tool.describe()));
-
-        let cwd = &self.config.cwd;
-        let changed_files = &mut self.changed_files;
-        let result =
-            execute_tool_or_report_error(self.config, cwd, &tool, changed_files, self.confirmer)
-                .await;
-        self.finish_gate.record_tool_result(&tool, &result);
-
-        self.reporter.line(result.clone());
+    /// Answer an `ask_user` call so every call has its result, and return the
+    /// question.
+    fn acknowledge_question(&mut self, id: String, question: String) -> String {
         self.messages.push(Message::Tool {
             id,
-            content: result,
+            content: QUESTION_SHOWN.to_string(),
         });
 
-        None
+        question
+    }
+
+    /// Execute one tool, report it, and append its result to the conversation.
+    async fn run_tool(&mut self, id: String, call: &Invocation, tool: Tool) {
+        self.reporter.report(AgentEvent::ToolCall {
+            id: id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+
+        let changes_before = self.changed_files.len();
+        let cwd = &self.config.cwd;
+        let report = run_tool_call(
+            self.config,
+            cwd,
+            &tool,
+            &mut self.changed_files,
+            self.confirmer,
+        )
+        .await;
+        let files_changed = self.changed_files.len() > changes_before;
+        self.finish_gate
+            .record_tool_result(&tool, &report.output, files_changed);
+
+        self.reporter.report(AgentEvent::ToolResult {
+            id: id.clone(),
+            success: report.success,
+            summary: report.summary,
+            output: report.output.clone(),
+        });
+        self.messages.push(Message::Tool {
+            id,
+            content: report.output,
+        });
     }
 
     /// Record a rejected call so the model can retry it.
-    fn reject(&mut self, id: String, error: &anyhow::Error) -> Option<String> {
+    fn reject(&mut self, id: String, error: &anyhow::Error) {
         self.reporter
-            .line(format!("\n⚠️  Tool call rejected: {error}"));
+            .notice(format!("\n⚠️  Tool call rejected: {error}"));
         self.messages.push(Message::Tool {
             id,
             content: format!("Error: {error}. Retry with the exact argument names."),
         });
-
-        None
     }
 
     /// The finish gate's feedback when a finish now would be premature;
     /// `None` when the finish may pass.
     fn finish_feedback(&mut self) -> Option<&'static str> {
-        self.finish_gate.reject_finish(
-            self.needs_files,
-            self.config.is_read_only,
-            self.changed_files.len(),
-            self.needs_verification,
-        )
+        self.finish_gate.reject_finish(self.needs_check)
     }
 
     /// Send the current conversation to the snapshot sink, if one is attached.
@@ -634,6 +688,22 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
         let snapshot: Vec<Value> = self.messages.iter().map(Message::to_json).collect();
         sink.save(snapshot);
+    }
+}
+
+/// The state after a streamed turn: run its tool calls, or read its text.
+fn state_after_turn(turn: Turn) -> State {
+    match turn.calls.is_empty() {
+        true => State::Reply(turn),
+        false => State::RunTools(turn),
+    }
+}
+
+/// The state for a reply without tool calls: blank text is an empty turn.
+fn state_for_text(text: String) -> State {
+    match text.trim().is_empty() {
+        true => State::EmptyTurn,
+        false => State::Answer(text),
     }
 }
 
@@ -671,21 +741,20 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
 
     let opening_task = opening_task(task, config, resuming, reporter).await;
     let messages = seed_messages(config, &opening_task, think, resume);
-    let needs_files = needs_file_work(task, resuming, &messages);
 
-    // Carry the prior run's state forward so the gate does not demand work
-    // that was already done before the interrupt.
+    // Carry the prior run's state forward so the gate does not demand a
+    // check that already passed before the interrupt.
     let changed_files = previously_changed_files(&messages);
     let finish_gate = gate_for_run(&messages);
 
-    let mut run = Run {
+    let run = Run {
         config,
         client,
         model,
         num_ctx: effective_context(config.model_context, config.max_ctx),
         think,
-        needs_files,
-        needs_verification: needs_verification(needs_files, &config.cwd),
+        needs_check: project_has_build_manifest(&config.cwd),
+        step: 0,
         empty_retries: 0,
         messages,
         changed_files,
@@ -694,7 +763,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         reporter,
         confirmer,
     };
-    run.save_conversation();
+
     run.run().await
 }
 
@@ -712,19 +781,6 @@ async fn opening_task<R: Reporter>(
     }
 
     task_with_documentation(task, config, reporter).await
-}
-
-/// Whether the task asks for file changes. A resumed run reads the task in
-/// its first user message; `task` is then the user's correction.
-fn needs_file_work(task: &str, resuming: bool, messages: &[Message]) -> bool {
-    if !resuming {
-        return requires_file_work(task);
-    }
-
-    messages
-        .iter()
-        .find_map(Message::user_text)
-        .is_some_and(|text| requires_file_work(task_part(text)))
 }
 
 /// The opening messages: the stored conversation plus the new task when
@@ -751,24 +807,28 @@ fn fresh_messages(config: &AgentConfig, task: &str, think: bool) -> Vec<Message>
     ]
 }
 
-/// The finish gate for a run, carrying a resumed run's verification state
-/// forward when its history already shows a successful command.
-fn gate_for_run(messages: &[Message]) -> FileWorkGate {
-    let mut gate = FileWorkGate::default();
+/// The finish gate for a run, replaying a resumed run's history: a file
+/// written there needs a passing check after it, as in a fresh run.
+fn gate_for_run(messages: &[Message]) -> FinishGate {
+    let mut gate = FinishGate::default();
 
-    if verified_in_history(messages) {
-        gate.record_verification();
+    for message in messages {
+        gate.record(writes_a_file(message), reports_a_passing_command(message));
     }
 
     gate
 }
 
-/// True when a tool result in the conversation reports a zero exit code.
-fn verified_in_history(messages: &[Message]) -> bool {
-    messages.iter().any(|message| match message {
-        Message::Tool { content, .. } => command_succeeded(content),
-        _ => false,
-    })
+/// True for an assistant turn that calls `write_file` or `edit_file`.
+fn writes_a_file(message: &Message) -> bool {
+    message
+        .calls()
+        .is_some_and(|calls| calls.iter().any(|call| written_path(call).is_some()))
+}
+
+/// True for a tool result that reports a zero exit code.
+fn reports_a_passing_command(message: &Message) -> bool {
+    message.tool_content().is_some_and(command_succeeded)
 }
 
 /// Files the prior conversation already wrote, so a resumed run's finish gate
@@ -809,15 +869,6 @@ fn written_path(call: &Invocation) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The task inside a first user message: what follows its `Task:` heading,
-/// without the environment facts and, with thinking off, the system prompt
-/// in front of it. Their words ("write", "tests") are not the user's request.
-fn task_part(message: &str) -> &str {
-    message
-        .rsplit_once(TASK_HEADING)
-        .map_or(message, |(_, task)| task)
-}
-
 /// The heading [`initial_user_message`] puts before the task.
 const TASK_HEADING: &str = "\n\nTask:\n";
 
@@ -839,11 +890,6 @@ fn initial_user_message(config: &AgentConfig, task: &str, think: bool) -> String
         true => task,
         false => format!("Instructions (highest priority):\n{NATIVE_SYSTEM_PROMPT}\n\n{task}"),
     }
-}
-
-/// Header printed before each model turn.
-fn step_header(step: usize, max_steps: usize, model: &str) -> String {
-    format!("\n── step {step}/{max_steps} ── {model}")
 }
 
 /// The id for a call: the server's, or a synthesized one when it omitted it.
@@ -1140,6 +1186,20 @@ fn tools_schema() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "ask_user",
+                "description": "Ask the user one short question when the request is unclear and the workspace cannot settle it. The run stops; the user's reply arrives as the next message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string", "description": "The question, in plain words." }
+                    },
+                    "required": ["question"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "finish",
                 "description": "Signal that the task is complete. Call it only after the work is done and verified.",
                 "parameters": {
@@ -1236,32 +1296,6 @@ mod tests {
 
         std::fs::remove_dir_all(root)?;
         Ok(outcome)
-    }
-
-    #[test]
-    fn the_file_change_check_reads_the_task_not_the_wrapping() {
-        let wrapped = format!(
-            "Instructions (highest priority):\nwrite tests and fix bugs\n\nWorkspace root: /w\n\nEnvironment:\nrust{TASK_HEADING}Read src/lib.rs and say what it returns."
-        );
-
-        assert_eq!(
-            task_part(&wrapped),
-            "Read src/lib.rs and say what it returns."
-        );
-        assert!(!requires_file_work(task_part(&wrapped)));
-        assert!(requires_file_work(&wrapped));
-    }
-
-    #[test]
-    fn a_resumed_run_reads_file_work_from_the_first_user_turn() {
-        let messages = [
-            Message::System("rules".to_string()),
-            Message::User(format!("facts{TASK_HEADING}write the parser")),
-        ];
-
-        assert!(needs_file_work("thanks", true, &messages));
-        assert!(!needs_file_work("thanks", false, &messages));
-        assert!(!needs_file_work("thanks", true, &[]));
     }
 
     #[test]
@@ -1423,6 +1457,8 @@ mod tests {
             "edit_file",
             "run_command",
             "read_file",
+            "ask_user",
+            "finish",
         ] {
             assert!(names.contains(&name), "{name} is missing");
         }
@@ -1593,17 +1629,26 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_command_in_history_seeds_the_gate() {
-        let messages = vec![Message::Tool {
+    fn the_gate_replays_writes_and_checks_from_history() {
+        let write = Invocation {
             id: "c1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path":"a.rs","content":"x"}"#.to_string(),
+        };
+        let written = Message::Assistant {
+            content: String::new(),
+            calls: vec![write],
+        };
+        let passed = Message::Tool {
+            id: "c2".to_string(),
             content: "compiled\n[exit code 0]\n".to_string(),
-        }];
+        };
 
-        let mut gate = gate_for_run(&messages);
-        assert_eq!(gate.reject_finish(true, false, 2, true), None);
+        let mut checked = gate_for_run(&[written.clone(), passed]);
+        assert_eq!(checked.reject_finish(true), None);
 
-        let mut fresh = gate_for_run(&[Message::User("task".to_string())]);
-        assert!(fresh.reject_finish(true, false, 2, true).is_some());
+        let mut unchecked = gate_for_run(&[written, Message::User("task".to_string())]);
+        assert!(unchecked.reject_finish(true).is_some());
     }
 
     #[tokio::test]
@@ -1619,15 +1664,28 @@ mod tests {
             ])
         };
 
+        let native_step = || AgentEvent::StepStarted {
+            step: 1,
+            max_steps: 1,
+            model: "m".to_string(),
+            loop_kind: LoopKind::Native,
+        };
+
         let mut shown = RecordingReporter::default();
+        shown.report(native_step());
         let turn = collect_turn(deltas(), &mut shown, true).await?;
-        assert_eq!(shown.output, "💭 plan more\nHi💭 again\n💭 last\n");
+        assert!(
+            shown
+                .output
+                .ends_with(" m\n💭 plan more\nHi💭 again\n💭 last\n")
+        );
         assert_eq!(turn.content, "Hi");
         assert_eq!(turn.calls.len(), 1);
 
         let mut hidden = RecordingReporter::default();
+        hidden.report(native_step());
         collect_turn(deltas(), &mut hidden, false).await?;
-        assert_eq!(hidden.output, "Hi");
+        assert!(hidden.output.ends_with(" m\nHi"));
 
         Ok(())
     }
@@ -1731,14 +1789,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn premature_answers_and_finishes_are_rejected() -> Result<()> {
-        let finish = tool_call_delta("c1", "finish", &json!({"summary": "done"}));
+    async fn a_change_in_a_cargo_project_is_checked_before_finishing() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-check");
+        std::fs::write(root.join("Cargo.toml"), "[package]")?;
+        let write = json!({"path": "a.txt", "content": "hello"});
+        let finish = tool_call_delta("c2", "finish", &json!({"summary": "done"}));
         let replies = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "write_file", &write)]),
             Reply::openai_stream(&[text_delta("all done")]),
             Reply::openai_stream(&[finish]),
         ];
 
-        let (output, result) = run_with_replies("write a file", 2, replies).await?;
+        let (output, result) = run_in(&root, "change a.txt", 3, replies).await?;
 
         result?;
         assert_eq!(
@@ -1747,8 +1809,75 @@ mod tests {
                 .count(),
             2
         );
-        assert!(output.contains("Reached max steps (2) without a final answer."));
+        assert!(output.contains("Reached max steps (3) without a final answer."));
 
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_question_with_work_words_is_answered_at_once() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-question");
+        std::fs::write(root.join("Cargo.toml"), "[package]")?;
+        let code = "```rust\nfn main() {}\n```";
+        let finish = tool_call_delta("c1", "finish", &json!({"summary": code}));
+        let task = "show me how to write and add tests for a directory walker, just the code";
+
+        let (output, result) =
+            run_in(&root, task, 3, vec![Reply::openai_stream(&[finish])]).await?;
+
+        result?;
+        assert!(output.contains("✅ ```rust"));
+        assert!(!output.contains("🔧"));
+        assert!(!output.contains("Finish rejected"));
+
+        let answered = vec![Reply::openai_stream(&[text_delta("Use walkdir.")])];
+        let (output, result) = run_in(&root, task, 3, answered).await?;
+
+        result?;
+        assert!(output.contains("✅ Use walkdir."));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ask_user_ends_the_run_after_one_model_call() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-ask");
+        let ask = tool_call_delta("c1", "ask_user", &json!({"question": "Which file?"}));
+        let url = serve_replies(vec![Reply::openai_stream(&[ask])]).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let config = test_config(&root, 5);
+        let mut sink = RecordingSink::default();
+        let continuation = RunContinuation {
+            messages: None,
+            sink: Some(&mut sink),
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "fix it",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let question = AgentEvent::AskUser {
+            question: "Which file?".to_string(),
+        };
+        assert_eq!(reporter.events.last(), Some(&question));
+        assert!(reporter.output.contains("❓ Which file?"));
+        assert!(!reporter.output.contains("step 2/5"));
+        let last = sink.snapshots.last().context("a saved conversation")?;
+        assert_eq!(last.len(), 4);
+        assert_eq!(last[3]["content"], QUESTION_SHOWN);
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -1,8 +1,8 @@
 //! Test doubles for the agent loops: a local HTTP server that replays canned
-//! model replies, a reporter that records its output, a confirmer with a
+//! model replies, a reporter that records its events, a confirmer with a
 //! fixed answer, and a history sink that keeps every snapshot.
 
-use super::{AgentConfig, Confirmer, HistorySink, Reporter};
+use super::{AgentConfig, AgentEvent, Confirmer, HistorySink, Reporter, StdoutReporter};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -160,23 +160,24 @@ async fn write_reply(mut socket: TcpStream, reply: &Reply) -> Result<()> {
     socket.shutdown().await.context("close the fake connection")
 }
 
-/// Records everything reported, lines and chunks, as one text.
+/// Records every event, and the text the stdout reporter would print for it.
 #[derive(Default)]
 pub(super) struct RecordingReporter {
-    /// Every line, followed by a newline, and every chunk, in order.
+    /// Every event, in order.
+    pub(super) events: Vec<AgentEvent>,
+    /// The one-shot CLI output for the events, in order.
     pub(super) output: String,
+    /// Renders the events in the one-shot CLI style.
+    printer: StdoutReporter,
 }
 
 impl Reporter for RecordingReporter {
-    /// Append `msg` and a newline.
-    fn line(&mut self, msg: String) {
-        self.output.push_str(&msg);
-        self.output.push('\n');
-    }
+    /// Keep `event` and its printed text.
+    fn report(&mut self, event: AgentEvent) {
+        let printed = self.printer.render(event.clone());
 
-    /// Append `msg`.
-    fn chunk(&mut self, msg: &str) {
-        self.output.push_str(msg);
+        self.output.push_str(&printed);
+        self.events.push(event);
     }
 }
 

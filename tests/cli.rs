@@ -132,6 +132,22 @@ fn tool_call_chat() -> (u16, String) {
     }
 }
 
+/// A chat reply with one `ask_user` call, as an OpenAI server streams it.
+const ASK_USER_STREAM: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+    "\"type\":\"function\",\"function\":{\"name\":\"ask_user\",",
+    "\"arguments\":\"{\\\"question\\\":\\\"Which file?\\\"}\"}}]}}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// An OpenAI server whose model answers every chat request with a question.
+fn ask_user_route(path: &str) -> (u16, String) {
+    match path {
+        "/v1/models" => (200, r#"{"data":[{"id":"gemma"}]}"#.to_string()),
+        _ => (200, ASK_USER_STREAM.to_string()),
+    }
+}
+
 /// Path of the compiled binary under test.
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_openbatrangs")
@@ -351,6 +367,31 @@ fn confirm_runs_the_command_after_y() -> Result<()> {
 
     assert!(printed.contains("[y/N]"), "stdout: {printed}");
     assert!(printed.contains("confirmed-by-y"), "stdout: {printed}");
+    Ok(())
+}
+
+/// A question from the model ends a one-shot run: it is printed, and the
+/// run exits with code 0 so a script can read it.
+#[test]
+fn a_question_from_the_model_is_printed_and_exits_cleanly() -> Result<()> {
+    let server = MockServer::start(ask_user_route)?;
+    let openai_url = format!("{}/v1", server.url());
+    let workspace_arg = empty_workspace("ask-user")?;
+
+    let output = run(&[
+        "--openai-url",
+        &openai_url,
+        "--cwd",
+        &workspace_arg,
+        "fix",
+        "the",
+        "bug",
+    ])?;
+    let printed = stdout(&output);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(printed.contains("❓ Which file?"), "stdout: {printed}");
+    assert!(!printed.contains("step 2/"), "stdout: {printed}");
     Ok(())
 }
 

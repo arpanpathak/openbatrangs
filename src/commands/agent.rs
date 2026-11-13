@@ -52,7 +52,7 @@ async fn run_agent_task(
     println!("{}", run_summary(&model, config, model_context));
 
     let agent_config = agent_config(config, model_context);
-    let mut reporter = agent::StdoutReporter;
+    let mut reporter = agent::StdoutReporter::default();
     let mut confirmer = agent::StdioConfirmer;
 
     agent::run_agent(

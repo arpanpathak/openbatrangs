@@ -5,8 +5,8 @@
 //! in one place:
 //!
 //! - [`strip_ansi`] removes terminal escapes so the chat log stores plain text.
-//! - [`text_wrapped_height`] / [`wrap_text_to_lines`] compute visual wrapping
-//!   for Unicode-safe layout.
+//! - [`text_wrapped_height`] / [`wrap_text_to_lines`] / [`wrap_spans`]
+//!   compute visual wrapping for Unicode-safe layout.
 //! - [`extract_path_from_line`] lets users click a file path in the chat.
 //!
 //! ## References
@@ -15,6 +15,8 @@
 //! - Unicode grapheme clusters: <https://www.unicode.org/reports/tr29/>
 //! - Ratatui wrapping: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::Chars;
@@ -160,19 +162,90 @@ fn fits_on_row(row_width: usize, grapheme_width: usize, max_text_width: usize) -
     row_width == 0 || row_width + grapheme_width <= max_text_width
 }
 
-/// Map every visual row of `text` back to its source line index.
-///
-/// This keeps mouse hit-testing and scrollbar math correct when chat lines wrap.
-pub(crate) fn chat_visual_line_indices(text: &str, max_text_width: usize) -> Vec<usize> {
-    let max_text_width = max_text_width.max(1);
-    let mut indices = Vec::new();
+/// Hard-wrap styled `spans` into rows of at most `max_text_width` cells,
+/// keeping each grapheme's style. Empty input gives one empty row.
+pub(crate) fn wrap_spans(
+    spans: Vec<Span<'static>>,
+    max_text_width: usize,
+) -> Vec<Vec<Span<'static>>> {
+    let mut rows = StyledRows::new(max_text_width.max(1));
 
-    for (index, line) in text.split('\n').enumerate() {
-        let rows = wrapped_line_count(line.width(), max_text_width);
-        indices.extend(std::iter::repeat_n(index, rows));
+    for span in spans {
+        rows.push_span(&span);
     }
 
-    indices
+    rows.finish()
+}
+
+/// The display width of `spans`, in cells.
+pub(crate) fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.width()).sum()
+}
+
+/// The text of `spans`, without styles.
+pub(crate) fn spans_text(spans: &[Span<'_>]) -> String {
+    spans.iter().map(|span| span.content.as_ref()).collect()
+}
+
+/// Styled rows built so far while wrapping.
+struct StyledRows {
+    /// Width of a row, in cells.
+    max_text_width: usize,
+    /// Rows that are already full.
+    full_rows: Vec<Vec<Span<'static>>>,
+    /// The row being filled.
+    row: Vec<Span<'static>>,
+    /// Display width of `row` in cells.
+    row_width: usize,
+}
+
+impl StyledRows {
+    /// No rows yet.
+    fn new(max_text_width: usize) -> Self {
+        Self {
+            max_text_width,
+            full_rows: Vec::new(),
+            row: Vec::new(),
+            row_width: 0,
+        }
+    }
+
+    /// Add every grapheme of `span`.
+    fn push_span(&mut self, span: &Span<'_>) {
+        for grapheme in span.content.graphemes(true) {
+            self.push_grapheme(grapheme, span.style);
+        }
+    }
+
+    /// Add one grapheme, starting a new row first when it does not fit.
+    fn push_grapheme(&mut self, grapheme: &str, style: Style) {
+        let grapheme_width = grapheme.width();
+
+        if !fits_on_row(self.row_width, grapheme_width, self.max_text_width) {
+            self.full_rows.push(std::mem::take(&mut self.row));
+            self.row_width = 0;
+        }
+
+        self.append(grapheme, style);
+        self.row_width += grapheme_width;
+    }
+
+    /// Append `grapheme` to the last span when it has the same style, else
+    /// start a new span.
+    fn append(&mut self, grapheme: &str, style: Style) {
+        let last_span = self.row.last_mut().filter(|last| last.style == style);
+
+        match last_span {
+            Some(last) => last.content.to_mut().push_str(grapheme),
+            None => self.row.push(Span::styled(grapheme.to_string(), style)),
+        }
+    }
+
+    /// All rows, including the last partly filled one.
+    fn finish(mut self) -> Vec<Vec<Span<'static>>> {
+        self.full_rows.push(self.row);
+        self.full_rows
+    }
 }
 
 /// Split a slash-command line into its name and argument parts.
@@ -279,8 +352,19 @@ mod tests {
     }
 
     #[test]
-    fn visual_line_indices_map_wrapped_rows_to_sources() {
-        assert_eq!(chat_visual_line_indices("aaaaaa\nbb", 3), vec![0, 0, 1]);
+    fn styled_spans_wrap_and_keep_their_styles() {
+        let bold = Style::new().add_modifier(ratatui::style::Modifier::BOLD);
+        let spans = vec![Span::raw("ab"), Span::styled("cde", bold), Span::raw("f")];
+
+        let rows = wrap_spans(spans, 3);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(spans_text(&rows[0]), "abc");
+        assert_eq!(rows[0][1].style, bold);
+        assert_eq!(spans_text(&rows[1]), "def");
+        assert_eq!(rows[1].len(), 2, "same-style graphemes share a span");
+        assert_eq!(spans_width(&rows[1]), 3);
+        assert_eq!(wrap_spans(Vec::new(), 0), vec![Vec::new()]);
     }
 
     #[test]

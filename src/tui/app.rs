@@ -1,19 +1,19 @@
 //! TUI application state and event handling.
 
-use super::chat::ChatRenderCache;
-use super::scroll::is_inside_track;
-use super::session::SessionLog;
+use super::block::BlockContent;
+use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
+use super::transcript::{Focus, RowHit, Transcript};
 use super::worker::send_event;
 use super::{
-    ScrollMode, UiEvent, WorkerHistory, chat_visual_line_indices, extract_path_from_line,
-    open_in_vim, run_agent_worker,
+    ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
+use crate::agent::{AgentEvent, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
-    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
-    MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_CHAT_HISTORY_MESSAGES, MAX_TRANSCRIPT_BLOCKS, SPINNER,
+    STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
 use crate::perf::{PerfMonitor, SystemStats};
@@ -84,6 +84,38 @@ enum KeyTarget {
     Picker,
     /// The input line.
     Input,
+    /// The transcript, focused with Tab.
+    Transcript,
+}
+
+/// Which pane receives keys when no dialog is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FocusArea {
+    /// The input box: keys edit the message.
+    Input,
+    /// The transcript: arrows move between blocks, Enter folds.
+    Transcript,
+}
+
+/// What a key press does while the transcript has the focus.
+#[derive(Debug, PartialEq)]
+enum TranscriptKey {
+    /// Cancel the running task (Ctrl+C).
+    Cancel,
+    /// Focus the part above.
+    Up,
+    /// Focus the part below.
+    Down,
+    /// Fold or unfold the focused part (Enter or Space).
+    Toggle,
+    /// Give the focus back to the input box (Tab or Esc).
+    Leave,
+    /// Scroll the chat up one page.
+    PageUp,
+    /// Scroll the chat down one page.
+    PageDown,
+    /// Do nothing.
+    Ignore,
 }
 
 /// What a key press does in the input line.
@@ -115,7 +147,8 @@ enum InputAction {
     PageUp,
     /// Scroll the chat down one page.
     PageDown,
-    /// Accept the highlighted suggestion (Tab).
+    /// Accept the highlighted suggestion, or focus the transcript when
+    /// there is none (Tab).
     Complete,
     /// Submit the input as a task or slash command.
     Submit,
@@ -161,10 +194,13 @@ enum PickerKey {
 ///
 /// - Elm Architecture for UI state: <https://guide.elm-lang.org/architecture/>
 pub(super) struct App {
-    /// Bounded, disk-backed chat log that stores every message in the session.
-    pub(super) log: SessionLog,
-    /// In-progress streaming output not yet flushed to the log.
-    pub(super) live: String,
+    /// Transcript blocks: a bounded window in memory, the rest on disk.
+    pub(super) transcript: Transcript,
+    /// Answer text streamed during the current task, saved to the chat
+    /// history when the task ends in chat mode.
+    pub(super) reply: String,
+    /// Which pane receives keys when no dialog is open.
+    pub(super) focus_area: FocusArea,
     /// Current text in the input box being composed by the user.
     pub(super) input: String,
     /// Byte offset of the text cursor within `input`.
@@ -242,8 +278,6 @@ pub(super) struct App {
     /// When the last chunk arrived; a longer gap than [`STREAM_GAP`] starts a
     /// new rate window, so time spent running tools is not counted as streaming.
     pub(super) last_chunk_at: Option<Instant>,
-    /// Cache of the last syntax-highlighted chat rendering result.
-    pub(super) chat_render: ChatRenderCache,
     /// Terminal emulators tried, in order, when a clicked file opens in vim.
     pub(super) editor_terminals: &'static [&'static str],
 }
@@ -261,8 +295,9 @@ impl App {
     /// A fully initialized `App` ready for the event loop.
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
         Self {
-            log: SessionLog::new(MAX_LOG_LINES),
-            live: String::new(),
+            transcript: Transcript::new(MAX_TRANSCRIPT_BLOCKS),
+            reply: String::new(),
+            focus_area: FocusArea::Input,
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -312,7 +347,6 @@ impl App {
             rate_window_chars: 0,
             rate_window_start: None,
             last_chunk_at: None,
-            chat_render: ChatRenderCache::new(),
             editor_terminals: VIM_TERMINALS,
         }
     }
@@ -435,14 +469,14 @@ impl App {
         }
     }
 
-    /// Move any in-progress streaming text from `live` into the persistent log.
-    ///
-    /// Called before appending a new log line so the streaming output and the
-    /// new message appear in the correct order.
-    pub(super) fn flush_live(&mut self) {
-        if !self.live.is_empty() {
-            self.log.push(std::mem::take(&mut self.live));
-        }
+    /// Show one notice line in the transcript.
+    pub(super) fn notice(&mut self, line: String) {
+        self.transcript.push_notice(vec![line]);
+    }
+
+    /// Show several notice lines in the transcript, as one block.
+    pub(super) fn notice_lines(&mut self, lines: Vec<String>) {
+        self.transcript.push_notice(lines);
     }
 
     /// Return the current spinner glyph based on the animation frame counter.
@@ -478,6 +512,7 @@ impl App {
         self.last_action.clear();
         self.scroll_mode = ScrollMode::Follow;
         self.reset_stream_metrics();
+        self.reply.clear();
         self.remember_chat_turn(Role::User, task.clone());
 
         let prior = WorkerHistory {
@@ -542,7 +577,7 @@ impl App {
     ) {
         match event {
             UiEvent::Log(line) => self.on_log(line),
-            UiEvent::Chunk(chunk) => self.on_chunk(&chunk),
+            UiEvent::Agent(agent_event) => self.on_agent_event(agent_event),
             UiEvent::History(messages) => self.agent_conversation = Some(messages),
             UiEvent::Done(result) => self.on_done(result, client, tx),
             UiEvent::PullDone { name, result } => self.on_pull_done(&name, result),
@@ -553,28 +588,54 @@ impl App {
         }
     }
 
-    /// Append a worker log line after any streamed text, and remember tool
-    /// calls (lines starting with 🔧) as the current action.
+    /// Show a worker status line.
     fn on_log(&mut self, line: String) {
-        self.note_tool_action(&line);
-        self.flush_live();
-
         if !line.is_empty() {
-            self.log.push(line);
+            self.notice(line);
         }
     }
 
-    /// Show a tool-call line as the current action in the status bar.
-    fn note_tool_action(&mut self, line: &str) {
-        if line.starts_with("🔧") {
-            self.last_action = line.trim().to_string();
+    /// Show an agent event in the transcript, and track what it means for
+    /// the status bar, the token rate and the chat history.
+    fn on_agent_event(&mut self, event: AgentEvent) {
+        match &event {
+            AgentEvent::Text {
+                kind: TextKind::Answer,
+                text,
+            } => self.on_answer_text(text),
+            AgentEvent::Text { text, .. } => self.measure_text(text),
+            AgentEvent::ToolCall {
+                name, arguments, ..
+            } => self.last_action = format!("🔧 {}", describe_call(name, arguments)),
+            AgentEvent::AskUser { question } => self.on_question(question),
+            AgentEvent::StepStarted { .. }
+            | AgentEvent::TextEnded(_)
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::Notice(_)
+            | AgentEvent::Finished { .. } => {}
         }
+
+        self.transcript.apply(event);
     }
 
-    /// Add a streamed chunk to the live output and update the token rate.
-    fn on_chunk(&mut self, chunk: &str) {
+    /// Count streamed answer text and keep it for the chat history.
+    fn on_answer_text(&mut self, text: &str) {
+        self.measure_text(text);
+        self.reply.push_str(text);
+    }
+
+    /// Treat the user's next message as the answer to `question`: it
+    /// continues the run, the same way a correction after Ctrl+C does.
+    fn on_question(&mut self, question: &str) {
+        let prompt = self.current_prompt.clone().unwrap_or_default();
+
+        self.interrupted_task = Some(format!("{prompt}\n\nYou asked the user: {question}"));
+    }
+
+    /// Update the token rate for streamed `text`.
+    fn measure_text(&mut self, text: &str) {
         let now = Instant::now();
-        let chunk_chars = chunk.chars().count() as u64;
+        let chunk_chars = text.chars().count() as u64;
 
         self.stream_started_at = self.stream_started_at.or(Some(now));
         self.stream_chars += chunk_chars;
@@ -582,8 +643,6 @@ impl App {
         let window_start = self.rate_window_start_at(now);
         self.rate_window_chars += chunk_chars;
         self.update_token_rate(now, window_start);
-
-        self.append_live(chunk);
     }
 
     /// Start of the rate-measurement window that a chunk arriving at `now`
@@ -621,22 +680,6 @@ impl App {
         self.open_rate_window(now);
     }
 
-    /// Append streamed text to the live output.
-    ///
-    /// Overflow spills into the disk-backed log instead of being truncated,
-    /// so long code is never silently lost.
-    fn append_live(&mut self, chunk: &str) {
-        self.live.push_str(chunk);
-
-        if self.live.len() <= MAX_LIVE_CHARS {
-            return;
-        }
-
-        let overflow = std::mem::take(&mut self.live);
-        self.log.push(overflow);
-        self.log.push("… (output continued)".to_string());
-    }
-
     /// Finish an agent task: save the reply, log the result, and start the
     /// next queued task.
     fn on_done(
@@ -646,7 +689,8 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         self.current_task = None;
-        self.agent_conversation = None;
+        self.forget_conversation_unless_asked();
+        self.transcript.finish_running_step();
 
         self.save_assistant_reply();
         self.log_task_result(result);
@@ -656,25 +700,30 @@ impl App {
         self.start_next_queued_task(client, tx);
     }
 
-    /// Move the streamed reply into the log, and into the chat history in chat mode.
+    /// Drop the stored conversation, unless the run asked the user a
+    /// question: then the next message answers it and continues the run.
+    fn forget_conversation_unless_asked(&mut self) {
+        if self.interrupted_task.is_none() {
+            self.agent_conversation = None;
+        }
+    }
+
+    /// Keep the streamed reply in the chat history in chat mode.
     fn save_assistant_reply(&mut self) {
-        let reply = std::mem::take(&mut self.live);
+        let reply = std::mem::take(&mut self.reply);
 
         if reply.is_empty() {
             return;
         }
 
-        self.log.push(reply.clone());
         self.remember_chat_turn(Role::Assistant, reply);
     }
 
     /// Log how an agent task ended.
     fn log_task_result(&mut self, result: Result<(), String>) {
         match result {
-            Ok(()) => self
-                .log
-                .push_lines(vec![String::new(), "✅ Agent finished.".to_string()]),
-            Err(error) => self.log.push(format!("⚠️ {error}")),
+            Ok(()) => self.notice_lines(vec![String::new(), "✅ Agent finished.".to_string()]),
+            Err(error) => self.notice(format!("⚠️ {error}")),
         }
     }
 
@@ -690,7 +739,7 @@ impl App {
             return;
         };
 
-        self.log.push("▶️  Starting next queued task.".to_string());
+        self.notice("▶️  Starting next queued task.".to_string());
         self.start_task(next, resume, client, tx);
     }
 
@@ -707,7 +756,7 @@ impl App {
             Err(error) => vec![format!("❌ Failed to pull model '{name}': {error}")],
         };
 
-        self.log.push_lines(lines);
+        self.notice_lines(lines);
     }
 
     /// Finish a `/setup` and log its result.
@@ -719,7 +768,7 @@ impl App {
             Err(error) => vec![format!("⚠️ Setup failed: {error}")],
         };
 
-        self.log.push_lines(lines);
+        self.notice_lines(lines);
     }
 
     /// Mark a background pull or setup as finished and the app as ready.
@@ -761,12 +810,14 @@ impl App {
             KeyTarget::Confirmation => self.handle_confirmation_key(key, client, tx),
             KeyTarget::Picker => self.handle_picker_key(key, client).await,
             KeyTarget::Input => self.handle_input_key(key, client, tx).await,
+            KeyTarget::Transcript => self.handle_transcript_key(key, client, tx),
         }
 
         self.should_quit
     }
 
-    /// Where `key` goes: nowhere for a release, else the open modal or the input.
+    /// Where `key` goes: nowhere for a release, else the open modal, or the
+    /// focused pane.
     ///
     /// `setup_terminal` pushes `REPORT_EVENT_TYPES`, so terminals that speak
     /// the kitty keyboard protocol deliver a Press *and* a Release event for
@@ -776,11 +827,12 @@ impl App {
     fn key_target(&self, key: &KeyEvent) -> KeyTarget {
         let is_press = matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat);
 
-        match (is_press, &self.modal) {
-            (false, _) => KeyTarget::Ignored,
-            (true, Some(ActiveModal::Confirm(_))) => KeyTarget::Confirmation,
-            (true, Some(ActiveModal::Picker(_))) => KeyTarget::Picker,
-            (true, None) => KeyTarget::Input,
+        match (is_press, &self.modal, self.focus_area) {
+            (false, _, _) => KeyTarget::Ignored,
+            (true, Some(ActiveModal::Confirm(_)), _) => KeyTarget::Confirmation,
+            (true, Some(ActiveModal::Picker(_)), _) => KeyTarget::Picker,
+            (true, None, FocusArea::Input) => KeyTarget::Input,
+            (true, None, FocusArea::Transcript) => KeyTarget::Transcript,
         }
     }
 
@@ -805,10 +857,85 @@ impl App {
             InputAction::Down => self.move_down(),
             InputAction::PageUp => self.scroll_chat_page(-1),
             InputAction::PageDown => self.scroll_chat_page(1),
-            InputAction::Complete => self.accept_suggestion(),
+            InputAction::Complete => self.complete_or_focus_transcript(),
             InputAction::Submit => self.submit_input(client, tx).await,
             InputAction::Nothing => {}
         }
+    }
+
+    /// Tab in the input line: accept the highlighted suggestion, or move the
+    /// focus to the transcript when no suggestion is shown.
+    fn complete_or_focus_transcript(&mut self) {
+        if self.suggestions().is_empty() {
+            return self.focus_transcript();
+        }
+
+        self.accept_suggestion();
+    }
+
+    /// Give the transcript the keys, focusing its last part when nothing in
+    /// it has the focus yet.
+    fn focus_transcript(&mut self) {
+        self.focus_area = FocusArea::Transcript;
+
+        self.move_transcript_focus(0);
+    }
+
+    /// Move the focus between transcript parts, or fold, depending on the key.
+    fn handle_transcript_key(
+        &mut self,
+        key: KeyEvent,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        match transcript_key(&key) {
+            TranscriptKey::Cancel => self.cancel_and_clear_input(client, tx),
+            TranscriptKey::Up => self.move_transcript_focus(-1),
+            TranscriptKey::Down => self.move_transcript_focus(1),
+            TranscriptKey::Toggle => self.toggle_focused_part(),
+            TranscriptKey::Leave => self.focus_area = FocusArea::Input,
+            TranscriptKey::PageUp => self.scroll_chat_page(-1),
+            TranscriptKey::PageDown => self.scroll_chat_page(1),
+            TranscriptKey::Ignore => {}
+        }
+    }
+
+    /// Move the transcript focus `step` parts and scroll it into view.
+    fn move_transcript_focus(&mut self, step: isize) {
+        self.transcript.move_focus(step);
+
+        self.scroll_to_focus();
+    }
+
+    /// Fold or unfold the focused transcript part.
+    fn toggle_focused_part(&mut self) {
+        self.transcript.toggle_focused();
+
+        self.scroll_to_focus();
+    }
+
+    /// Scroll so the focused transcript part is on screen.
+    fn scroll_to_focus(&mut self) {
+        let Some(area) = self.last_chat_area else {
+            return;
+        };
+
+        let rows = self.transcript.focus_rows(chat_text_width(area.width));
+        self.scroll_to_rows(area, rows);
+    }
+
+    /// Scroll the least amount that puts `rows` (first, after last) on screen.
+    fn scroll_to_rows(&mut self, area: Rect, rows: Option<(usize, usize)>) {
+        let Some((first_row, end_row)) = rows else {
+            return;
+        };
+
+        let total_rows = self.transcript.total_rows();
+        let current = self.chat_scroll_for(area, total_rows);
+        let lowest_start = end_row.saturating_sub(chat_visible_height(area));
+
+        self.chat_scroll_offset = current.max(lowest_start).min(first_row);
+        self.scroll_mode = ScrollMode::Manual;
     }
 
     /// Ctrl+C in the input line: cancel any running or queued work, then
@@ -852,8 +979,8 @@ impl App {
 
         self.last_action.clear();
         self.scroll_mode = ScrollMode::Follow;
-        self.flush_live();
-        self.log.push("⛔ Cancelled.".to_string());
+        self.transcript.finish_running_step();
+        self.notice("⛔ Cancelled.".to_string());
 
         // Keep the queue moving: cancelling the active task should not strand
         // tasks the user already queued behind it.
@@ -932,10 +1059,10 @@ impl App {
         }
     }
 
-    /// A left click: jump on the scrollbar, or open the file on the clicked line.
+    /// A left click: jump on the scrollbar, or act on the clicked row.
     fn click_chat(&mut self, column: u16, row: u16) {
         if !self.handle_scrollbar_click(column, row) {
-            self.open_clicked_file(column, row);
+            self.click_transcript(row);
         }
     }
 
@@ -944,74 +1071,69 @@ impl App {
         self.handle_scrollbar_click(column, row);
     }
 
-    /// Open the file referenced in a clicked chat line in an external editor.
-    ///
-    /// Maps the mouse click coordinates to a visual line in the chat, extracts
-    /// any file path from that line, and opens it in vim.
-    ///
-    /// # Parameters
-    ///
-    /// - `column`: x coordinate of the click in terminal columns. It is not
-    ///   used: any file path on the clicked line opens, so the user does not
-    ///   have to hit the path exactly.
-    /// - `row`: y coordinate of the click in terminal rows.
-    pub(super) fn open_clicked_file(&mut self, _column: u16, row: u16) {
-        let path = self
-            .clicked_chat_line(row)
-            .and_then(|line| extract_path_from_line(&line, &self.run_config.cwd));
-
-        let Some(path) = path else {
-            return;
-        };
-
-        self.log
-            .push(format!("📂 Opening {} in vim...", path.display()));
-        open_in_vim(&path, self.editor_terminals);
-    }
-
-    /// The source chat line drawn at terminal row `row`, or `None` when the
-    /// row is a border or below the text.
-    fn clicked_chat_line(&self, row: u16) -> Option<String> {
-        let area = self.last_chat_area?;
-        let text_row = is_inside_track(area, row).then(|| (row - area.y - 1) as usize)?;
-
-        let chat_text = self.chat_text();
-        let max_text_width = (area.width as usize).saturating_sub(2).max(1);
-        let visual_lines = chat_visual_line_indices(&chat_text, max_text_width);
-        let scroll = self.chat_scroll_for(area, visual_lines.len().max(1));
-        let source_index = *visual_lines.get(scroll + text_row)?;
-
-        chat_text.split('\n').nth(source_index).map(str::to_string)
-    }
-
-    /// The first visible wrapped row of a chat `content_height` rows tall in `area`.
-    fn chat_scroll_for(&self, area: Rect, content_height: usize) -> usize {
-        let visible_height = area.height.saturating_sub(2) as usize;
-
-        match self.scroll_mode {
-            ScrollMode::Follow => content_height.saturating_sub(visible_height),
-            ScrollMode::Manual => self.chat_scroll_offset.min(content_height),
+    /// Fold or unfold the block part at terminal row `row`; a row that does
+    /// not fold opens the file path it names, if any.
+    pub(super) fn click_transcript(&mut self, row: u16) {
+        if let Some(hit) = self.transcript_row_at(row) {
+            self.act_on_row(hit);
         }
     }
 
-    /// Whether the transcript has no messages yet, saved or still streaming.
-    pub(super) fn transcript_is_empty(&self) -> bool {
-        self.log.is_empty() && self.live.is_empty()
+    /// Focus the clicked part and fold it, or open the file it names.
+    fn act_on_row(&mut self, hit: RowHit) {
+        self.transcript.set_focus(Focus {
+            block: hit.block,
+            part: hit.part,
+        });
+
+        if !self.transcript.toggle(hit.block, hit.part) {
+            self.open_path_in(&hit.text);
+        }
     }
 
-    /// Assemble the full visible chat text from the log and any live streaming output.
-    ///
-    /// # Returns
-    ///
-    /// The complete chat text ready for rendering or scroll calculations.
-    pub(super) fn chat_text(&self) -> String {
-        let log_text = self.log.text();
-        let parts: Vec<&str> = [log_text.as_str(), self.live.as_str()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect();
+    /// Open the file path named in `line` in an external editor.
+    fn open_path_in(&mut self, line: &str) {
+        let Some(path) = extract_path_from_line(line, &self.run_config.cwd) else {
+            return;
+        };
 
-        parts.join("\n")
+        self.notice(format!("📂 Opening {} in vim...", path.display()));
+        open_in_vim(&path, self.editor_terminals);
+    }
+
+    /// What lies under terminal row `row`, or `None` for a border, a row
+    /// below the text, or before the first draw.
+    fn transcript_row_at(&mut self, row: u16) -> Option<RowHit> {
+        let area = self.last_chat_area?;
+        let text_row = is_inside_track(area, row).then(|| (row - area.y - 1) as usize)?;
+        let width = chat_text_width(area.width);
+
+        let total_rows = self.transcript.layout(width);
+        let scroll = self.chat_scroll_for(area, total_rows);
+
+        self.transcript.row_at(width, scroll + text_row)
+    }
+
+    /// The first visible row of a chat `content_height` rows tall in `area`.
+    pub(super) fn chat_scroll_for(&self, area: Rect, content_height: usize) -> usize {
+        let max_scroll = content_height.saturating_sub(chat_visible_height(area));
+
+        match self.scroll_mode {
+            ScrollMode::Follow => max_scroll,
+            ScrollMode::Manual => self.chat_scroll_offset.min(max_scroll),
+        }
+    }
+
+    /// Apply what the transcript did to the rows above the view: rows that
+    /// left memory shift the offset up, and a jump back to the newest
+    /// blocks follows the output again.
+    pub(super) fn sync_transcript_scroll(&mut self) {
+        let dropped_rows = self.transcript.take_dropped_rows();
+        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(dropped_rows);
+
+        if self.transcript.take_reattached() {
+            self.scroll_mode = ScrollMode::Follow;
+        }
     }
 
     /// Resolve a pending tool confirmation from a single keypress.
@@ -1044,7 +1166,7 @@ impl App {
     /// Note in the chat that the user refused a tool.
     fn log_aborted_tool(&mut self, answer: bool) {
         if !answer {
-            self.log.push("⛔ Tool aborted by user.".to_string());
+            self.notice("⛔ Tool aborted by user.".to_string());
         }
     }
 
@@ -1179,8 +1301,7 @@ impl App {
         }
 
         self.current_prompt = Some(task.clone());
-        self.log.push("─".repeat(CHAT_SEPARATOR_LENGTH));
-        self.log.push(format!("You: {task}"));
+        self.transcript.push(BlockContent::User(task.clone()));
         self.start_or_queue(task, resume, client, tx);
     }
 
@@ -1195,7 +1316,7 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         if let Err(error) = self.run_slash_command(client, command, tx).await {
-            self.log.push(format!("⚠️ {error:#}"));
+            self.notice(format!("⚠️ {error:#}"));
         }
     }
 
@@ -1209,8 +1330,7 @@ impl App {
     ) {
         if self.is_running {
             self.task_queue.push_back((task, resume));
-            self.log
-                .push("⏳ Queued — will run after the current task.".to_string());
+            self.notice("⏳ Queued — will run after the current task.".to_string());
             return;
         }
 
@@ -1319,6 +1439,22 @@ fn enter_action(modifiers: KeyModifiers) -> InputAction {
     }
 }
 
+/// What a key press does while the transcript has the focus.
+fn transcript_key(key: &KeyEvent) -> TranscriptKey {
+    let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match (key.code, is_control) {
+        (KeyCode::Char('c'), true) => TranscriptKey::Cancel,
+        (KeyCode::Up, _) => TranscriptKey::Up,
+        (KeyCode::Down, _) => TranscriptKey::Down,
+        (KeyCode::Enter | KeyCode::Char(' '), _) => TranscriptKey::Toggle,
+        (KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc, _) => TranscriptKey::Leave,
+        (KeyCode::PageUp, _) => TranscriptKey::PageUp,
+        (KeyCode::PageDown, _) => TranscriptKey::PageDown,
+        _ => TranscriptKey::Ignore,
+    }
+}
+
 /// What a key press does while the confirmation dialog is open.
 fn confirmation_key(key: &KeyEvent) -> ConfirmationKey {
     let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1371,6 +1507,7 @@ fn corrected_task_prompt(previous: &str, correction: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::block::Part;
     use super::*;
     use anyhow::Context;
     use crossterm::event;
@@ -1444,6 +1581,14 @@ mod tests {
     fn test_app() -> App {
         let cli = Cli::parse_from(["openbatrangs"]);
         App::new(&cli, Arc::new(Mutex::new(None)))
+    }
+
+    /// An answer-text event carrying `text`.
+    fn answer(text: &str) -> AgentEvent {
+        AgentEvent::Text {
+            kind: TextKind::Answer,
+            text: text.to_string(),
+        }
     }
 
     /// Terminals with the kitty keyboard protocol send Press and Release for
@@ -1558,7 +1703,7 @@ mod tests {
     fn scrollbar_click_jumps_to_scroll_position() {
         let mut app = test_app();
         for i in 0..100 {
-            app.log.push(format!("line {i}"));
+            app.notice(format!("line {i}"));
         }
         let area = Rect {
             x: 0,
@@ -1586,19 +1731,21 @@ mod tests {
     }
 
     #[test]
-    fn long_streamed_output_spills_to_log_without_loss() {
-        let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
+    fn long_streamed_output_stays_whole_in_one_block() -> anyhow::Result<()> {
+        let client = refused_client()?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
-        let part_a = "A".repeat(30_000);
-        let part_b = "B".repeat(30_000);
-        let part_c = "C".repeat(30_000);
-        app.handle_event(UiEvent::Chunk(part_a.clone()), &client, &tx);
-        app.handle_event(UiEvent::Chunk(part_b.clone()), &client, &tx);
-        app.handle_event(UiEvent::Chunk(part_c.clone()), &client, &tx);
-        assert!(app.log.text().contains(&part_a));
-        assert!(app.log.text().contains(&part_b));
-        assert_eq!(app.live, part_c);
+        let parts = ["A".repeat(30_000), "B".repeat(30_000), "C".repeat(30_000)];
+
+        for part in &parts {
+            app.handle_event(UiEvent::Agent(answer(part)), &client, &tx);
+        }
+
+        assert_eq!(app.transcript.text(), parts.concat());
+        assert_eq!(app.transcript.blocks_in_memory(), 1);
+        assert_eq!(app.reply, parts.concat());
+
+        Ok(())
     }
 
     #[test]
@@ -1611,7 +1758,7 @@ mod tests {
             role: crate::ollama::Role::User,
             content: "hello".to_string(),
         });
-        app.live.push_str("world");
+        app.handle_event(UiEvent::Agent(answer("world")), &client, &tx);
         app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
         assert_eq!(app.chat_history.len(), 2);
         assert_eq!(app.chat_history[1].role, crate::ollama::Role::Assistant);
@@ -1652,7 +1799,7 @@ mod tests {
         app.clear_chat();
         assert!(app.chat_history.is_empty());
         assert!(app.current_prompt.is_none());
-        assert!(app.log.is_empty());
+        assert!(app.transcript.is_empty());
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
         assert_eq!(app.chat_scroll_offset, 0);
     }
@@ -1669,7 +1816,7 @@ mod tests {
         });
         app.cancel_task(&client, &tx);
         assert!(app.chat_history.is_empty());
-        assert!(app.log.iter().any(|line| line.contains("Cancelled")));
+        assert!(app.transcript.text().contains("Cancelled"));
     }
 
     #[test]
@@ -1720,7 +1867,7 @@ mod tests {
         );
         assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(false));
-        assert!(app.log.iter().any(|line| line.contains("aborted")));
+        assert!(app.transcript.text().contains("aborted"));
     }
 
     #[test]
@@ -1777,11 +1924,7 @@ mod tests {
         assert!(app.task_queue.is_empty());
         assert!(app.is_running, "queued task should start immediately");
         assert!(app.current_task.is_some());
-        assert!(
-            app.log
-                .iter()
-                .any(|line| line.contains("Starting next queued task"))
-        );
+        assert!(app.transcript.text().contains("Starting next queued task"));
     }
 
     #[test]
@@ -1860,7 +2003,7 @@ mod tests {
         assert!(!app.is_confirming());
         assert!(response_rx.try_recv() == Ok(false));
         assert!(!app.is_running);
-        assert!(app.log.iter().any(|line| line.contains("Cancelled")));
+        assert!(app.transcript.text().contains("Cancelled"));
     }
 
     #[tokio::test]
@@ -1876,7 +2019,7 @@ mod tests {
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
         assert!(
-            !app.log.text().contains("Cancelled"),
+            !app.transcript.text().contains("Cancelled"),
             "idle Ctrl+C must not log a fake cancel"
         );
     }
@@ -1941,7 +2084,7 @@ mod tests {
         );
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
-        assert!(app.log.iter().any(|line| line.contains("Model ready")));
+        assert!(app.transcript.text().contains("Model ready"));
     }
 
     #[test]
@@ -1961,9 +2104,9 @@ mod tests {
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
         assert!(
-            app.log
-                .iter()
-                .any(|line| line.contains("Failed to pull model 'bad-model'"))
+            app.transcript
+                .text()
+                .contains("Failed to pull model 'bad-model'")
         );
     }
 
@@ -1976,7 +2119,7 @@ mod tests {
         app.handle_event(UiEvent::SetupDone(Ok(())), &client, &tx);
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
-        assert!(app.log.iter().any(|line| line.contains("Setup finished")));
+        assert!(app.transcript.text().contains("Setup finished"));
     }
 
     #[tokio::test]
@@ -1988,7 +2131,7 @@ mod tests {
         app.input = "/model missing-model".to_string();
         app.submit_input(&client, &tx).await;
         assert!(
-            app.log.iter().any(|line| line.contains('⚠')),
+            app.transcript.text().contains('⚠'),
             "expected an error logged to chat"
         );
 
@@ -2115,7 +2258,7 @@ mod tests {
         let after_help = app.handle_key(press(KeyCode::Enter), &client, &tx).await;
 
         assert!(!after_help);
-        assert!(app.log.iter().any(|line| line.contains("Commands")));
+        assert!(app.transcript.text().contains("Commands"));
 
         app.insert_text("/quit");
         let after_quit = app.handle_key(press(KeyCode::Enter), &client, &tx).await;
@@ -2134,7 +2277,7 @@ mod tests {
         app.handle_key(press(KeyCode::Enter), &client, &tx).await;
 
         assert!(app.history.is_empty());
-        assert!(app.transcript_is_empty());
+        assert!(app.transcript.is_empty());
 
         Ok(())
     }
@@ -2202,7 +2345,7 @@ mod tests {
 
         app.answer_confirmation(false);
 
-        assert!(app.transcript_is_empty());
+        assert!(app.transcript.is_empty());
     }
 
     #[tokio::test]
@@ -2287,21 +2430,22 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_log_line_becomes_the_current_action() -> anyhow::Result<()> {
+    fn a_tool_call_becomes_the_current_action() -> anyhow::Result<()> {
         let client = refused_client()?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
-        app.live = "partial reply".to_string();
+        let call = AgentEvent::ToolCall {
+            id: "c1".to_string(),
+            name: "write_file".to_string(),
+            arguments: r#"{"path":"a.txt","content":"x"}"#.to_string(),
+        };
 
-        app.handle_event(
-            UiEvent::Log("🔧 write file 'a.txt'".to_string()),
-            &client,
-            &tx,
-        );
+        app.handle_event(UiEvent::Log("pulling".to_string()), &client, &tx);
         app.handle_event(UiEvent::Log(String::new()), &client, &tx);
+        app.handle_event(UiEvent::Agent(call), &client, &tx);
 
-        assert_eq!(app.last_action, "🔧 write file 'a.txt'");
-        assert_eq!(app.log.text(), "partial reply\n🔧 write file 'a.txt'");
+        assert_eq!(app.last_action, "🔧 write_file → a.txt");
+        assert_eq!(app.transcript.text(), "pulling");
 
         Ok(())
     }
@@ -2318,7 +2462,7 @@ mod tests {
 
         app.rate_window_start = Some(one_second_ago);
         app.last_chunk_at = Some(now);
-        app.handle_event(UiEvent::Chunk("a".repeat(400)), &client, &tx);
+        app.handle_event(UiEvent::Agent(answer(&"a".repeat(400))), &client, &tx);
 
         assert!(app.tokens_per_sec > 0.0);
         assert_eq!(app.rate_window_chars, 0);
@@ -2327,7 +2471,11 @@ mod tests {
             .checked_sub(STREAM_GAP * 2)
             .context("the clock must be past the stream gap")?;
         app.last_chunk_at = Some(pause_start);
-        app.handle_event(UiEvent::Chunk("abcd".to_string()), &client, &tx);
+        let reasoning = AgentEvent::Text {
+            kind: TextKind::Reasoning,
+            text: "abcd".to_string(),
+        };
+        app.handle_event(UiEvent::Agent(reasoning), &client, &tx);
 
         assert_eq!(app.rate_window_chars, 4);
 
@@ -2351,8 +2499,12 @@ mod tests {
             &tx,
         );
 
-        assert!(app.log.text().contains("⚠️ model crashed"));
-        assert!(app.log.text().contains("⚠️ Setup failed: no network"));
+        assert!(app.transcript.text().contains("⚠️ model crashed"));
+        assert!(
+            app.transcript
+                .text()
+                .contains("⚠️ Setup failed: no network")
+        );
 
         Ok(())
     }
@@ -2368,7 +2520,7 @@ mod tests {
         app.handle_key(press(KeyCode::Enter), &client, &tx).await;
 
         assert_eq!(app.task_queue.len(), 1);
-        assert!(app.log.text().contains("Queued"));
+        assert!(app.transcript.text().contains("Queued"));
 
         Ok(())
     }
@@ -2377,7 +2529,7 @@ mod tests {
     fn the_mouse_scrolls_drags_and_is_ignored_behind_a_dialog() {
         let mut app = test_app();
         for index in 0..100 {
-            app.log.push(format!("line {index}"));
+            app.notice(format!("line {index}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
 
@@ -2410,16 +2562,16 @@ mod tests {
         let mut app = test_app();
         app.run_config.cwd = workspace.clone();
         app.editor_terminals = &["true"];
-        app.log.push("no path here".to_string());
-        app.log.push("wrote notes.txt".to_string());
+        app.notice("no path here".to_string());
+        app.notice("wrote notes.txt".to_string());
         app.last_chat_area = Some(Rect::new(0, 0, 40, 10));
         app.scroll_mode = ScrollMode::Follow;
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
-        assert!(!app.log.text().contains("Opening"));
+        assert!(!app.transcript.text().contains("Opening"));
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 2));
-        assert!(app.log.text().contains("📂 Opening"));
+        assert!(app.transcript.text().contains("📂 Opening"));
 
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 1;
@@ -2435,9 +2587,288 @@ mod tests {
     fn a_click_before_the_first_draw_does_nothing() {
         let mut app = test_app();
 
-        app.open_clicked_file(5, 5);
+        app.click_transcript(5);
 
-        assert!(app.transcript_is_empty());
+        assert!(app.transcript.is_empty());
+    }
+
+    /// An app whose transcript holds a running step with reasoning and one
+    /// tool call, then a notice, drawn in a short chat area.
+    fn app_with_a_step() -> App {
+        let mut app = test_app();
+        app.transcript.apply(AgentEvent::StepStarted {
+            step: 1,
+            max_steps: 3,
+            model: "m".to_string(),
+            loop_kind: crate::agent::LoopKind::Native,
+        });
+        app.transcript.apply(AgentEvent::Text {
+            kind: TextKind::Reasoning,
+            text: "**Look around**\nfirst the files".to_string(),
+        });
+        app.transcript.apply(AgentEvent::ToolCall {
+            id: "c1".to_string(),
+            name: "list_files".to_string(),
+            arguments: "{}".to_string(),
+        });
+        app.notice("after the step".to_string());
+        app.last_chat_area = Some(Rect::new(0, 0, 60, 5));
+
+        app
+    }
+
+    #[tokio::test]
+    async fn tab_switches_panes_and_arrow_keys_fold_steps() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_with_a_step();
+
+        app.input = "/mo".to_string();
+        app.cursor = 3;
+        app.handle_key(press(KeyCode::Tab), &client, &tx).await;
+        assert_eq!(app.focus_area, FocusArea::Input);
+        assert_ne!(app.input, "/mo");
+
+        app.input.clear();
+        app.cursor = 0;
+        app.handle_key(press(KeyCode::Tab), &client, &tx).await;
+        assert_eq!(app.focus_area, FocusArea::Transcript);
+        assert_eq!(
+            app.transcript.focus(),
+            Some(Focus {
+                block: 1,
+                part: Part::Header
+            })
+        );
+
+        let rows_before = app.transcript.layout(57);
+        type_keys(
+            &mut app,
+            &[press(KeyCode::Up), press(KeyCode::Enter)],
+            &client,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            app.transcript.focus(),
+            Some(Focus {
+                block: 0,
+                part: Part::Tool(0)
+            })
+        );
+        assert!(
+            app.transcript.layout(57) > rows_before,
+            "the tool line opened"
+        );
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+
+        let keys = [
+            press(KeyCode::Up),
+            press(KeyCode::Char(' ')),
+            press(KeyCode::Down),
+        ];
+        type_keys(&mut app, &keys, &client, &tx).await;
+        assert_eq!(
+            app.transcript.focus(),
+            Some(Focus {
+                block: 0,
+                part: Part::Tool(0)
+            })
+        );
+
+        app.chat_scroll_offset = 10;
+        let keys = [
+            press(KeyCode::PageUp),
+            press(KeyCode::PageDown),
+            press(KeyCode::Char('x')),
+        ];
+        type_keys(&mut app, &keys, &client, &tx).await;
+        assert_eq!(app.chat_scroll_offset, 10);
+        assert!(
+            app.input.is_empty(),
+            "letters do not reach the input from the transcript"
+        );
+
+        app.input = "draft".to_string();
+        app.handle_key(ctrl(KeyCode::Char('c')), &client, &tx).await;
+        assert!(app.input.is_empty());
+
+        app.handle_key(press(KeyCode::Esc), &client, &tx).await;
+        assert_eq!(app.focus_area, FocusArea::Input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_click_folds_the_step_under_the_pointer() {
+        let mut app = app_with_a_step();
+        app.scroll_mode = ScrollMode::Manual;
+        app.chat_scroll_offset = 0;
+        let rows_open = app.transcript.layout(57);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+
+        assert!(app.transcript.layout(57) < rows_open);
+        assert_eq!(
+            app.transcript.focus(),
+            Some(Focus {
+                block: 0,
+                part: Part::Header
+            })
+        );
+
+        app.last_chat_area = None;
+        app.move_transcript_focus(1);
+        assert_eq!(
+            app.transcript.focus(),
+            Some(Focus {
+                block: 1,
+                part: Part::Header
+            })
+        );
+    }
+
+    #[test]
+    fn tab_into_an_empty_transcript_focuses_nothing() {
+        let mut app = test_app();
+        app.last_chat_area = Some(Rect::new(0, 0, 60, 5));
+        app.scroll_mode = ScrollMode::Follow;
+
+        app.focus_transcript();
+
+        assert_eq!(app.focus_area, FocusArea::Transcript);
+        assert_eq!(app.transcript.focus(), None);
+        assert_eq!(app.scroll_mode, ScrollMode::Follow);
+    }
+
+    #[test]
+    fn a_jump_back_to_the_newest_blocks_follows_the_output() {
+        let mut app = test_app();
+        app.transcript = Transcript::new(2);
+        for index in 0..6 {
+            app.notice(format!("line {index}"));
+        }
+        app.transcript.load_older(4);
+        app.scroll_mode = ScrollMode::Manual;
+
+        app.notice("newest".to_string());
+        app.sync_transcript_scroll();
+
+        assert_eq!(app.scroll_mode, ScrollMode::Follow);
+        assert!(app.transcript.text().ends_with("newest"));
+    }
+
+    /// The first chat reply of [`asking_server`]: one `ask_user` call.
+    const ASK_STREAM: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"q1\",",
+        "\"type\":\"function\",\"function\":{\"name\":\"ask_user\",",
+        "\"arguments\":\"{\\\"question\\\":\\\"Which file?\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The later chat replies of [`asking_server`]: a plain answer.
+    const ANSWER_STREAM: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Fixed main.rs\"}}]}\n\ndata: [DONE]\n\n";
+
+    /// A mock OpenAI server whose model first asks which file to fix, then
+    /// answers.
+    async fn asking_server() -> anyhow::Result<OllamaClient> {
+        let chats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let models = r#"{"data":[{"id":"served","max_model_len":8192}]}"#;
+
+        let base_url = crate::test_support::spawn_mock_server(move |path| {
+            match path.ends_with("/chat/completions") {
+                true => chat_reply(&chats),
+                false => crate::test_support::MockResponse::json("200 OK", models),
+            }
+        })
+        .await;
+
+        OllamaClient::openai(&format!("{base_url}/v1"), None, true)
+    }
+
+    /// The question for the first chat request, the answer after it.
+    fn chat_reply(chats: &std::sync::atomic::AtomicUsize) -> crate::test_support::MockResponse {
+        let replies = [ASK_STREAM, ANSWER_STREAM];
+        let index = chats
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .min(1);
+
+        crate::test_support::MockResponse::json("200 OK", replies[index])
+    }
+
+    /// Handle worker events until the task reports done; returns the last
+    /// conversation snapshot the run sent.
+    async fn run_until_done(
+        app: &mut App,
+        rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let mut snapshot = Vec::new();
+        let mut is_done = false;
+
+        while !is_done {
+            let event = rx.recv().await.context("the worker must report back")?;
+            is_done = matches!(event, UiEvent::Done(_));
+            snapshot = history_of(&event).unwrap_or(snapshot);
+
+            app.handle_event(event, client, tx);
+        }
+
+        Ok(snapshot)
+    }
+
+    /// The conversation a history event carries.
+    fn history_of(event: &UiEvent) -> Option<Vec<Value>> {
+        match event {
+            UiEvent::History(messages) => Some(messages.clone()),
+            _other => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_next_message_answers_the_question_and_continues_the_run() -> anyhow::Result<()> {
+        let client = asking_server().await?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let workspace = crate::test_support::unique_temp_dir("openbatrangs-tui-ask");
+        let mut app = test_app();
+        app.run_config.cwd = workspace.clone();
+
+        app.insert_text("fix the bug");
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+        run_until_done(&mut app, &mut rx, &client, &tx).await?;
+
+        assert!(app.transcript.text().contains("Which file?"));
+        assert!(
+            app.interrupted_task
+                .as_deref()
+                .is_some_and(|task| task.contains("Which file?"))
+        );
+        assert!(app.agent_conversation.is_some());
+
+        app.insert_text("src/main.rs");
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+        let history = run_until_done(&mut app, &mut rx, &client, &tx).await?;
+
+        let contents: Vec<String> = history.iter().map(|message| message.to_string()).collect();
+        assert!(contents.iter().any(|message| message.contains("ask_user")));
+        assert!(
+            contents
+                .iter()
+                .any(|message| message.contains("question is shown to the user"))
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|message| message.contains("\"content\":\"src/main.rs\""))
+        );
+        assert!(app.transcript.text().contains("Fixed main.rs"));
+        assert!(app.interrupted_task.is_none());
+        assert!(app.agent_conversation.is_none());
+
+        std::fs::remove_dir_all(workspace)?;
+        Ok(())
     }
 
     #[test]
