@@ -30,7 +30,7 @@ use crate::constants::commands::{
     OLLAMA_BINARY, OLLAMA_POLL_INTERVAL_MILLIS, OLLAMA_START_POLL_ATTEMPTS,
 };
 use crate::ollama::OllamaClient;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::process::Stdio;
 use std::time::Duration;
 

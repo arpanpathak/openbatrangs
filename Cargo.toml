@@ -1,7 +1,7 @@
 [package]
 name = "openbatrangs"
 version = "0.2.2"
-edition = "2021"
+edition = "2024"
 description = "🦇 openBatarangs - Agentic coding CLI for local models via Ollama"
 license = "AGPL-3.0"
 repository = "https://github.com/arpanpathak/openbatrangs"

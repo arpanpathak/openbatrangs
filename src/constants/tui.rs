@@ -122,3 +122,9 @@ pub const VIM_TERMINALS: &[&str] = &[
     "alacritty",
     "kitty",
 ];
+
+/// Hints shown under the banner until the first message.
+pub const WELCOME_HINTS: &[&str] = &[
+    "Type a task to start coding, or /help for commands.",
+    "/mode chat for plain conversation, /mode plan for read-only planning.",
+];

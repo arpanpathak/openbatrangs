@@ -8,7 +8,7 @@ use crate::constants::models::{
 use crate::models;
 use crate::models::ModelScore;
 use crate::ollama::OllamaClient;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 /// Resolve a model from an optional explicit slot or auto-selection.
 ///
@@ -260,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_returns_explicit_installed_model() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/tags");
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_errors_when_explicit_model_missing() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url =
             spawn_mock_server(|_| MockResponse::json("200 OK", r#"{"models":[]}"#)).await;
@@ -317,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_auto_selects_best_installed_model() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url = spawn_mock_server(|_| MockResponse::json("200 OK", model_json())).await;
         let client = OllamaClient::new(&base_url).unwrap();
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_auto_errors_when_no_models_and_pull_disabled() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url =
             spawn_mock_server(|_| MockResponse::json("200 OK", r#"{"models":[]}"#)).await;
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_model_auto_pulls_fallback_when_empty() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let calls = AtomicUsize::new(0);
@@ -374,16 +374,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(scored.name, "qwen2.5-coder:7b");
-        assert!(statuses
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|msg| msg.contains("Pulling a better default")));
+        assert!(
+            statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|msg| msg.contains("Pulling a better default"))
+        );
     }
 
     #[tokio::test]
     async fn resolve_model_context_reads_show_endpoint() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/show");

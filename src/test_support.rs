@@ -14,8 +14,8 @@
 //! - Hypertext Transfer Protocol basics: <https://developer.mozilla.org/en-US/docs/Web/HTTP>
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);

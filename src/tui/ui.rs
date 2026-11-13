@@ -15,12 +15,13 @@
 //! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
 use super::app::App;
-use super::{text_wrapped_height, wrap_text_to_lines, ScrollMode};
+use super::{ScrollMode, text_wrapped_height, wrap_text_to_lines};
+use crate::banner;
 use crate::cli::AgentMode;
 use crate::constants::tui::{
     HEADER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
     MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD, WELCOME_HINTS,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,7 +44,7 @@ use unicode_width::UnicodeWidthStr;
 pub(super) fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = layout_chunks(f.area(), app);
     render_header(f, app, chunks[0]);
-    render_chat_area(f, app, chunks[1]);
+    render_transcript(f, app, chunks[1]);
     render_status_line(f, app, chunks[2]);
     if perf_visible(app, f.area().height) {
         render_perf_panel(f, app, chunks[3]);
@@ -125,7 +126,7 @@ fn render_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(Span::styled(
-                    " ⣿ OPEN-BATARANGS ",
+                    " openbatrangs ",
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
@@ -155,6 +156,49 @@ fn transcript_block() -> Block<'static> {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ))
+}
+
+/// Draw the welcome banner while the transcript is empty, and the chat after that.
+fn render_transcript(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    if app.transcript_is_empty() {
+        return render_welcome(f, area);
+    }
+
+    render_chat_area(f, app, area);
+}
+
+/// Draw the batarang banner and the starting hints in the middle of the empty
+/// transcript pane.
+fn render_welcome(f: &mut ratatui::Frame, area: Rect) {
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let mut lines = banner::banner_lines();
+    lines.push(Line::default());
+    lines.extend(
+        WELCOME_HINTS
+            .iter()
+            .map(|hint| Line::from(Span::styled(format!(" {hint}"), hint_style))),
+    );
+
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = widest.min(u16::MAX as usize) as u16;
+    let height = lines.len().min(u16::MAX as usize) as u16;
+    let inner = transcript_block().inner(area);
+
+    f.render_widget(transcript_block(), area);
+    f.render_widget(Paragraph::new(lines), middle_rect(inner, width, height));
+}
+
+/// A rectangle of `width` by `height` cells in the middle of `area`, cut to fit.
+fn middle_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 /// Render the chat scrollback area with optional syntax highlighting and scrollbar.
@@ -526,8 +570,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use clap::Parser;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::sync::{Arc, Mutex};
 
     #[test]

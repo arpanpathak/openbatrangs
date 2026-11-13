@@ -3,7 +3,7 @@
 //! The instance's base URL comes from the agent configuration (`--searxng-url`
 //! or `OPENBATRANGS_SEARXNG_URL`), because SearXNG often runs on a different
 //! machine than openBatarangs (e.g. next to a remote model server).
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::net::IpAddr;
@@ -72,7 +72,9 @@ pub(crate) async fn web_search(base_url: &str, key: Option<&str>, query: &str) -
 pub(crate) async fn web_read(url: &str) -> Result<String> {
     let parsed = raw_source(reqwest::Url::parse(url).context("invalid URL")?);
     if !is_public_web_url(&parsed) {
-        bail!("web_read reads public http and https pages only, not addresses on this machine or its network");
+        bail!(
+            "web_read reads public http and https pages only, not addresses on this machine or its network"
+        );
     }
 
     let response = http_client()?

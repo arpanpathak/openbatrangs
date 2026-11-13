@@ -18,6 +18,6 @@ mod config;
 
 pub(crate) use args::{Cli, Commands};
 pub(crate) use config::{
-    agent_run_config, model_prefs_from_cli, search_key, searxng_url, AgentMode, AgentRunConfig,
-    ModelPrefs,
+    AgentMode, AgentRunConfig, ModelPrefs, agent_run_config, model_prefs_from_cli, search_key,
+    searxng_url,
 };

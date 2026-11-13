@@ -31,7 +31,7 @@ pub(super) use text::{
     text_wrapped_height, wrap_text_to_lines,
 };
 pub(super) use worker::{
-    run_agent_worker, run_pull_worker, run_setup_worker, UiEvent, WorkerHistory,
+    UiEvent, WorkerHistory, run_agent_worker, run_pull_worker, run_setup_worker,
 };
 
 /// How the chat viewport follows newly generated output.
@@ -58,11 +58,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::io::stdout;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -228,7 +228,7 @@ mod tests {
         let banner = text::strip_ansi(&banner::banner_text());
         assert!(!banner.contains('\x1b'));
         assert!(banner.lines().count() > 5);
-        assert!(banner.contains('⣿') || banner.contains('█'));
+        assert!(banner.contains('█'));
     }
 
     #[test]
@@ -250,11 +250,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(
-            content.contains('⣿') || content.contains('█'),
-            "banner pixel art should render"
-        );
-        assert!(content.contains("OPEN-BATARANGS") || content.contains("perf"));
+        assert!(content.contains('█'), "the banner art should render");
+        assert!(content.contains("openbatrangs"));
     }
 
     #[test]

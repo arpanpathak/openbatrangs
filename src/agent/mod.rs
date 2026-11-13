@@ -42,14 +42,14 @@ use crate::constants::ansi::{
 };
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient};
 use crate::tools;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use environment::{environment_facts, project_has_build_manifest};
 use execute::{execute_tool_or_report_error, print_changed_files};
-use quality::{command_succeeded, requires_file_work, FileWorkGate};
+use quality::{FileWorkGate, command_succeeded, requires_file_work};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use stream::stream_model_response;
-use tool::{parse_agent_response, Tool, ToolCall};
+use tool::{Tool, ToolCall, parse_agent_response};
 
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, max_output_tokens};
@@ -769,9 +769,11 @@ mod tests {
         assert_eq!(messages[1].content, "task");
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].content, r#"{"answer":"done"}"#);
-        assert!(messages
-            .iter()
-            .all(|message| !message.content.starts_with("Tool result:")));
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.starts_with("Tool result:"))
+        );
     }
 
     #[test]
