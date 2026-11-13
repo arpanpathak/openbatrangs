@@ -9,6 +9,7 @@ A terminal coding agent for local language models, on any hardware.
 [![CI](https://img.shields.io/github/actions/workflow/status/arpanpathak/openbatrangs/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Farpanpathak%2Fopenbatrangs%2Fcoverage%2Fcoverage.json&style=for-the-badge&logo=codecov&logoColor=white)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/arpanpathak/openbatrangs?style=for-the-badge&logo=github&logoColor=white&color=9664ff)](https://github.com/arpanpathak/openbatrangs/releases)
+[![crates.io](https://img.shields.io/crates/v/openbatrangs?style=for-the-badge&logo=rust&logoColor=white&color=e57324)](https://crates.io/crates/openbatrangs)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-2e8b57?style=for-the-badge&logo=gnu&logoColor=white)](LICENSE)
 
 [![Rust 2024](https://img.shields.io/badge/Rust-2024%20edition-ce422b?style=for-the-badge&logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/)
@@ -95,9 +96,16 @@ To download a binary yourself, pick the file for your system from the
 | macOS, Apple silicon | `openbatrangs-aarch64-apple-darwin` |
 | macOS, Intel | `openbatrangs-x86_64-apple-darwin` |
 
-To build from source, install Rust with [rustup](https://rustup.rs) and run the
-command below. `rust-toolchain.toml` pins Rust 1.100.0, and you get that
-version through rustup on the first build.
+With Rust installed through [rustup](https://rustup.rs), you can install the
+same release from crates.io.
+
+```sh
+cargo install openbatrangs --locked
+```
+
+To build the latest code from GitHub, run the command below.
+`rust-toolchain.toml` pins Rust 1.100.0, and you get that version through
+rustup on the first build.
 
 ```sh
 cargo install --git https://github.com/arpanpathak/openbatrangs --locked
