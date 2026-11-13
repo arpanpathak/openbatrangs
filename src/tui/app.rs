@@ -1515,6 +1515,26 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn a_shifted_symbol_is_inserted_as_typed() {
+        let less_than = KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE);
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+
+        assert_eq!(input_action(&less_than), InputAction::Insert('<'));
+        assert_eq!(input_action(&question), InputAction::Insert('?'));
+    }
+
+    #[test]
+    fn keyboard_flags_report_typed_characters() {
+        use crate::constants::tui::KEYBOARD_FLAGS;
+        use crossterm::event::KeyboardEnhancementFlags;
+
+        assert!(KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(
+            !KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        );
+    }
+
+    #[test]
     fn follow_up_after_ctrl_c_keeps_original_task_and_adds_correction() -> anyhow::Result<()> {
         let mut app = test_app();
         app.interrupted_task = Some("write a stable softmax kernel".to_string());

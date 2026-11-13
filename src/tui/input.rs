@@ -67,7 +67,7 @@ impl App {
         self.cursor += text.len();
     }
 
-    /// Insert a newline character at the cursor (Shift+Enter or Ctrl+J).
+    /// Insert a newline character at the cursor (Ctrl+J, or Enter with Shift, Ctrl or Alt).
     pub(super) fn insert_newline(&mut self) {
         self.clamp_cursor_to_boundary();
         self.input.insert(self.cursor, '\n');

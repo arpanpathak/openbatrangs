@@ -1,5 +1,7 @@
 //! TUI constants and the chat-mode system prompt.
 
+use crossterm::event::KeyboardEnhancementFlags;
+
 /// Slash commands recognized by the TUI.
 pub const COMMANDS: &[&str] = &[
     "help",
@@ -53,7 +55,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /clear             — clear chat log",
     "",
     "═══ Keys ═══",
-    "  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel",
+    "  Enter = send · Ctrl+J / Alt+Enter = newline · Ctrl+C = cancel",
     "  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete, or switch to the transcript",
     "  In the transcript: ↑↓ = move · Enter / Space = fold or unfold · Tab / Esc = back",
     "  Click a step, thinking line or tool line to fold or unfold it",
@@ -155,3 +157,16 @@ pub const WELCOME_HINTS: &[&str] = &[
     "Type a task to start coding, or /help for commands.",
     "/mode chat for plain conversation, /mode plan for read-only planning.",
 ];
+
+/// Kitty keyboard protocol flags the TUI asks the terminal for.
+///
+/// Escape codes are disambiguated, so Esc and Alt or Ctrl combinations arrive
+/// as distinct keys, and release events are reported so they can be ignored.
+/// Alternate keys make a shifted key arrive as the character it types, `<` for
+/// Shift+`,`. The flag that reports every key as an escape code is left off:
+/// crossterm cannot read the text a key produces in that mode, so shifted
+/// symbols, Option characters and non-US layouts would be lost.
+pub const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
