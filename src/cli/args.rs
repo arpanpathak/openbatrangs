@@ -113,6 +113,7 @@ mod tests {
     #[test]
     fn parses_defaults_without_arguments() {
         let cli = Cli::parse_from(["openbatrangs"]);
+
         assert!(cli.task.is_empty());
         assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
         assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
@@ -128,6 +129,7 @@ mod tests {
     #[test]
     fn parses_positional_task() {
         let cli = Cli::parse_from(["openbatrangs", "fix", "the", "bug"]);
+
         assert_eq!(cli.task, vec!["fix", "the", "bug"]);
     }
 
@@ -142,6 +144,7 @@ mod tests {
             "--read-only",
             "list-models",
         ]);
+
         assert_eq!(cli.model.as_deref(), Some("qwen2.5-coder:7b"));
         assert_eq!(cli.max_steps, 5);
         assert!(cli.is_read_only);
@@ -151,30 +154,34 @@ mod tests {
     #[test]
     fn parses_agent_subcommand_with_task() {
         let cli = Cli::parse_from(["openbatrangs", "agent", "write", "tests"]);
-        match cli.command {
-            Some(Commands::Agent { task }) => assert_eq!(task, vec!["write", "tests"]),
-            _ => panic!("expected agent subcommand"),
-        }
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent { task }) if task == ["write", "tests"]
+        ));
     }
 
     #[test]
     fn parses_setup_subcommand() {
         let cli = Cli::parse_from(["openbatrangs", "setup"]);
+
         assert!(matches!(cli.command, Some(Commands::Setup)));
     }
 
     #[test]
     fn parses_doctor_subcommand() {
         let cli = Cli::parse_from(["openbatrangs", "doctor"]);
+
         assert!(matches!(cli.command, Some(Commands::Doctor)));
     }
 
     #[test]
     fn parses_pull_subcommand_with_model() {
         let cli = Cli::parse_from(["openbatrangs", "pull", "samantha-mistral:7b"]);
-        match cli.command {
-            Some(Commands::Pull { model }) => assert_eq!(model, "samantha-mistral:7b"),
-            _ => panic!("expected pull subcommand"),
-        }
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Pull { model }) if model == "samantha-mistral:7b"
+        ));
     }
 }

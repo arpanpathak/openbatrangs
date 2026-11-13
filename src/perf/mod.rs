@@ -7,12 +7,13 @@
 mod gpu;
 
 use crate::constants::perf::{
-    GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
+    CPU_TICK_FIELDS, GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
 };
 use gpu::{GpuStats, parse_nvidia_smi, parse_tegrastats};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Instant;
 
@@ -56,12 +57,12 @@ struct CpuSampler {
 }
 
 impl CpuSampler {
-    /// Create a new sampler and prime the delta so the first real sample is usable.
+    /// Create a sampler that holds a first reading, so the first real sample
+    /// already has a delta to measure.
     fn new() -> Self {
-        let mut sampler = Self { previous: None };
-        // Prime the delta so the first visible sample is meaningful.
-        let _ = sampler.sample();
-        sampler
+        Self {
+            previous: read_cpu_times(),
+        }
     }
 
     /// Take a new CPU utilization sample as a percentage (0–100).
@@ -71,21 +72,32 @@ impl CpuSampler {
     /// CPU utilization percentage, or `None` if `/proc/stat` is unreadable.
     fn sample(&mut self) -> Option<f64> {
         let current = read_cpu_times()?;
-        let utilization = match self.previous {
-            Some((previous_idle, previous_total)) => {
-                let idle_delta = current.0.saturating_sub(previous_idle);
-                let total_delta = current.1.saturating_sub(previous_total);
-                if total_delta == 0 {
-                    None
-                } else {
-                    Some(100.0 * (1.0 - idle_delta as f64 / total_delta as f64))
-                }
-            }
-            None => None,
-        };
+        let utilization = cpu_utilization(self.previous, current);
+
         self.previous = Some(current);
+
         utilization
     }
+}
+
+/// Busy percentage between two `(idle_total, total)` tick readings, or `None`
+/// without an earlier reading.
+fn cpu_utilization(previous: Option<(u64, u64)>, current: (u64, u64)) -> Option<f64> {
+    let (previous_idle, previous_total) = previous?;
+    let idle_delta = current.0.saturating_sub(previous_idle);
+    let total_delta = current.1.saturating_sub(previous_total);
+
+    busy_percent(idle_delta, total_delta)
+}
+
+/// The share of `total_delta` ticks that were not idle, as a percentage, or
+/// `None` when no ticks passed.
+fn busy_percent(idle_delta: u64, total_delta: u64) -> Option<f64> {
+    if total_delta == 0 {
+        return None;
+    }
+
+    Some(100.0 * (1.0 - idle_delta as f64 / total_delta as f64))
 }
 
 /// Monitors system stats and the latest `tegrastats` line.
@@ -121,35 +133,19 @@ impl PerfMonitor {
             .last_sample
             .map(|last| now.duration_since(last) >= SAMPLE_INTERVAL)
             .unwrap_or(true);
+
         if !is_due {
             return None;
         }
+
         self.last_sample = Some(now);
+
         Some(self.sample())
     }
 
     /// Collect a full system snapshot from tegrastats/nvidia-smi and /proc.
     fn sample(&mut self) -> SystemStats {
-        let latest_tegrastats = self
-            .tegrastats
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let tegrastats_stats = latest_tegrastats.as_deref().and_then(parse_tegrastats);
-        let gpu = match &tegrastats_stats {
-            // On Jetson, tegrastats RAM is the shared system memory, not a
-            // dedicated VRAM pool; leave GPU memory fields for nvidia-smi only.
-            Some(stats) => GpuStats {
-                name: None,
-                util_percent: stats.util_percent,
-                memory_used_mb: None,
-                memory_total_mb: None,
-                power_watts: stats.power_watts,
-                temp_c: stats.temp_c,
-            },
-            None => self.cached_nvidia_smi(),
-        };
-        // Match jtop: green used = (Total - Free - Buffers - Cached) - shared.
+        let gpu = self.gpu_stats();
         let memory = read_memory_mb();
 
         SystemStats {
@@ -160,9 +156,7 @@ impl PerfMonitor {
             gpu_power_watts: gpu.power_watts,
             gpu_temp_c: gpu.temp_c,
             cpu_util_percent: self.cpu.sample(),
-            cpu_cores: std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(1),
+            cpu_cores: logical_cores(),
             memory_used_mb: memory.used_mb,
             memory_total_mb: memory.total_mb,
             memory_shared_mb: memory.shared_mb,
@@ -172,22 +166,67 @@ impl PerfMonitor {
         }
     }
 
+    /// GPU metrics from the latest `tegrastats` line, else from `nvidia-smi`.
+    fn gpu_stats(&mut self) -> GpuStats {
+        let latest_line = self.latest_tegrastats_line();
+
+        match latest_line.as_deref().and_then(parse_tegrastats) {
+            Some(stats) => jetson_gpu_stats(stats),
+            None => self.cached_nvidia_smi(),
+        }
+    }
+
+    /// The newest `tegrastats` line, or `None` before the first one arrives.
+    fn latest_tegrastats_line(&self) -> Option<String> {
+        self.tegrastats
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Query `nvidia-smi`, reusing the last result within `GPU_CACHE_TTL`.
     fn cached_nvidia_smi(&mut self) -> GpuStats {
         let now = Instant::now();
-        if let Some((cached_at, cached)) = &self.gpu_cache
-            && now.duration_since(*cached_at) < GPU_CACHE_TTL
-        {
-            return cached.clone();
+
+        if let Some(cached) = self.fresh_gpu_cache(now) {
+            return cached;
         }
+
         let fresh = parse_nvidia_smi().unwrap_or_default();
         self.gpu_cache = Some((now, fresh.clone()));
+
         fresh
+    }
+
+    /// The cached `nvidia-smi` result when it is younger than `GPU_CACHE_TTL`.
+    fn fresh_gpu_cache(&self, now: Instant) -> Option<GpuStats> {
+        let (cached_at, cached) = self.gpu_cache.as_ref()?;
+        let is_fresh = now.duration_since(*cached_at) < GPU_CACHE_TTL;
+
+        is_fresh.then(|| cached.clone())
     }
 }
 
+/// GPU metrics on Jetson. The `tegrastats` RAM figure is the shared system
+/// memory, not a dedicated VRAM pool, so the GPU memory fields stay empty.
+fn jetson_gpu_stats(stats: GpuStats) -> GpuStats {
+    GpuStats {
+        name: None,
+        memory_used_mb: None,
+        memory_total_mb: None,
+        ..stats
+    }
+}
+
+/// Number of logical CPU cores, or 1 when the count is unknown.
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
 /// Spawn `tegrastats` in the background and keep its latest line in `shared`.
-pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<std::process::Child> {
+pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<Child> {
     let mut child = Command::new("tegrastats")
         .arg("--interval")
         .arg(TEGRASTATS_INTERVAL_MILLIS)
@@ -196,19 +235,29 @@ pub fn start_tegrastats(shared: Arc<Mutex<Option<String>>>) -> Option<std::proce
         .spawn()
         .ok()?;
     let stdout = child.stdout.take()?;
-    thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(mut guard) = shared.lock() {
-                *guard = Some(line);
-            }
-        }
-    });
+
+    thread::spawn(move || keep_latest_line(BufReader::new(stdout), &shared));
+
     Some(child)
 }
 
+/// Store each line `reader` produces in `shared`, replacing the one before.
+fn keep_latest_line(reader: impl BufRead, shared: &Mutex<Option<String>>) {
+    for line in reader.lines().map_while(Result::ok) {
+        store_line(shared, line);
+    }
+}
+
+/// Replace the stored line. A poisoned lock reads as no line at all, so the
+/// line is stored even then.
+fn store_line(shared: &Mutex<Option<String>>, line: String) {
+    let mut latest = shared.lock().unwrap_or_else(PoisonError::into_inner);
+
+    *latest = Some(line);
+}
+
 /// Kills the background `tegrastats` process when dropped.
-pub struct TegrastatsGuard(Option<std::process::Child>);
+pub struct TegrastatsGuard(Option<Child>);
 
 impl TegrastatsGuard {
     /// Spawn `tegrastats` and return a guard that kills it on drop.
@@ -223,11 +272,19 @@ impl TegrastatsGuard {
 
 impl Drop for TegrastatsGuard {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let Some(child) = &mut self.0 else {
+            return;
+        };
+
+        stop_child(child);
     }
+}
+
+/// Kill `child` and wait for it to exit.
+fn stop_child(child: &mut Child) {
+    // An error here means the process has already exited; nothing is left to stop.
+    child.kill().ok();
+    child.wait().ok();
 }
 
 /// System memory breakdown matching jtop's RAM page.
@@ -246,44 +303,46 @@ struct MemoryStats {
     free_mb: u64,
 }
 
-/// Parse `/proc/meminfo` into a structured memory breakdown.
+/// Read `/proc/meminfo` into a structured memory breakdown.
 fn read_memory_mb() -> MemoryStats {
-    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let mut total_kb = 0u64;
-    let mut free_kb = 0u64;
-    let mut buffers_kb = 0u64;
-    let mut cached_kb = 0u64;
-    let mut reclaimable_kb = 0u64;
-    let mut shared_kb = 0u64;
-    for line in content.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "MemTotal" => total_kb = parse_kibibytes(value),
-            "MemFree" => free_kb = parse_kibibytes(value),
-            "Buffers" => buffers_kb = parse_kibibytes(value),
-            "Cached" => cached_kb = parse_kibibytes(value),
-            "SReclaimable" => reclaimable_kb = parse_kibibytes(value),
-            "NvMapMemUsed" => shared_kb = parse_kibibytes(value),
-            _ => {}
-        }
-    }
-    let total_mb = total_kb / KIB_PER_MIB;
-    let free_mb = free_kb / KIB_PER_MIB;
-    let buffers_mb = buffers_kb / KIB_PER_MIB;
-    let cached_mb = (cached_kb + reclaimable_kb) / KIB_PER_MIB;
-    let shared_mb = shared_kb / KIB_PER_MIB;
-    let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb + reclaimable_kb);
-    let used_mb = used_kb.saturating_sub(shared_kb) / KIB_PER_MIB;
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+
+    memory_stats(&meminfo)
+}
+
+/// The memory breakdown from the text of `/proc/meminfo`.
+///
+/// "Used" matches jtop: `Total - Free - Buffers - Cached - SReclaimable`,
+/// minus the memory shared with the GPU.
+fn memory_stats(meminfo: &str) -> MemoryStats {
+    let fields = meminfo_fields(meminfo);
+    let field = |name: &str| fields.get(name).copied().unwrap_or(0);
+
+    let total_kb = field("MemTotal");
+    let free_kb = field("MemFree");
+    let buffers_kb = field("Buffers");
+    let cached_kb = field("Cached") + field("SReclaimable");
+    let shared_kb = field("NvMapMemUsed");
+
+    let used_kb = total_kb.saturating_sub(free_kb + buffers_kb + cached_kb);
+
     MemoryStats {
-        used_mb,
-        total_mb,
-        shared_mb,
-        buffers_mb,
-        cached_mb,
-        free_mb,
+        used_mb: used_kb.saturating_sub(shared_kb) / KIB_PER_MIB,
+        total_mb: total_kb / KIB_PER_MIB,
+        shared_mb: shared_kb / KIB_PER_MIB,
+        buffers_mb: buffers_kb / KIB_PER_MIB,
+        cached_mb: cached_kb / KIB_PER_MIB,
+        free_mb: free_kb / KIB_PER_MIB,
     }
+}
+
+/// Every `Key: value kB` line of `/proc/meminfo`, as kibibytes by key.
+fn meminfo_fields(meminfo: &str) -> HashMap<&str, u64> {
+    meminfo
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), parse_kibibytes(value)))
+        .collect()
 }
 
 /// Parse a numeric value followed by a unit from a `/proc` line (e.g. "12345 kB").
@@ -300,26 +359,46 @@ fn parse_kibibytes(rest: &str) -> u64 {
 ///
 /// `(idle_total, total)` tick counts, or `None` if the file is unreadable.
 fn read_cpu_times() -> Option<(u64, u64)> {
-    let content = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = content.lines().next()?;
-    let mut fields = line.split_whitespace().skip(1);
-    let user: u64 = fields.next()?.parse().ok()?;
-    let nice: u64 = fields.next()?.parse().ok()?;
-    let system: u64 = fields.next()?.parse().ok()?;
-    let idle: u64 = fields.next()?.parse().ok()?;
-    let iowait: u64 = fields.next()?.parse().ok()?;
-    let irq: u64 = fields.next()?.parse().ok()?;
-    let softirq: u64 = fields.next()?.parse().ok()?;
-    let steal: u64 = fields.next()?.parse().ok()?;
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+
+    cpu_times(&stat)
+}
+
+/// `(idle_total, total)` from the aggregate `cpu` line, the first line of
+/// `/proc/stat`, or `None` when it lacks eight numeric tick counts.
+fn cpu_times(stat: &str) -> Option<(u64, u64)> {
+    let first_line = stat.lines().next().unwrap_or_default();
+    let ticks: Option<Vec<u64>> = first_line
+        .split_whitespace()
+        .skip(1)
+        .take(CPU_TICK_FIELDS)
+        .map(|field| field.parse().ok())
+        .collect();
+
+    tick_totals(&ticks?)
+}
+
+/// `(idle + iowait, sum of all eight)` from the ticks user, nice, system,
+/// idle, iowait, irq, softirq and steal.
+fn tick_totals(ticks: &[u64]) -> Option<(u64, u64)> {
+    let [user, nice, system, idle, iowait, irq, softirq, steal] = ticks else {
+        return None;
+    };
 
     let idle_total = idle + iowait;
     let total = user + nice + system + idle + iowait + irq + softirq + steal;
+
     Some((idle_total, total))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A `/proc/meminfo` excerpt with every field the breakdown reads.
+    const MEMINFO: &str = "MemTotal: 16384 kB\nMemFree: 2048 kB\nBuffers: 1024 kB\n\
+        Cached: 3072 kB\nSReclaimable: 1024 kB\nNvMapMemUsed: 2048 kB\nno colon here\n";
 
     #[test]
     fn parses_kibibytes_value() {
@@ -328,12 +407,46 @@ mod tests {
         assert_eq!(parse_kibibytes("garbage"), 0);
     }
 
+    #[test]
+    fn memory_breakdown_matches_jtop() {
+        let memory = memory_stats(MEMINFO);
+
+        assert_eq!(memory.total_mb, 16);
+        assert_eq!(memory.free_mb, 2);
+        assert_eq!(memory.buffers_mb, 1);
+        assert_eq!(memory.cached_mb, 4);
+        assert_eq!(memory.shared_mb, 2);
+        assert_eq!(memory.used_mb, 7);
+    }
+
+    #[test]
+    fn cpu_times_sum_the_first_eight_ticks() {
+        let stat = "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 1 1 1 1 1 1 1\n";
+
+        assert_eq!(cpu_times(stat), Some((9, 36)));
+    }
+
+    #[test]
+    fn cpu_times_need_eight_numbers() {
+        assert_eq!(cpu_times(""), None);
+        assert_eq!(cpu_times("cpu 1 2 3"), None);
+        assert_eq!(cpu_times("cpu 1 2 x 4 5 6 7 8"), None);
+    }
+
+    #[test]
+    fn cpu_utilization_is_the_busy_share_of_new_ticks() {
+        assert_eq!(cpu_utilization(None, (10, 100)), None);
+        assert_eq!(cpu_utilization(Some((10, 100)), (10, 100)), None);
+        assert_eq!(cpu_utilization(Some((10, 100)), (35, 200)), Some(75.0));
+    }
+
     // `/proc` exists only on Linux. These two read the real kernel files, so
     // they are meaningless (and fail) on macOS and Windows builds.
     #[cfg(target_os = "linux")]
     #[test]
     fn reads_memory_from_proc_meminfo() {
         let memory = read_memory_mb();
+
         assert!(memory.total_mb > 0);
         assert!(memory.free_mb <= memory.total_mb);
         assert!(memory.used_mb <= memory.total_mb);
@@ -341,47 +454,76 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn reads_cpu_times_from_proc_stat() {
-        let times = read_cpu_times();
-        assert!(times.is_some());
-        let (idle, total) = times.unwrap();
-        assert!(idle <= total);
-        assert!(total > 0);
-    }
-
-    #[test]
-    fn cpu_sampler_primes_without_panicking() {
+    fn cpu_sampler_reads_proc_stat() {
         let mut sampler = CpuSampler::new();
-        // The second read can legitimately be `None` when `/proc/stat` counters
-        // did not advance between samples; the point of this test is that
-        // sampling never panics.
-        let _ = sampler.sample();
-        let _ = sampler.sample();
+
+        assert!(sampler.previous.is_some());
+
+        // The share is `None` when no ticks passed between the two readings.
+        let utilization = sampler.sample().unwrap_or(0.0);
+
+        assert!((0.0..=100.0).contains(&utilization));
     }
 
     #[test]
     fn perf_monitor_samples_when_due_and_skips_early_samples() {
-        use std::time::Duration;
-
         let shared = Arc::new(Mutex::new(Some(
             "RAM 100/1000MB GR3D_FREQ 10% gpu@40C VDD_IN 5000mW/".to_string(),
         )));
         let mut monitor = PerfMonitor::new(shared);
         let now = Instant::now();
+
         let first = monitor.sample_if_due(now);
-        assert!(first.is_some());
-        let stats = first.unwrap();
+        let not_due = monitor.sample_if_due(now + Duration::from_millis(1));
+        let stats = first.unwrap_or_default();
+
         assert_eq!(stats.gpu_util_percent, Some(10.0));
         assert_eq!(stats.gpu_temp_c, Some(40.0));
         assert_eq!(stats.gpu_power_watts, Some(5.0));
-        let not_due = monitor.sample_if_due(now + Duration::from_millis(1));
+        assert_eq!(stats.gpu_memory_total_mb, None);
         assert!(not_due.is_none());
+    }
+
+    #[test]
+    fn nvidia_smi_result_is_reused_within_the_cache_time() {
+        let mut monitor = PerfMonitor::new(Arc::new(Mutex::new(None)));
+
+        let first = monitor.gpu_stats();
+        let second = monitor.gpu_stats();
+
+        assert_eq!(first.name, second.name);
+    }
+
+    #[test]
+    fn latest_line_replaces_the_one_before() {
+        let shared = Mutex::new(None);
+
+        keep_latest_line("first\nsecond\n".as_bytes(), &shared);
+
+        let latest = shared.lock().map(|guard| guard.clone()).unwrap_or_default();
+
+        assert_eq!(latest.as_deref(), Some("second"));
     }
 
     #[test]
     fn tegrastats_guard_handles_missing_binary() {
         let shared = Arc::new(Mutex::new(None));
         let guard = TegrastatsGuard::start(shared);
+
         drop(guard);
+    }
+
+    #[test]
+    fn guard_without_a_process_does_nothing() {
+        drop(TegrastatsGuard(None));
+    }
+
+    #[test]
+    fn guard_stops_its_process() -> anyhow::Result<()> {
+        let child = Command::new("sleep").arg("30").spawn()?;
+
+        drop(TegrastatsGuard(Some(child)));
+
+        Ok(())
     }
 }

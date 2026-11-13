@@ -30,26 +30,38 @@ pub fn total_system_memory_bytes() -> u64 {
     ProcMemoryInfo.total_memory_bytes()
 }
 
-/// Parse `MemTotal` from `/proc/meminfo` and return total RAM in bytes.
+/// Total RAM in bytes from `/proc/meminfo`, else from `sysctl`.
 ///
-/// Falls back to [`FALLBACK_SYSTEM_MEMORY_BYTES`] when the file is missing or
-/// the value cannot be parsed, so model selection always has a usable budget.
-///
-/// # Returns
-///
-/// Total physical memory in bytes.
+/// Falls back to [`FALLBACK_SYSTEM_MEMORY_BYTES`] when neither source gives a
+/// value, so model selection always has a usable budget.
 fn read_memtotal_from_proc() -> u64 {
-    let content = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kilobytes: u64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES / BYTES_PER_KIB);
-            return kilobytes * BYTES_PER_KIB;
-        }
-    }
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+
+    memtotal_bytes(&meminfo).unwrap_or_else(memory_from_sysctl)
+}
+
+/// `MemTotal` from the text of `/proc/meminfo`, in bytes, or `None` when the
+/// text has no `MemTotal` line.
+fn memtotal_bytes(meminfo: &str) -> Option<u64> {
+    let value = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+
+    Some(kibibytes_or_fallback(value) * BYTES_PER_KIB)
+}
+
+/// The number of kibibytes in a value such as ` 16384 kB`; an unreadable
+/// value counts as [`FALLBACK_SYSTEM_MEMORY_BYTES`].
+fn kibibytes_or_fallback(value: &str) -> u64 {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES / BYTES_PER_KIB)
+}
+
+/// Total RAM from `sysctl`, or [`FALLBACK_SYSTEM_MEMORY_BYTES`] without it.
+fn memory_from_sysctl() -> u64 {
     read_memsize_from_sysctl().unwrap_or(FALLBACK_SYSTEM_MEMORY_BYTES)
 }
 
@@ -59,6 +71,7 @@ fn read_memsize_from_sysctl() -> Option<u64> {
         .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
+
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
@@ -77,12 +90,39 @@ mod tests {
     #[test]
     fn memory_info_trait_is_mockable() {
         let fake = FakeMemory(123);
+
         assert_eq!(fake.total_memory_bytes(), 123);
     }
 
     #[test]
     fn proc_memory_returns_positive_total() {
         assert!(ProcMemoryInfo.total_memory_bytes() > 0);
+    }
+
+    #[test]
+    fn memtotal_is_read_in_kibibytes() {
+        assert_eq!(
+            memtotal_bytes("MemFree: 1 kB\nMemTotal:  16 kB\n"),
+            Some(16 * BYTES_PER_KIB)
+        );
+    }
+
+    #[test]
+    fn unreadable_memtotal_uses_the_fallback() {
+        assert_eq!(
+            memtotal_bytes("MemTotal: many kB"),
+            Some(FALLBACK_SYSTEM_MEMORY_BYTES)
+        );
+    }
+
+    #[test]
+    fn meminfo_without_memtotal_has_no_total() {
+        assert_eq!(memtotal_bytes("MemFree: 1 kB"), None);
+    }
+
+    #[test]
+    fn sysctl_or_fallback_is_positive() {
+        assert!(memory_from_sysctl() > 0);
     }
 
     #[test]
