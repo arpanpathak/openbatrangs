@@ -131,3 +131,12 @@ pub const PARAMETERS_MILLION_DIVISOR: f64 = 1_000.0;
 
 /// Divisor used to render a context length in thousands (32768 -> 32K).
 pub const CONTEXT_LENGTH_KILO_DIVISOR: u64 = 1_000;
+
+/// Parameter-count tiers below [`MAX_LARGE_MODEL_B`], in billions: each range
+/// with its score multiplier. Larger models get [`SIZE_FACTOR_HUGE`], and
+/// counts outside every range get [`SIZE_FACTOR_UNKNOWN`].
+pub const PARAMETER_SIZE_TIERS: [(std::ops::Range<f64>, f64); 3] = [
+    (MIN_SMALL_MODEL_B..MAX_SMALL_MODEL_B, SIZE_FACTOR_SMALL),
+    (MAX_SMALL_MODEL_B..MAX_MEDIUM_MODEL_B, SIZE_FACTOR_MEDIUM),
+    (MAX_MEDIUM_MODEL_B..MAX_LARGE_MODEL_B, SIZE_FACTOR_LARGE),
+];

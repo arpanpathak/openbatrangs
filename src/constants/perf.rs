@@ -22,3 +22,7 @@ pub const MIB_PER_GIB: f64 = 1_024.0;
 
 /// Kibibytes per mebibyte for `/proc/meminfo` conversions.
 pub const KIB_PER_MIB: u64 = 1_024;
+
+/// Number of tick counts summed from the `cpu` line of `/proc/stat`: user,
+/// nice, system, idle, iowait, irq, softirq and steal.
+pub const CPU_TICK_FIELDS: usize = 8;

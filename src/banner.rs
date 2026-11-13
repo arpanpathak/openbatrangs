@@ -151,6 +151,7 @@ mod tests {
         for row in &rows[..BATARANG_LEFT_HALF.len()] {
             let shape = row.trim();
             let reversed: String = shape.chars().rev().collect();
+
             assert_eq!(shape, reversed);
         }
     }

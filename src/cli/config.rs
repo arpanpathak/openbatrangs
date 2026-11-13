@@ -81,6 +81,7 @@ pub(crate) fn searxng_url(cli: &Cli) -> String {
     } else {
         DEFAULT_SEARXNG_URL
     };
+
     cli.searxng_url
         .as_deref()
         .unwrap_or(fallback)
@@ -91,16 +92,40 @@ pub(crate) fn searxng_url(cli: &Cli) -> String {
 /// The key a search sends: the Thor's access key when `--thor` searches through
 /// the Thor's agent, nothing for a SearXNG named by flag or environment.
 pub(crate) fn search_key(cli: &Cli) -> Option<String> {
-    if cli.searxng_url.is_some() || !cli.thor {
+    if !searches_through_thor(cli) {
         return None;
     }
-    let path = cli
-        .api_key_file
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(THOR_KEY_FILE)))?;
-    std::fs::read_to_string(path)
+
+    thor_key(cli, home_directory())
+}
+
+/// Whether web searches go to the Thor's agent: `--thor` without a SearXNG
+/// address of its own.
+fn searches_through_thor(cli: &Cli) -> bool {
+    cli.searxng_url.is_none() && cli.thor
+}
+
+/// The Thor's access key, without surrounding whitespace, or `None` when the
+/// key file cannot be read.
+fn thor_key(cli: &Cli, home: Option<PathBuf>) -> Option<String> {
+    let key_file = thor_key_file(cli, home)?;
+
+    std::fs::read_to_string(key_file)
         .ok()
         .map(|key| key.trim().to_string())
+}
+
+/// The file holding the Thor's access key: `--api-key-file`, else
+/// `THOR_KEY_FILE` under `home`.
+pub(crate) fn thor_key_file(cli: &Cli, home: Option<PathBuf>) -> Option<PathBuf> {
+    let home_key_file = home.map(|home| home.join(THOR_KEY_FILE));
+
+    cli.api_key_file.clone().or(home_key_file)
+}
+
+/// The user's home directory from `$HOME`.
+pub(crate) fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -126,6 +151,7 @@ mod tests {
     #[test]
     fn model_prefs_reflect_cli_options() {
         let prefs = model_prefs_from_cli(&sample_cli());
+
         assert_eq!(prefs.model.as_deref(), Some("qwen2.5-coder:3b"));
         assert!(prefs.is_auto_pull_disabled);
         assert_eq!(prefs.min_context, 4_096);
@@ -134,6 +160,7 @@ mod tests {
     #[test]
     fn agent_run_config_uses_agent_mode_and_thinking() {
         let config = agent_run_config(&sample_cli());
+
         assert_eq!(config.mode, AgentMode::Agent);
         assert!(config.show_thinking);
         assert!(config.is_read_only);
@@ -153,6 +180,7 @@ mod tests {
     fn model_prefs_default_when_model_omitted() {
         let cli = Cli::parse_from(["openbatrangs"]);
         let prefs = model_prefs_from_cli(&cli);
+
         assert!(prefs.model.is_none());
         assert!(!prefs.is_auto_pull_disabled);
         assert_eq!(prefs.min_context, 8_192);
@@ -161,15 +189,18 @@ mod tests {
     #[test]
     fn searxng_url_defaults_to_localhost_and_trims_the_trailing_slash() {
         let cli = Cli::parse_from(["openbatrangs"]);
+
         assert_eq!(agent_run_config(&cli).searxng_url, DEFAULT_SEARXNG_URL);
 
         let flagged = Cli::parse_from(["openbatrangs", "--searxng-url", "http://thor:8080/"]);
+
         assert_eq!(agent_run_config(&flagged).searxng_url, "http://thor:8080");
     }
 
     #[test]
     fn thor_searches_through_the_agent() {
         let cli = Cli::parse_from(["openbatrangs", "--thor"]);
+
         assert_eq!(agent_run_config(&cli).searxng_url, THOR_OPENAI_URL);
 
         let named = Cli::parse_from([
@@ -178,7 +209,27 @@ mod tests {
             "--searxng-url",
             "http://other:8888",
         ]);
+
         assert_eq!(agent_run_config(&named).searxng_url, "http://other:8888");
         assert_eq!(agent_run_config(&named).search_key, None);
+    }
+
+    #[test]
+    fn thor_search_sends_the_key_from_the_key_file() -> anyhow::Result<()> {
+        let directory = crate::test_support::unique_temp_dir("openbatrangs-search-key");
+        let key_file = directory.join("api-key");
+        std::fs::write(&key_file, "  secret\n")?;
+        let key_arg = key_file.display().to_string();
+        let cli = Cli::parse_from(["openbatrangs", "--thor", "--api-key-file", &key_arg]);
+
+        assert_eq!(search_key(&cli), Some("secret".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn thor_key_is_missing_without_a_key_file_or_home() {
+        let cli = Cli::parse_from(["openbatrangs", "--thor"]);
+
+        assert_eq!(thor_key(&cli, None), None);
     }
 }

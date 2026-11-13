@@ -7,11 +7,10 @@
 use crate::constants::models::{
     BYTES_PER_GIGABYTE, CODING_FALLBACK_BONUS, CODING_KEYWORDS, DEFAULT_CONTEXT_LENGTH,
     FALLBACK_7B_MEMORY_THRESHOLD_BYTES, FALLBACK_MODEL_3B, FALLBACK_MODEL_7B, IDEAL_CONTEXT_LENGTH,
-    MAX_LARGE_MODEL_B, MAX_MEDIUM_MODEL_B, MAX_SMALL_MODEL_B, MEMORY_COMFORT_DIVISOR,
-    MEMORY_FACTOR_COMFORTABLE, MEMORY_FACTOR_OVERFLOW, MEMORY_FACTOR_TIGHT, MEMORY_FACTOR_UNKNOWN,
-    MIN_CONTEXT_LENGTH, MIN_SMALL_MODEL_B, PARAMETERS_MILLION_DIVISOR, QUANT_FALLBACK_BONUS,
-    QUANT_KEYWORDS, SCORE_SCALE, SIZE_FACTOR_HUGE, SIZE_FACTOR_LARGE, SIZE_FACTOR_MEDIUM,
-    SIZE_FACTOR_SMALL, SIZE_FACTOR_UNKNOWN, STRONG_CODING_SCORE, WEIGHT_CODING, WEIGHT_CONTEXT,
+    MAX_LARGE_MODEL_B, MEMORY_COMFORT_DIVISOR, MEMORY_FACTOR_COMFORTABLE, MEMORY_FACTOR_OVERFLOW,
+    MEMORY_FACTOR_TIGHT, MEMORY_FACTOR_UNKNOWN, MIN_CONTEXT_LENGTH, PARAMETER_SIZE_TIERS,
+    PARAMETERS_MILLION_DIVISOR, QUANT_FALLBACK_BONUS, QUANT_KEYWORDS, SCORE_SCALE,
+    SIZE_FACTOR_HUGE, SIZE_FACTOR_UNKNOWN, STRONG_CODING_SCORE, WEIGHT_CODING, WEIGHT_CONTEXT,
     WEIGHT_MEMORY, WEIGHT_QUANTIZATION, WEIGHT_SIZE,
 };
 use crate::ollama::OllamaModel;
@@ -53,17 +52,25 @@ pub fn total_system_memory_bytes() -> u64 {
 /// Parameter count in billions of parameters (e.g. `7.6`, `0.87344`).
 fn parse_parameter_size(label: &str) -> f64 {
     let normalized = label.trim().to_ascii_lowercase();
-    let number: f64 = normalized
-        .chars()
-        .take_while(|character| character.is_ascii_digit() || *character == '.')
-        .collect::<String>()
-        .parse()
-        .unwrap_or(0.0);
+    let number = leading_number(&normalized);
+
     if normalized.contains('m') {
-        number / PARAMETERS_MILLION_DIVISOR
-    } else {
-        number
+        return number / PARAMETERS_MILLION_DIVISOR;
     }
+
+    number
+}
+
+/// The number at the start of `text`, or 0 when it does not start with one.
+fn leading_number(text: &str) -> f64 {
+    let digits: String = text.chars().take_while(is_number_character).collect();
+
+    digits.parse().unwrap_or(0.0)
+}
+
+/// Whether `character` can be part of a decimal number: a digit or a dot.
+fn is_number_character(character: &char) -> bool {
+    character.is_ascii_digit() || *character == '.'
 }
 
 /// Heuristic bonus for model names that indicate coding specialization.
@@ -109,35 +116,58 @@ fn quant_bonus(quantization: &str) -> f64 {
 /// `Some(ModelScore)` if the model meets the context requirement,
 /// otherwise `None`.
 pub fn score_model(model: &OllamaModel, mem_budget: u64, min_context: u64) -> Option<ModelScore> {
-    // Older Ollama tags can omit `details` entirely. Treat missing metadata as
-    // "unknown" instead of silently dropping the model from scoring/listing.
-    let details = model.details.as_ref();
-    let context = details
-        .and_then(|details| details.context_length)
-        .unwrap_or(DEFAULT_CONTEXT_LENGTH)
-        .max(MIN_CONTEXT_LENGTH);
-    let parameter_label = details
-        .and_then(|details| details.parameter_size.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    let quantization_label = details
-        .and_then(|details| details.quantization_level.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let context = context_length(model);
 
     if context < min_context {
         return None;
     }
 
-    let parameters_b = parse_parameter_size(&parameter_label);
+    Some(scored_model(model, context, mem_budget))
+}
+
+/// The model's context window, with defaults for missing metadata.
+///
+/// Older Ollama tags can omit `details` entirely. Missing metadata counts as
+/// unknown instead of dropping the model from scoring and listing.
+fn context_length(model: &OllamaModel) -> u64 {
+    model
+        .details
+        .as_ref()
+        .and_then(|details| details.context_length)
+        .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+        .max(MIN_CONTEXT_LENGTH)
+}
+
+/// The parameter-count label, or `unknown`.
+fn parameter_label(model: &OllamaModel) -> String {
+    model
+        .details
+        .as_ref()
+        .and_then(|details| details.parameter_size.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The quantization label, or `unknown`.
+fn quantization_label(model: &OllamaModel) -> String {
+    model
+        .details
+        .as_ref()
+        .and_then(|details| details.quantization_level.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The weighted score of a model whose context window is large enough.
+fn scored_model(model: &OllamaModel, context: u64, mem_budget: u64) -> ModelScore {
+    let parameter_size = parameter_label(model);
+    let quantization = quantization_label(model);
     let mut reasons: Vec<String> = Vec::new();
 
     let memory_factor = memory_fit_factor(model, mem_budget, &mut reasons);
-    let size_factor = parameter_size_factor(parameters_b);
+    let size_factor = parameter_size_factor(parse_parameter_size(&parameter_size));
     let coding = coding_bonus(&model.name);
-    if coding >= STRONG_CODING_SCORE {
-        reasons.push("strong coding model name".to_string());
-    }
+    reasons.extend(coding_reason(coding));
     let context_factor = (context as f64 / IDEAL_CONTEXT_LENGTH).min(1.0);
-    let quantization_factor = quant_bonus(&quantization_label);
+    let quantization_factor = quant_bonus(&quantization);
 
     let score = memory_factor * WEIGHT_MEMORY
         + size_factor * WEIGHT_SIZE
@@ -145,15 +175,22 @@ pub fn score_model(model: &OllamaModel, mem_budget: u64, min_context: u64) -> Op
         + context_factor * WEIGHT_CONTEXT
         + quantization_factor * WEIGHT_QUANTIZATION;
 
-    Some(ModelScore {
+    ModelScore {
         name: model.name.clone(),
         size_bytes: model.size,
-        parameter_size: parameter_label,
+        parameter_size,
         context_length: context,
-        quantization: quantization_label,
+        quantization,
         score: score * SCORE_SCALE,
         reasons,
-    })
+    }
+}
+
+/// The reason shown for a model whose name marks it as a coding model.
+fn coding_reason(coding: f64) -> Option<String> {
+    let is_strong_coder = coding >= STRONG_CODING_SCORE;
+
+    is_strong_coder.then(|| "strong coding model name".to_string())
 }
 
 /// Compute the memory-fit factor for a model and append human-readable reasons.
@@ -161,35 +198,60 @@ fn memory_fit_factor(model: &OllamaModel, mem_budget: u64, reasons: &mut Vec<Str
     if model.size == 0 {
         return MEMORY_FACTOR_UNKNOWN;
     }
-    if model.size <= mem_budget / MEMORY_COMFORT_DIVISOR {
-        reasons.push(format!(
-            "fits comfortably ({:.1} GB / {:.1} GB budget)",
-            model.size as f64 / BYTES_PER_GIGABYTE,
-            mem_budget as f64 / BYTES_PER_GIGABYTE
-        ));
-        MEMORY_FACTOR_COMFORTABLE
-    } else if model.size <= mem_budget {
-        reasons.push("fits but leaves little headroom".to_string());
-        MEMORY_FACTOR_TIGHT
-    } else {
-        reasons.push(format!(
-            "model file ({:.1} GB) exceeds memory budget ({:.1} GB)",
-            model.size as f64 / BYTES_PER_GIGABYTE,
-            mem_budget as f64 / BYTES_PER_GIGABYTE
-        ));
-        MEMORY_FACTOR_OVERFLOW
+
+    let (factor, reason) = memory_fit(model.size, mem_budget);
+    reasons.push(reason);
+
+    factor
+}
+
+/// The memory-fit factor for a model file of `size` bytes, and its reason.
+fn memory_fit(size: u64, mem_budget: u64) -> (f64, String) {
+    let fits_comfortably = size <= mem_budget / MEMORY_COMFORT_DIVISOR;
+    let fits = size <= mem_budget;
+
+    match (fits_comfortably, fits) {
+        (true, _) => (
+            MEMORY_FACTOR_COMFORTABLE,
+            comfortable_reason(size, mem_budget),
+        ),
+        (false, true) => (
+            MEMORY_FACTOR_TIGHT,
+            "fits but leaves little headroom".to_string(),
+        ),
+        (false, false) => (MEMORY_FACTOR_OVERFLOW, overflow_reason(size, mem_budget)),
     }
+}
+
+/// The reason for a model that fits in half the memory budget.
+fn comfortable_reason(size: u64, mem_budget: u64) -> String {
+    format!(
+        "fits comfortably ({:.1} GB / {:.1} GB budget)",
+        size as f64 / BYTES_PER_GIGABYTE,
+        mem_budget as f64 / BYTES_PER_GIGABYTE
+    )
+}
+
+/// The reason for a model larger than the memory budget.
+fn overflow_reason(size: u64, mem_budget: u64) -> String {
+    format!(
+        "model file ({:.1} GB) exceeds memory budget ({:.1} GB)",
+        size as f64 / BYTES_PER_GIGABYTE,
+        mem_budget as f64 / BYTES_PER_GIGABYTE
+    )
 }
 
 /// Parameter-size factor favoring 4B-8B coding models on edge devices.
 fn parameter_size_factor(parameters_b: f64) -> f64 {
-    match parameters_b {
-        p if (MIN_SMALL_MODEL_B..MAX_SMALL_MODEL_B).contains(&p) => SIZE_FACTOR_SMALL,
-        p if (MAX_SMALL_MODEL_B..MAX_MEDIUM_MODEL_B).contains(&p) => SIZE_FACTOR_MEDIUM,
-        p if (MAX_MEDIUM_MODEL_B..MAX_LARGE_MODEL_B).contains(&p) => SIZE_FACTOR_LARGE,
-        p if p >= MAX_LARGE_MODEL_B => SIZE_FACTOR_HUGE,
-        _ => SIZE_FACTOR_UNKNOWN,
+    if parameters_b >= MAX_LARGE_MODEL_B {
+        return SIZE_FACTOR_HUGE;
     }
+
+    PARAMETER_SIZE_TIERS
+        .iter()
+        .find(|(range, _factor)| range.contains(&parameters_b))
+        .map(|(_range, factor)| *factor)
+        .unwrap_or(SIZE_FACTOR_UNKNOWN)
 }
 
 /// Score and sort all models, best first.
@@ -237,20 +299,35 @@ pub fn recommended_fallback_model(mem_budget: u64) -> &'static str {
 /// - `name`: user-supplied model identifier.
 ///
 /// # Returns
-/// `true` if the name ends with `.gguf`, contains a path separator, or exists
-/// as a file on disk.
+/// `true` if the name ends with `.gguf`, is absolute, starts with a dot,
+/// contains `..` or a backslash, or exists as a file on disk.
 pub fn looks_like_path(name: &str) -> bool {
-    name.ends_with(".gguf")
-        || Path::new(name).is_absolute()
-        || name.starts_with('.')
-        || name.contains("..")
-        || name.contains('\\')
-        || Path::new(name).exists()
+    let path = Path::new(name);
+    let path_signs = [
+        name.ends_with(".gguf"),
+        path.is_absolute(),
+        name.starts_with('.'),
+        name.contains(".."),
+        name.contains('\\'),
+    ];
+
+    path_signs.contains(&true) || path.exists()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::sample_model;
+    use anyhow::{Context, Result};
+
+    /// A model as old Ollama versions list it: a name and a size, no details.
+    fn legacy_model() -> OllamaModel {
+        OllamaModel {
+            name: "legacy:latest".to_string(),
+            size: 1_000_000_000,
+            details: None,
+        }
+    }
 
     #[test]
     fn parses_parameter_sizes() {
@@ -266,70 +343,98 @@ mod tests {
         assert!(coding_bonus("llama3.2:3b") < 1.0);
     }
 
-    fn model(name: &str, context: u64, params: &str, quant: &str, size: u64) -> OllamaModel {
-        serde_json::from_value(serde_json::json!({
-            "name": name,
-            "size": size,
-            "details": {
-                "parameter_size": params,
-                "quantization_level": quant,
-                "context_length": context,
-            },
-        }))
-        .expect("valid model JSON")
-    }
-
     #[test]
-    fn score_model_returns_none_below_min_context() {
-        let model = model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000);
+    fn score_model_returns_none_below_min_context() -> Result<()> {
+        let model = sample_model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000)?;
+
         assert!(score_model(&model, 8_000_000_000, 8_192).is_none());
+        Ok(())
     }
 
     #[test]
-    fn score_model_includes_models_without_details() {
-        let model = OllamaModel {
-            name: "legacy:latest".to_string(),
-            size: 1_000_000_000,
-            details: None,
-        };
-        let scored =
-            score_model(&model, 16_000_000_000, 4_096).expect("missing details should score");
+    fn score_model_includes_models_without_details() -> Result<()> {
+        let scored = score_model(&legacy_model(), 16_000_000_000, 4_096)
+            .context("missing details should score")?;
+
         assert_eq!(scored.name, "legacy:latest");
         assert_eq!(scored.parameter_size, "unknown");
         assert_eq!(scored.quantization, "unknown");
         assert!(scored.score > 0.0);
+        Ok(())
     }
 
     #[test]
-    fn score_models_keeps_models_without_details() {
-        let legacy = OllamaModel {
-            name: "legacy:latest".to_string(),
-            size: 1_000_000_000,
-            details: None,
-        };
-        let modern = model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000);
-        let scored = score_models(&[legacy, modern], 16_000_000_000, 4_096);
+    fn score_models_keeps_models_without_details() -> Result<()> {
+        let modern = sample_model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000)?;
+
+        let scored = score_models(&[legacy_model(), modern], 16_000_000_000, 4_096);
+
         assert_eq!(scored.len(), 2);
         assert_eq!(scored[0].name, "qwen2.5-coder:7b");
         assert_eq!(scored[1].name, "legacy:latest");
+        Ok(())
     }
 
     #[test]
-    fn score_model_returns_some_when_context_meets_minimum() {
-        let model = model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000);
-        let scored = score_model(&model, 16_000_000_000, 8_192).unwrap();
+    fn score_model_returns_some_when_context_meets_minimum() -> Result<()> {
+        let model = sample_model("qwen2.5-coder:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000)?;
+
+        let scored = score_model(&model, 16_000_000_000, 8_192).context("model should score")?;
+
         assert_eq!(scored.name, "qwen2.5-coder:7b");
         assert!(scored.score > 0.0);
         assert!(scored.score <= 100.0);
+        assert!(
+            scored
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("strong coding"))
+        );
+        Ok(())
     }
 
     #[test]
-    fn score_models_sorts_best_first() {
-        let good = model("good:7b", 32_768, "7B", "Q4_K_M", 4_000_000_000);
-        let meh = model("meh:3b", 8_192, "3B", "Q4_0", 2_000_000_000);
-        let scored = score_models(&[meh.clone(), good.clone()], 16_000_000_000, 8_192);
+    fn score_models_sorts_best_first() -> Result<()> {
+        let good = sample_model("good:7b", 32_768, "7B", "Q4_K_M", 4_000_000_000)?;
+        let meh = sample_model("meh:3b", 8_192, "3B", "Q4_0", 2_000_000_000)?;
+
+        let scored = score_models(&[meh, good], 16_000_000_000, 8_192);
+
         assert_eq!(scored[0].name, "good:7b");
         assert_eq!(scored[1].name, "meh:3b");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_fit_depends_on_the_share_of_the_budget() {
+        assert_eq!(memory_fit(4, 10).0, MEMORY_FACTOR_COMFORTABLE);
+        assert_eq!(memory_fit(8, 10).0, MEMORY_FACTOR_TIGHT);
+        assert_eq!(memory_fit(12, 10).0, MEMORY_FACTOR_OVERFLOW);
+        assert!(memory_fit(12, 10).1.contains("exceeds memory budget"));
+    }
+
+    #[test]
+    fn model_without_a_size_has_unknown_memory_fit() {
+        let model = OllamaModel {
+            size: 0,
+            ..legacy_model()
+        };
+        let mut reasons = Vec::new();
+
+        assert_eq!(
+            memory_fit_factor(&model, 10, &mut reasons),
+            MEMORY_FACTOR_UNKNOWN
+        );
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn parameter_size_factor_prefers_medium_models() {
+        assert_eq!(parameter_size_factor(0.5), SIZE_FACTOR_UNKNOWN);
+        assert_eq!(parameter_size_factor(3.0), 0.7);
+        assert_eq!(parameter_size_factor(7.0), 1.0);
+        assert_eq!(parameter_size_factor(13.0), 0.8);
+        assert_eq!(parameter_size_factor(70.0), SIZE_FACTOR_HUGE);
     }
 
     #[test]
@@ -338,6 +443,7 @@ mod tests {
         assert!(looks_like_path("/tmp/foo"));
         assert!(looks_like_path("C:\\models\\foo"));
         assert!(looks_like_path("../secret"));
+        assert!(looks_like_path("Cargo.toml"));
         assert!(!looks_like_path("qwen2.5-coder:7b"));
     }
 
@@ -352,6 +458,7 @@ mod tests {
     fn recommended_fallback_model_chooses_bigger_model_on_large_memory() {
         let small = recommended_fallback_model(8 * 1024 * 1024 * 1024);
         let large = recommended_fallback_model(24 * 1024 * 1024 * 1024);
+
         assert_eq!(small, "qwen2.5-coder:3b");
         assert_eq!(large, "qwen2.5-coder:7b");
     }
