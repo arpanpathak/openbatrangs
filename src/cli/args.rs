@@ -1,6 +1,7 @@
 //! Clap argument definitions and default values.
 
 use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
+use clap::builder::FalseyValueParser;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -77,7 +78,18 @@ pub(crate) struct Cli {
     #[arg(long = "searxng-url", global = true, env = "OPENBATRANGS_SEARXNG_URL")]
     pub(crate) searxng_url: Option<String>,
 
-    /// Optional subcommand (agent, list-models, doctor, setup, pull).
+    /// Do not check for a newer release when openBatarangs starts.
+    /// `OPENBATRANGS_NO_UPDATE_CHECK=1` does the same; `openbatrangs update`
+    /// still checks.
+    #[arg(
+        long = "no-update-check",
+        global = true,
+        env = "OPENBATRANGS_NO_UPDATE_CHECK",
+        value_parser = FalseyValueParser::new()
+    )]
+    pub(crate) is_update_check_disabled: bool,
+
+    /// Optional subcommand (agent, list-models, doctor, setup, pull, update).
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -103,6 +115,8 @@ pub(crate) enum Commands {
         #[arg(value_name = "MODEL")]
         model: String,
     },
+    /// Check for a newer release now and install it when there is one.
+    Update,
 }
 
 #[cfg(test)]
@@ -173,6 +187,14 @@ mod tests {
         let cli = Cli::parse_from(["openbatrangs", "doctor"]);
 
         assert!(matches!(cli.command, Some(Commands::Doctor)));
+    }
+
+    #[test]
+    fn parses_update_subcommand_and_the_opt_out_flag() {
+        let cli = Cli::parse_from(["openbatrangs", "update", "--no-update-check"]);
+
+        assert!(matches!(cli.command, Some(Commands::Update)));
+        assert!(cli.is_update_check_disabled);
     }
 
     #[test]

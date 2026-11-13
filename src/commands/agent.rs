@@ -8,23 +8,53 @@ use crate::cli::{
 };
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::OllamaClient;
+use crate::update::{NewRelease, UpdateCheck, daily_check};
 use anyhow::{Result, bail};
+use tokio::task::JoinHandle;
 
 /// Run the agent for a task, or start the TUI when the task is empty.
+///
+/// `update_check` is the automatic release check, or `None` when it is
+/// turned off. After a task, a newer release is named in one line.
 pub(crate) async fn run_agent_or_tui(
     cli: &Cli,
     client: &OllamaClient,
     task: &[String],
+    update_check: Option<UpdateCheck>,
 ) -> Result<()> {
     if task.is_empty() {
-        return crate::tui::run(cli, client).await;
+        return crate::tui::run(cli, client, update_check).await;
     }
+
+    let release_check = start_release_check(update_check);
 
     banner::print_banner();
     let prefs = model_prefs_from_cli(cli);
     let config = agent_run_config(cli);
 
-    run_agent_task(client, &config, &prefs, &task.join(" ")).await
+    let outcome = run_agent_task(client, &config, &prefs, &task.join(" ")).await;
+
+    print_new_release(release_check).await;
+
+    outcome
+}
+
+/// Run the once-a-day release check in the background while the task runs.
+fn start_release_check(update_check: Option<UpdateCheck>) -> JoinHandle<Option<NewRelease>> {
+    tokio::spawn(async move {
+        match update_check {
+            Some(check) => daily_check(&check).await,
+            None => None,
+        }
+    })
+}
+
+/// Print one line about a newer release once the background check ends.
+/// The request times out after a few seconds, so the wait is short.
+async fn print_new_release(release_check: JoinHandle<Option<NewRelease>>) {
+    if let Some(release) = release_check.await.ok().flatten() {
+        println!("{}", release.one_shot_line());
+    }
 }
 
 /// Trim a task and reject empty input.
@@ -109,6 +139,8 @@ fn agent_config(config: &AgentRunConfig, model_context: u64) -> AgentConfig {
 mod tests {
     use super::*;
     use crate::test_support::{MockResponse, spawn_mock_server, unique_temp_dir};
+    use crate::update::fakes::{fake_check, release_server};
+    use crate::update::newer_release;
     use clap::Parser;
 
     /// One installed coding model, as `/api/tags` lists it.
@@ -172,9 +204,40 @@ mod tests {
         let workspace_arg = workspace.display().to_string();
         let cli = Cli::parse_from(["openbatrangs", "--cwd", &workspace_arg, "say", "hello"]);
 
-        let outcome = run_agent_or_tui(&cli, &client, &cli.task).await;
+        let outcome = run_agent_or_tui(&cli, &client, &cli.task, None).await;
 
         assert!(format!("{outcome:?}").contains("chat is down"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_newer_release_is_found_while_the_task_runs() -> Result<()> {
+        let check = fake_check(&release_server("v0.3.0").await, "exit 1");
+
+        let release = start_release_check(Some(check)).await?;
+
+        assert_eq!(release, newer_release("v0.3.0", "0.2.2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_turned_off_check_finds_nothing() -> Result<()> {
+        assert_eq!(start_release_check(None).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_with_a_newer_release_prints_one_line() -> Result<()> {
+        let base_url = spawn_mock_server(ollama_route).await;
+        let client = OllamaClient::new(&base_url)?;
+        let check = fake_check(&release_server("v0.3.0").await, "exit 1");
+        let workspace = unique_temp_dir("openbatrangs-one-shot-release");
+        let workspace_arg = workspace.display().to_string();
+        let cli = Cli::parse_from(["openbatrangs", "--cwd", &workspace_arg, "say", "hello"]);
+
+        let outcome = run_agent_or_tui(&cli, &client, &cli.task, Some(check)).await;
+
+        assert!(outcome.is_err());
         Ok(())
     }
 }

@@ -37,7 +37,7 @@ pub(super) use text::{
     extract_path_from_line, open_in_vim, split_command, text_wrapped_height, wrap_text_to_lines,
 };
 pub(super) use worker::{
-    UiEvent, WorkerHistory, run_agent_worker, run_pull_worker, run_setup_worker,
+    UiEvent, WorkerHistory, run_agent_worker, run_pull_worker, run_setup_worker, run_update_worker,
 };
 
 /// How the chat viewport follows newly generated output.
@@ -57,6 +57,7 @@ use crate::cli::Cli;
 use crate::constants::tui::{KEYBOARD_FLAGS, MAX_BACKGROUND_EVENTS_PER_FRAME, TICK_MILLIS};
 use crate::ollama::OllamaClient;
 use crate::perf::{ServerPoller, TegrastatsGuard};
+use crate::update::UpdateCheck;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -99,15 +100,21 @@ enum LoopInput {
 ///
 /// - `cli`: parsed command-line arguments for initial app state.
 /// - `client`: Ollama client for model operations.
+/// - `update_check`: the release check to run in the background, or `None`
+///   when it is turned off.
 ///
 /// # Returns
 ///
 /// `Ok(())` when the user exits normally, or an error if setup/teardown fails.
-pub(crate) async fn run(cli: &Cli, client: &OllamaClient) -> Result<()> {
+pub(crate) async fn run(
+    cli: &Cli,
+    client: &OllamaClient,
+    update_check: Option<UpdateCheck>,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut events = event::EventStream::new();
 
-    let result = run_app(&mut terminal, &mut events, cli, client).await;
+    let result = run_app(&mut terminal, &mut events, cli, client, update_check).await;
 
     teardown_terminal(&mut terminal)?;
     result
@@ -160,6 +167,7 @@ async fn run_app<W: Write>(
     events: &mut (impl Stream<Item = std::io::Result<Event>> + Unpin),
     cli: &Cli,
     client: &OllamaClient,
+    update_check: Option<UpdateCheck>,
 ) -> Result<()> {
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
@@ -171,7 +179,7 @@ async fn run_app<W: Write>(
     app.server_feed = server_poller.as_ref().map(ServerPoller::feed);
     app.refresh_model_info(client).await;
 
-    run_loop(terminal, &mut app, events, client).await
+    run_loop(terminal, &mut app, events, client, update_check).await
 }
 
 /// Keep the terminal's mouse-capture state in sync with the app preference.
@@ -205,10 +213,13 @@ async fn run_loop<W: Write>(
     app: &mut app::App,
     events: &mut (impl Stream<Item = std::io::Result<Event>> + Unpin),
     client: &OllamaClient,
+    update_check: Option<UpdateCheck>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
     let mut mouse_capture = false;
     let mut outcome = Ok(LoopControl::Continue);
+
+    start_update_worker(update_check, &tx);
 
     while let Ok(LoopControl::Continue) = outcome {
         outcome = step(
@@ -225,6 +236,13 @@ async fn run_loop<W: Write>(
 
     // `Ok(Exit)` ends the loop normally; an error ends it with that error.
     outcome.and(Ok(()))
+}
+
+/// Start the release check in the background, unless it is turned off.
+fn start_update_worker(update_check: Option<UpdateCheck>, tx: &mpsc::UnboundedSender<UiEvent>) {
+    if let Some(check) = update_check {
+        tokio::spawn(run_update_worker(check, tx.clone()));
+    }
 }
 
 /// Draw one frame, then handle the next input.
@@ -403,9 +421,11 @@ fn handle_queued_events(
     }
 }
 
-/// Advance the spinner and refresh the perf panel when a sample is due.
+/// Advance the spinner, show an update question that waited for another
+/// dialog to close, and refresh the perf panel when a sample is due.
 fn tick(app: &mut app::App) -> LoopControl {
     app.spinner_frame += 1;
+    app.open_waiting_update();
 
     if let Some(stats) = app.perf.sample_if_due(Instant::now()) {
         app.system_stats = stats;
@@ -496,7 +516,7 @@ mod tests {
         let mut events = futures_util::stream::iter(script);
         let cli = Cli::parse_from(["openbatrangs"]);
 
-        run_app(&mut terminal, &mut events, &cli, &refused_client()?).await?;
+        run_app(&mut terminal, &mut events, &cli, &refused_client()?, None).await?;
 
         drop(terminal);
 
@@ -517,7 +537,14 @@ mod tests {
         let mut app = test_app();
         let mut events = futures_util::stream::iter(Vec::new());
 
-        run_loop(&mut terminal, &mut app, &mut events, &refused_client()?).await?;
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &refused_client()?,
+            None,
+        )
+        .await?;
 
         assert!(!app.should_quit);
 
@@ -532,7 +559,14 @@ mod tests {
         let failure = std::io::Error::other("terminal gone");
         let mut events = futures_util::stream::iter(vec![Err(failure)]);
 
-        let result = run_loop(&mut terminal, &mut app, &mut events, &refused_client()?).await;
+        let result = run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &refused_client()?,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
 
@@ -548,7 +582,14 @@ mod tests {
         script.push(key(event::KeyCode::Enter));
         let mut events = events_then_pause(script, Duration::from_millis(500));
 
-        run_loop(&mut terminal, &mut app, &mut events, &refused_client()?).await?;
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &refused_client()?,
+            None,
+        )
+        .await?;
 
         assert!(
             app.spinner_frame > 0,
@@ -591,6 +632,165 @@ mod tests {
 
         assert_eq!(control, LoopControl::Exit);
 
+        Ok(())
+    }
+
+    /// The rows of the screen after drawing `app` on a test terminal.
+    fn screen_rows(app: &mut app::App, width: u16, height: u16) -> anyhow::Result<Vec<String>> {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+        terminal.draw(|frame| ui::ui(frame, app))?;
+
+        let symbols: Vec<&str> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        Ok(symbols
+            .chunks(width as usize)
+            .map(|row| row.concat().trim_end().to_string())
+            .collect())
+    }
+
+    /// Start the update worker for a release server with `v0.3.0` and an
+    /// installer that runs `installer_command`, and show its question.
+    async fn app_with_update_question(
+        installer_command: &str,
+    ) -> anyhow::Result<(
+        app::App,
+        mpsc::UnboundedSender<UiEvent>,
+        mpsc::UnboundedReceiver<UiEvent>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        use crate::update::fakes::{fake_check, release_server};
+        use anyhow::Context;
+
+        let check = fake_check(&release_server("v0.3.0").await, installer_command);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let worker = tokio::spawn(run_update_worker(check, tx.clone()));
+
+        let question = rx.recv().await.context("the worker should ask")?;
+        app.handle_event(question, &refused_client()?, &tx);
+
+        Ok((app, tx, rx, worker))
+    }
+
+    /// Press `answer`, wait for the worker to end, and show what it sent.
+    async fn answer_update_question(
+        app: &mut app::App,
+        answer: char,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+        rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        worker: tokio::task::JoinHandle<()>,
+    ) -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let press = event::KeyEvent::new(event::KeyCode::Char(answer), event::KeyModifiers::NONE);
+
+        app.handle_key(press, &client, tx).await;
+        worker.await?;
+
+        while let Ok(event) = rx.try_recv() {
+            app.handle_event(event, &client, tx);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_update_question_is_drawn_and_y_runs_the_installer() -> anyhow::Result<()> {
+        let (mut app, tx, mut rx, worker) = app_with_update_question("echo installed").await?;
+
+        let screen = screen_rows(&mut app, 130, 24)?.join("\n");
+
+        assert!(
+            screen
+                .contains("openbatrangs 0.3.0 is available (you have 0.2.2). Install it now? y/n")
+        );
+        assert!(screen.contains("Press y to confirm"));
+
+        answer_update_question(&mut app, 'y', &tx, &mut rx, worker).await?;
+
+        assert!(!app.is_confirming());
+        assert_eq!(
+            app.transcript.text(),
+            "Installing openbatrangs 0.3.0.\ninstalled\nRestart openbatrangs to use 0.3.0."
+        );
+
+        let screen = screen_rows(&mut app, 130, 24)?.join("\n");
+
+        assert!(screen.contains("Restart openbatrangs to use 0.3.0."));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn n_closes_the_update_question_and_shows_nothing_more() -> anyhow::Result<()> {
+        let (mut app, tx, mut rx, worker) = app_with_update_question("echo installed").await?;
+
+        answer_update_question(&mut app, 'n', &tx, &mut rx, worker).await?;
+
+        assert!(!app.is_confirming());
+        assert_eq!(app.transcript.text(), "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_update_is_shown() -> anyhow::Result<()> {
+        let (mut app, tx, mut rx, worker) = app_with_update_question("exit 1").await?;
+
+        answer_update_question(&mut app, 'y', &tx, &mut rx, worker).await?;
+
+        assert!(app.transcript.text().contains("⚠️ The update failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_update_question_waits_for_an_open_dialog_to_close() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (response, _answer) = tokio::sync::oneshot::channel();
+        let mut app = test_app();
+        app.open_picker(vec!["qwen".to_string()]);
+
+        let question = UiEvent::UpdateAvailable {
+            prompt: "Install it now? y/n".to_string(),
+            response,
+        };
+        app.handle_event(question, &client, &tx);
+
+        assert!(app.is_showing_picker());
+
+        app.close_modal();
+        tick(&mut app);
+
+        assert!(app.is_confirming());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_loop_starts_the_update_check_when_it_is_on() -> anyhow::Result<()> {
+        use crate::update::fakes::fake_check;
+
+        let mut output = Vec::new();
+        let mut terminal = memory_terminal(&mut output)?;
+        let mut app = test_app();
+        let mut events = futures_util::stream::iter(Vec::new());
+        let check = fake_check("http://127.0.0.1:1/releases/latest", "exit 1");
+
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &refused_client()?,
+            Some(check),
+        )
+        .await?;
+
+        assert!(!app.is_confirming());
         Ok(())
     }
 

@@ -53,12 +53,24 @@ impl PickerState {
     }
 }
 
-/// Pending tool-confirmation dialog state.
+/// What a confirmation dialog asks about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConfirmationKind {
+    /// A file write or shell command the agent wants to run.
+    Tool,
+    /// Installing a newer openbatrangs release.
+    Update,
+}
+
+/// Pending confirmation dialog state.
 pub(super) struct PendingConfirmation {
     /// Human-readable prompt shown to the user, e.g. `write file 'a.txt'?`.
     pub(super) prompt: String,
-    /// Channel to send the user's yes/no answer back to the agent worker.
+    /// Channel to send the user's yes/no answer back to the worker.
     pub(super) response: tokio::sync::oneshot::Sender<bool>,
+    /// What the dialog asks about; a refused tool is noted in the chat, a
+    /// refused update is not.
+    pub(super) kind: ConfirmationKind,
 }
 
 /// Mutually exclusive modal overlays.
@@ -283,6 +295,8 @@ pub(super) struct App {
     pub(super) last_chunk_at: Option<Instant>,
     /// Terminal emulators tried, in order, when a clicked file opens in vim.
     pub(super) editor_terminals: &'static [&'static str],
+    /// An update question that waits until no other dialog is open.
+    pub(super) waiting_update: Option<PendingConfirmation>,
 }
 
 impl App {
@@ -352,6 +366,7 @@ impl App {
             rate_window_start: None,
             last_chunk_at: None,
             editor_terminals: VIM_TERMINALS,
+            waiting_update: None,
         }
     }
 
@@ -426,7 +441,32 @@ impl App {
         self.modal = Some(ActiveModal::Confirm(PendingConfirmation {
             prompt,
             response,
+            kind: ConfirmationKind::Tool,
         }));
+    }
+
+    /// Show an update question now, or after the open dialog closes.
+    fn on_update_available(
+        &mut self,
+        prompt: String,
+        response: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        self.waiting_update = Some(PendingConfirmation {
+            prompt,
+            response,
+            kind: ConfirmationKind::Update,
+        });
+
+        self.open_waiting_update();
+    }
+
+    /// Open the waiting update question when no other dialog is open.
+    pub(super) fn open_waiting_update(&mut self) {
+        if self.modal.is_some() {
+            return;
+        }
+
+        self.modal = self.waiting_update.take().map(ActiveModal::Confirm);
     }
 
     /// Build a one-line summary of the current model, mode, and server for the banner.
@@ -588,6 +628,9 @@ impl App {
             UiEvent::SetupDone(result) => self.on_setup_done(result),
             UiEvent::ConfirmRequest { prompt, response } => {
                 self.on_confirm_request(prompt, response)
+            }
+            UiEvent::UpdateAvailable { prompt, response } => {
+                self.on_update_available(prompt, response)
             }
         }
     }
@@ -1163,13 +1206,14 @@ impl App {
             return;
         };
 
-        self.log_aborted_tool(answer);
+        self.log_refusal(pending.kind, answer);
         send_answer(pending, answer);
     }
 
-    /// Note in the chat that the user refused a tool.
-    fn log_aborted_tool(&mut self, answer: bool) {
-        if !answer {
+    /// Note in the chat that the user refused a tool. A refused update
+    /// shows nothing.
+    fn log_refusal(&mut self, kind: ConfirmationKind, answer: bool) {
+        if (kind, answer) == (ConfirmationKind::Tool, false) {
             self.notice("⛔ Tool aborted by user.".to_string());
         }
     }

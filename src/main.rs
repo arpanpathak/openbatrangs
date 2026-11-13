@@ -23,6 +23,7 @@ mod ollama;
 mod perf;
 mod tools;
 mod tui;
+mod update;
 
 #[cfg(test)]
 mod test_support;
@@ -50,6 +51,7 @@ async fn run_command(cli: &Cli, client: &OllamaClient) -> Result<()> {
         Some(Commands::Doctor) => doctor(cli, client).await,
         Some(Commands::Agent { task }) => run_agent(cli, client, task).await,
         Some(Commands::Pull { model }) => pull(client, model).await,
+        Some(Commands::Update) => commands::update(&update::UpdateCheck::for_this_process()).await,
         None => run_agent(cli, client, &cli.task).await,
     }
 }
@@ -72,7 +74,7 @@ async fn doctor(cli: &Cli, client: &OllamaClient) -> Result<()> {
 async fn run_agent(cli: &Cli, client: &OllamaClient, task: &[String]) -> Result<()> {
     commands::ensure_ollama(client).await?;
 
-    commands::run_agent_or_tui(cli, client, task).await
+    commands::run_agent_or_tui(cli, client, task, update::automatic_check(cli)).await
 }
 
 /// `pull`: download a model.
