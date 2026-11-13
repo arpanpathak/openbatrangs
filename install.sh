@@ -1,122 +1,106 @@
 #!/bin/sh
-set -eu
-
-# openBatarangs installer/updater
-#   Install:  curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
-#   Update:   same command (overwrites the old binary)
+# Install or update openbatrangs from the latest GitHub release.
 #
-# Downloads the prebuilt release binary and installs it to ~/.local/bin
-# (or /usr/local/bin when run as root). Also ensures Ollama is present.
+#   curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
+#
+# OPENBATRANGS_VERSION      release tag to install, such as v0.3.0 (default: latest)
+# OPENBATRANGS_INSTALL_DIR  folder for the binary (default: ~/.local/bin, or
+#                           /usr/local/bin for root)
+set -eu
 
 REPO="arpanpathak/openbatrangs"
 VERSION="${OPENBATRANGS_VERSION:-latest}"
-BASE_URL="https://github.com/${REPO}/releases/${VERSION}/download"
 
-# --- Detect target ---------------------------------------------------------
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-case "${OS}" in
-  Linux)  SUFFIX="unknown-linux-gnu" ;;
-  Darwin) SUFFIX="apple-darwin" ;;
-  *)
-    echo "❌ Unsupported OS: ${OS}"
-    exit 1
-    ;;
-esac
-
-case "${ARCH}" in
-  aarch64|arm64) TARGET="aarch64-${SUFFIX}" ;;
-  x86_64|amd64)  TARGET="x86_64-${SUFFIX}" ;;
-  *)
-    echo "❌ Unsupported architecture for the prebuilt binary: ${ARCH}"
-    echo "   Prebuilt releases target aarch64 and x86_64 on Linux and macOS."
-    echo "   To build from source instead:"
-    echo "     git clone https://github.com/arpanpathak/openbatrangs.git"
-    echo "     cd openbatrangs && cargo build --release"
-    exit 1
-    ;;
-esac
-
-# --- Install location ------------------------------------------------------
-if [ "$(id -u)" -eq 0 ]; then
-  BIN_DIR="/usr/local/bin"
+if [ "${VERSION}" = "latest" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
 else
-  BIN_DIR="${HOME}/.local/bin"
+  BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 fi
 
-BIN="${BIN_DIR}/openbatrangs"
-
-# --- Download --------------------------------------------------------------
-if ! command -v curl >/dev/null 2>&1; then
-  echo "❌ curl is required to download openBatarangs."
+fail() {
+  printf '\033[31merror:\033[0m %s\n' "$1" >&2
   exit 1
-fi
+}
 
-echo "🦇 Installing/updating openBatarangs (${TARGET})..."
-mkdir -p "${BIN_DIR}"
+step() {
+  printf '\033[36m==>\033[0m %s\n' "$1"
+}
+
+# The release target for this system, such as aarch64-unknown-linux-gnu.
+target() {
+  case "$(uname -s)" in
+    Linux) suffix="unknown-linux-gnu" ;;
+    Darwin) suffix="apple-darwin" ;;
+    *) fail "no release binary for $(uname -s); build from source with cargo" ;;
+  esac
+
+  case "$(uname -m)" in
+    aarch64 | arm64) echo "aarch64-${suffix}" ;;
+    x86_64 | amd64) echo "x86_64-${suffix}" ;;
+    *) fail "no release binary for $(uname -m); build from source with cargo" ;;
+  esac
+}
+
+# The folder for the binary: the override, /usr/local/bin for root, or ~/.local/bin.
+install_dir() {
+  if [ -n "${OPENBATRANGS_INSTALL_DIR:-}" ]; then
+    echo "${OPENBATRANGS_INSTALL_DIR}"
+    return
+  fi
+
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "/usr/local/bin"
+    return
+  fi
+
+  echo "${HOME}/.local/bin"
+}
+
+# The SHA-256 digest of a file, with whichever tool this system has.
+digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+    return
+  fi
+
+  shasum -a 256 "$1" | cut -d' ' -f1
+}
+
+# Compare the download with its line in the release's SHA256SUMS.
+verify() {
+  expected="$(curl -fsSL "${BASE_URL}/SHA256SUMS" | grep "openbatrangs-$2\$" | cut -d' ' -f1)"
+  [ -n "${expected}" ] || fail "SHA256SUMS has no entry for openbatrangs-$2"
+
+  actual="$(digest "$1")"
+  [ "${actual}" = "${expected}" ] || fail "checksum mismatch for openbatrangs-$2"
+}
+
+command -v curl >/dev/null 2>&1 || fail "curl is required"
+
+TARGET="$(target)"
+BIN_DIR="$(install_dir)"
 TMP_BIN="$(mktemp)"
 trap 'rm -f "${TMP_BIN}"' EXIT HUP INT TERM
 
-echo "⬇️  Downloading ${BASE_URL}/openbatrangs-${TARGET} ..."
-if ! curl -fsSL -o "${TMP_BIN}" "${BASE_URL}/openbatrangs-${TARGET}"; then
-  echo "❌ Download failed. Check your network or GitHub availability."
-  exit 1
-fi
+step "Downloading openbatrangs for ${TARGET}"
+curl -fsSL -o "${TMP_BIN}" "${BASE_URL}/openbatrangs-${TARGET}" ||
+  fail "download failed from ${BASE_URL}"
 
-if [ ! -s "${TMP_BIN}" ]; then
-  echo "❌ Downloaded file is empty. The release asset may not exist yet."
-  exit 1
-fi
+step "Verifying the SHA-256 checksum"
+verify "${TMP_BIN}" "${TARGET}"
 
-chmod +x "${TMP_BIN}"
-mv "${TMP_BIN}" "${BIN}"
+step "Installing to ${BIN_DIR}/openbatrangs"
+mkdir -p "${BIN_DIR}"
+chmod 755 "${TMP_BIN}"
+mv "${TMP_BIN}" "${BIN_DIR}/openbatrangs"
 trap - EXIT HUP INT TERM
 
-echo "✅ Installed: ${BIN}"
-
-# --- PATH ------------------------------------------------------------------
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;
-  *)
-    echo ""
-    echo "⚠️  ${BIN_DIR} is not on your PATH yet."
-    if [ "$(id -u)" -ne 0 ]; then
-      RC_FILE="${HOME}/.bashrc"
-      if [ -f "${HOME}/.zshrc" ]; then
-        RC_FILE="${HOME}/.zshrc"
-      fi
-      if ! grep -q "${BIN_DIR}" "${RC_FILE}" 2>/dev/null; then
-        echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> "${RC_FILE}"
-        echo "   Added to ${RC_FILE}. Restart your shell or run: export PATH=\"${BIN_DIR}:\$PATH\""
-      fi
-    else
-      echo "   As root, it is already in a standard PATH location."
-    fi
-    ;;
+  *) printf '\n%s is not on your PATH. Add it with:\n  export PATH="%s:$PATH"\n' "${BIN_DIR}" "${BIN_DIR}" ;;
 esac
 
-# --- Ollama ----------------------------------------------------------------
-if ! command -v ollama >/dev/null 2>&1; then
-  echo ""
-  echo "⬇️  Ollama not found. Installing it with the official script..."
-  curl -fsSL https://ollama.com/install.sh | sh
-fi
-
-if ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
-  echo "🔄 Starting Ollama..."
-  nohup ollama serve >/tmp/openbatrangs-ollama.log 2>&1 &
-  sleep 2
-fi
-
-echo ""
-echo "🔄 Running first-time setup (pulls a coding model)..."
-"${BIN}" setup || {
-  echo "⚠️  First-time setup did not complete."
-  echo "   You can retry it later with: ${BIN} setup"
-}
-
-echo ""
-echo "🎉 Done!"
-echo "   Run:    ${BIN}"
-echo "   Update: curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | sh"
+printf '\n\033[32mopenbatrangs %s is installed.\033[0m Connect it to your model server:\n' \
+  "$("${BIN_DIR}/openbatrangs" --version | cut -d' ' -f2)"
+printf '  openbatrangs --openai-url http://127.0.0.1:8000/v1     # TensorRT-LLM, vLLM, SGLang, llama.cpp\n'
+printf '  openbatrangs                                            # Ollama on localhost:11434\n'
