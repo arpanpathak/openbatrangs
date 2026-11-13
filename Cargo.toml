@@ -2,12 +2,13 @@
 name = "openbatrangs"
 version = "0.2.2"
 edition = "2024"
-description = "🦇 openBatarangs - Agentic coding CLI for local models via Ollama"
+description = "A terminal coding agent that runs on local language models"
 license = "AGPL-3.0"
 repository = "https://github.com/arpanpathak/openbatrangs"
 readme = "README.md"
-keywords = ["agent", "ollama", "coding", "cli", "local-llm"]
+keywords = ["agent", "llm", "coding", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**/*", "/tests/**/*", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1"

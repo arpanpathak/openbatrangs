@@ -1,297 +1,174 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="openBatarangs" width="340" style="max-width:100%;"/>
+<img src="assets/logo.svg" alt="openbatrangs logo" width="160">
 
-# openBatarangs
+# openbatrangs
 
-> *Agentic coding CLI for local models.*
->
-> *Auto-discovers the best model on your hardware,*
-> *thinks, reads, edits, and verifies —*
-> *no manual model ops, no cloud required.*
+A terminal coding agent that runs on local language models.
 
-**A DeepCode-style autonomous coding agent that runs on Jetson-class edge devices and anywhere Ollama runs.**
-
-[![Release](https://img.shields.io/github/v/release/arpanpathak/openbatrangs?style=for-the-badge&logo=github&logoColor=white&color=8A2BE2)](https://github.com/arpanpathak/openbatrangs/releases) [![Stars](https://img.shields.io/github/stars/arpanpathak/openbatrangs?style=for-the-badge&logo=github&logoColor=white&color=FF6B6B)](https://github.com/arpanpathak/openbatrangs) [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-2E8B57?style=for-the-badge&logo=open-source-initiative&logoColor=white)](LICENSE) [![PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen?style=for-the-badge&logo=github&logoColor=white)](CONTRIBUTING.md)
-
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org) [![Ollama](https://img.shields.io/badge/Ollama-Local%20LLMs-000000?style=for-the-badge&logo=ollama&logoColor=white)](https://ollama.com) [![NVIDIA Jetson](https://img.shields.io/badge/NVIDIA-Jetson%20Orin%20Nano%20Super-76B900?style=for-the-badge&logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/) [![Local First](https://img.shields.io/badge/Local-First-2E8B57?style=for-the-badge)](https://github.com/arpanpathak/openbatrangs)
-
-[![Agentic](https://img.shields.io/badge/Agentic-Tools-8A2BE2?style=for-the-badge)](https://github.com/arpanpathak/openbatrangs) [![Context Aware](https://img.shields.io/badge/Context-32K%2B-FF6B6B?style=for-the-badge)](https://github.com/arpanpathak/openbatrangs) [![Maintained](https://img.shields.io/badge/Maintained-YES-2E8B57?style=for-the-badge&logo=github&logoColor=white)](https://github.com/arpanpathak/openbatrangs)
-
-[![CI](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml/badge.svg)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Farpanpathak%2Fopenbatrangs%2Fcoverage%2Fcoverage.json&style=for-the-badge)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/arpanpathak/openbatrangs/ci.yml?branch=main&style=flat-square&logo=github&label=CI)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Farpanpathak%2Fopenbatrangs%2Fcoverage%2Fcoverage.json&style=flat-square)](https://github.com/arpanpathak/openbatrangs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/arpanpathak/openbatrangs?style=flat-square&color=9664ff)](https://github.com/arpanpathak/openbatrangs/releases)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024%20edition-dea584?style=flat-square&logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-2e8b57?style=flat-square)](LICENSE)
 
 </div>
 
----
+With openbatrangs, a language model on your own hardware works on a project
+through file, search, shell and web tools. It connects to TensorRT Edge-LLM,
+TensorRT-LLM, vLLM, SGLang, llama.cpp, Ollama, and any other server with
+OpenAI's chat completions API. It runs on Linux and macOS, from a Jetson board
+to a multi-GPU server.
 
-openBatarangs is an **agentic coding CLI** for local LLMs. It talks to an
-[Ollama](https://ollama.com) server, auto-discovers the best installed model for
-your hardware, and iterates with tools to explore, edit, and verify code —
-no manual model selection required.
+- **Agent loop.** In each step, the model calls one tool to list, read, search,
+  write or edit files, run a shell command, or search the web. The loop ends
+  when the model calls `finish`, or after 40 steps.
+- **Modes.** `agent` allows every tool, `plan` allows only reading, and `chat`
+  allows no tools.
+- **Web search.** `web_search` and `web_read` look up documentation through a
+  [SearXNG](https://github.com/searxng/searxng) instance.
+- **Safety controls.** `--confirm` adds a prompt before each file write and
+  shell command, and `--read-only` allows neither. Commands run with `$HOME`
+  and tool caches inside the project's `.agent/` folder. They get no keyboard
+  input, and they end at a timeout.
+- **Terminal UI.** A transcript with syntax-highlighted code, slash commands, a
+  model picker, and a panel with GPU, CPU and memory use and tokens per second.
+- **Reasoning.** For thinking models such as Qwen3 and Nemotron, the reasoning
+  appears dimmed before each step. `--no-think` turns thinking off.
+- **Model selection.** `/models` lists what the server serves. With Ollama, the
+  installed models are also scored for agentic coding on the current hardware,
+  and the best fit is used first.
 
-It is designed to run well on Jetson-class edge devices (Orin Nano/NX Super,
-16 GB unified memory) and on any desktop/laptop that can run Ollama.
+## Engines
 
-## Why Ollama?
+| | Engine | Connect with | Status |
+|---|---|---|---|
+| <img src="assets/engines/nvidia.png" alt="" height="28"> | [TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) | `--openai-url` | tested on Jetson AGX Thor |
+| <img src="assets/engines/nvidia.png" alt="" height="28"> | [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) (`trtllm-serve`) | `--openai-url` | OpenAI-compatible, not tested |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="assets/engines/vllm-dark.png"><img src="assets/engines/vllm-light.png" alt="" height="24"></picture> | [vLLM](https://github.com/vllm-project/vllm) | `--openai-url` | OpenAI-compatible, not tested |
+| <img src="assets/engines/sglang.svg" alt="" height="28"> | [SGLang](https://github.com/sgl-project/sglang) | `--openai-url` | OpenAI-compatible, not tested |
+| <img src="assets/engines/llamacpp.jpg" alt="" height="28"> | [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) | `--openai-url` | tested |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="assets/engines/ollama-dark.png"><img src="assets/engines/ollama.svg" alt="" height="28"></picture> | [Ollama](https://ollama.com) | `--ollama-url` | tested |
 
-- Same `llama.cpp` + CUDA/ROCm/Metal engine used by most local LLM tools.
-- Auto-discovers installed models through the Ollama API.
-- No heavy Rust/CUDA compile per machine.
-- Best performance-per-watt-per-dollar for local agentic coding on edge devices.
+Each logo belongs to its owner. [`assets/engines/README.md`](assets/engines/README.md)
+lists where each one comes from.
 
-## Performance per watt per dollar
+## Install
 
-openBatarangs is built around the local-first economics of edge AI:
-
-- **No cloud API fees.** Every prompt stays on-device; the only cost is electricity.
-- **Unified memory wins on Jetson.** The Orin 16 GB's GPU/CPU share memory, so a
-  4-7 GB Q4_K_M coding model fits without duplicating weights across VRAM and RAM.
-- **Small quantized models beat big cloud round-trips for agentic loops.**
-  A 3B-8B Q4 coding model is fast enough to iterate (read → edit → build → fix)
-  while leaving headroom for a 32K+ context window.
-- **The auto-picker optimizes for watts, not just raw tokens/sec:** it refuses
-  models that don't fit comfortably, avoiding swap thrash and thermal throttling.
-- **Same binary runs on Jetson, laptops, and desktops** — you only pay for the
-  hardware you already own.
-
-Exact tok/s depends on clocks, thermals, and model size; run `openbatrangs doctor`
-to see which model your hardware scores best for this workload.
-
-## Requirements
-
-- [Ollama](https://ollama.com) installed (the CLI auto-starts `ollama serve` if it is installed but not running),
-  or an OpenAI-compatible server such as llama-server, vLLM or trtllm-serve (see "Other servers" below).
-- If Ollama is not installed at all, run `openbatrangs setup` once — it installs Ollama and pulls a coding model for you.
-- If no suitable model is installed, openBatarangs auto-pulls a recommended coding model unless you pass `--no-auto-pull`.
-
-## Install / Build
-
-```sh
-git clone https://github.com/arpanpathak/openbatrangs.git
-cd openbatrangs
-
-# Build release
-cargo build --release
-
-# Or install the binary into ~/.cargo/bin
-cargo install --path .
-```
-
-The binary is at `target/release/openbatrangs` (or `~/.cargo/bin/openbatrangs`).
-
-### macOS
-
-Prebuilt binaries exist for both Apple silicon and Intel Macs:
-
-```sh
-# Apple silicon (M1/M2/M3/M4)
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-apple-darwin
-
-# Intel
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-apple-darwin
-
-chmod +x openbatrangs && sudo mv openbatrangs /usr/local/bin/
-```
-
-Or build from source, which needs no TLS headers because the client uses `rustls`:
-
-```sh
-xcode-select --install                 # C compiler for the TLS library; skip if installed
-curl https://sh.rustup.rs -sSf | sh    # skip if you have Rust
-cargo install --git https://github.com/arpanpathak/openbatrangs --locked
-```
-
-macOS is a thin client in practice: point it at a GPU box and let that machine do
-the inference (see "The Thor over Tailscale"). Locally, the GPU panel stays empty
-(it reads `tegrastats` or `nvidia-smi`) and CPU/RAM percentages stay at zero
-because those readers parse `/proc`.
-
-### Prebuilt binaries (easiest)
-
-Download from the latest GitHub release:
-
-```sh
-# macOS Apple silicon / Intel
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-apple-darwin
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-apple-darwin
-
-# Linux x86_64 (most desktops/laptops)
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-x86_64-unknown-linux-gnu
-
-# Linux aarch64 (Jetson, Raspberry Pi 5, Apple silicon Linux)
-curl -fsSL -o openbatrangs https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-unknown-linux-gnu
-
-chmod +x openbatrangs
-./openbatrangs setup
-./openbatrangs
-```
-
-Or use the installer:
+The installer downloads the release binary for your system and architecture.
 
 ```sh
 curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh
 ```
 
-## Quick start
+Release binaries are also available on their own.
+
+| System | File |
+|---|---|
+| Linux, x86_64 | `openbatrangs-x86_64-unknown-linux-gnu` |
+| Linux, ARM64 (Jetson, Raspberry Pi 5) | `openbatrangs-aarch64-unknown-linux-gnu` |
+| macOS, Apple silicon | `openbatrangs-aarch64-apple-darwin` |
+| macOS, Intel | `openbatrangs-x86_64-apple-darwin` |
 
 ```sh
-# One-time auto setup: install/start Ollama + pull a coding model
-openbatrangs setup
-
-# Interactive mode starts in chat (no tools); type /mode agent for full agent
-openbatrangs
-
-# One-shot agent mode with a task
-openbatrangs "fix the Rust build errors"
-
-# One-shot agent in a specific directory
-openbatrangs --cwd /path/to/project "add a --dry-run flag"
-
-# See what models are installed and which is best
-openbatrangs list-models
-
-# Check Ollama and get a recommendation
-openbatrangs doctor
-
-# Force a specific model
-openbatrangs --model qwen2.5-coder:7b "explain this repo"
-
-# Read-only mode (no file writes or shell commands)
-openbatrangs --read-only "suggest a refactor plan"
-
-# Ask before every write/command
-openbatrangs --confirm "update the CLI docs"
+curl -fsSL -o openbatrangs \
+  https://github.com/arpanpathak/openbatrangs/releases/latest/download/openbatrangs-aarch64-unknown-linux-gnu
+chmod +x openbatrangs
+sudo mv openbatrangs /usr/local/bin/
 ```
 
-## Other servers: llama-server, vLLM, Nemotron on a Jetson Thor
-
-Any OpenAI-compatible server works instead of Ollama:
+To build from source, install Rust with [rustup](https://rustup.rs). The
+repository pins Rust 1.100.0 in `rust-toolchain.toml`, and rustup installs it
+on the first build.
 
 ```sh
-openbatrangs --openai-url http://127.0.0.1:8079/v1 --api-key-file ~/.config/thor-chat/api-key
-openbatrangs --thor          # shortcut for the two options above
-openbatrangs --thor --no-think "fix the failing test"
+cargo install --git https://github.com/arpanpathak/openbatrangs --locked
 ```
 
-- `--openai-url` takes the base URL including `/v1`; `--api-key-file` is
-  optional and sends the file's contents as a bearer key.
-- Thinking models (Nemotron, Qwen3) think before each step by default; the
-  reasoning is shown dimmed after 💭. `--no-think` turns it off.
-- `/models` and `list-models` show what the server serves; there is nothing
-  to pull.
-- The web tools search a SearXNG instance at `http://127.0.0.1:8888` by
-  default. Point them elsewhere with `--searxng-url http://thor:8888` (or the
-  `OPENBATRANGS_SEARXNG_URL` environment variable).
-- Interrupting a run with Ctrl+C and typing a correction resumes the
-  conversation where it stopped instead of restarting the task.
+## Usage
 
-### The Thor over Tailscale
-
-The Thor's chat server is reachable on the tailnet with no SSH tunnel, and it
-fronts both TensorRT Edge-LLM engines, so one URL serves both models:
+`--openai-url` takes the base URL of a TensorRT Edge-LLM, TensorRT-LLM, vLLM,
+SGLang or llama.cpp server, including `/v1`. `--api-key-file` sends the
+contents of a file as a bearer token.
 
 ```sh
-openbatrangs \
-  --openai-url https://arpanpathak.taildb9a39.ts.net/v1 \
-  --api-key-file ~/.config/thor-chat/api-key \
-  --model Qwen3.6-35B-A3B-NVFP4
+openbatrangs --openai-url http://127.0.0.1:8000/v1                          # start the terminal UI
+openbatrangs --openai-url http://127.0.0.1:8000/v1 "fix the failing test"   # run one task and exit
+openbatrangs --openai-url https://gpu-box.example.com/v1 --api-key-file ~/.config/gpu-box/key
+openbatrangs --openai-url http://127.0.0.1:8000/v1 --model Qwen3.6-35B-A3B-NVFP4 --confirm "update the CLI docs"
+openbatrangs --openai-url http://127.0.0.1:8000/v1 --read-only --cwd ~/code/app "suggest a refactoring plan"
 ```
 
-Swap `--model` for `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` to use the other
-engine; `/models` lists both, and there is nothing to pull. That URL is the
-Thor's `tailscale funnel` address and is public, so the API key is the gate. On
-the same LAN an SSH tunnel to `127.0.0.1:8079` is faster and private.
+Without `--model`, openbatrangs uses the first model the server lists, and
+`/models` and `list-models` show them all. `--max-ctx` caps the context window
+that openbatrangs uses, and `--thor` is a shortcut for the author's Jetson AGX
+Thor.
 
-Measured with Nemotron 3 Nano 30B-A3B on a Jetson AGX Thor (llama-server,
-thinking on): a cargo project with a stack, a queue, a linked list, binary
-search and quicksort, each with tests, took 14 steps and 293 s, and its 14
-tests pass. Setup for the Thor's shared server, including keys:
-[Bring your own agent](https://arpanpathak.github.io/thor-thunder-tigress-platform/ch16-bring-your-own-agent.html).
+### Ollama
 
-### Interactive REPL commands
+Without `--openai-url`, openbatrangs connects to Ollama at
+`http://localhost:11434`. It starts `ollama serve` when Ollama is installed but
+not running, and it downloads a recommended coding model when no installed
+model is suitable. `--no-auto-pull` turns that download off.
 
-Inside the `openBatarangs>` prompt:
-
-```
-/help          show all commands
-/exit, /quit   leave the REPL
-/setup         install/start Ollama + pull a model
-/models        list installed models + scores
-/model <tag>   switch model (e.g. /model qwen2.5-coder:7b)
-/read-only     toggle read-only mode
-/confirm       toggle confirm-before-write/command
-/steps <n>     set max agent steps
-/cwd <path>    change workspace
-/doctor        check Ollama + best model
-/mouse on|off  wheel/scrollbar capture (default on)
+```sh
+openbatrangs setup                          # install and start Ollama, download a coding model
+openbatrangs list-models                    # installed models and their agent scores
+openbatrangs doctor                         # check Ollama and recommend a model
+openbatrangs --model qwen2.5-coder:7b "explain this repository"
 ```
 
-The interactive TUI starts in **chat** mode (no tools). Use `/mode agent` to
-enable the full agentic loop, or `/mode plan` for read-only planning.
+### Web search
 
-Anything else you type is sent to chat; in agent/plan mode it is sent to the
-coding agent as a task.
+The web tools query SearXNG at `http://127.0.0.1:8888` by default. To use
+another instance, pass `--searxng-url` or set `OPENBATRANGS_SEARXNG_URL`.
 
-## Agent tools
-
-The agent can use these tools during a task. It does **not** scan the
-workspace unless your task explicitly asks about the current directory,
-project structure, codebase, or which files exist:
-
-| Tool | Description |
-| --- | --- |
-| `list_files` | List files in a directory (max depth 2; skips `target`, `.git`, `node_modules`, `data`, build/cache dirs, etc.) |
-| `read_file` | Read a text file with a size cap |
-| `grep_files` | Regex search across workspace files |
-| `write_file` | Write or overwrite a file (relative paths only) |
-| `run_command` | Run a shell command in the workspace (e.g. `cargo check`) |
-| `finish` | Signal the task is complete |
-
-For safety:
-- Tool paths must be relative; absolute paths and `..` are rejected.
-- `--read-only` disables `write_file` and `run_command`.
-- `--confirm` asks before each write/command.
-
-## Model auto-discovery
-
-`openBatarangs` scores installed models by:
-
-- Memory fit (model file size vs. system memory)
-- Parameter size sweet spot for agentic coding (roughly 3B–8B on 16 GB devices)
-- Coding-model name bonus (`qwen2.5-coder`, `deepseek-coder`, etc.)
-- Context window (target ~32K)
-- Quantization quality
-
-If nothing suitable is installed, it can automatically pull a recommended model
-(`qwen2.5-coder:7b` on >=12 GB systems, otherwise `qwen2.5-coder:3b`).
-
-## Common flags
-
-```
---ollama-url <URL>   Ollama server URL (default http://localhost:11434)
---model <TAG>        Use a specific Ollama model tag
---cwd <DIR>          Workspace directory (default .)
---max-steps <N>      Max agent iterations (default 40)
---min-context <N>    Minimum context window for auto-selection (default 8192)
---read-only          Disable writes and shell commands
---confirm            Ask before writes/commands
---no-auto-pull       Never auto-pull models
---openai-url <URL>   Use an OpenAI-compatible server instead of Ollama
---api-key-file <P>   Bearer key file for --openai-url
---thor               Nemotron on a Jetson Thor (127.0.0.1:8079/v1, ~/.config/thor-chat/api-key)
---no-think           Turn thinking off (OpenAI-compatible servers)
+```sh
+ssh -fN -L 18888:127.0.0.1:8888 gpu-box     # reach SearXNG on a remote machine
+openbatrangs --searxng-url http://127.0.0.1:18888
 ```
 
-## Roadmap
+## Terminal UI commands
 
-This is the first working version. Future steps for standalone distribution:
+| Command | Effect |
+|---|---|
+| `/help` | list the commands |
+| `/status` | show the current settings and model |
+| `/mode agent\|plan\|chat` | switch between every tool, read-only planning and plain chat |
+| `/model <tag>` | switch to an installed model |
+| `/models` | open the model picker |
+| `/pull <tag>` | download a model from Ollama |
+| `/setup` | install and start Ollama and download a model |
+| `/doctor` | check Ollama and recommend a model |
+| `/read-only` | toggle read-only mode |
+| `/confirm` | toggle confirmation before writes and commands |
+| `/yolo` | turn off every confirmation |
+| `/thinking on\|off` | show or hide the model's reasoning |
+| `/steps <n>` | set the step limit |
+| `/cwd <path>` | change the project folder |
+| `/perf` | toggle the performance panel |
+| `/mouse on\|off` | use the mouse wheel and scrollbar, or the terminal's own selection |
+| `/clear` | clear the transcript |
+| `/exit`, `/quit` | leave openbatrangs |
 
-- Prebuilt binaries for `aarch64` and `x86_64`
-- `cargo install` from crates.io
-- Optional direct GGUF fallback via `mistralrs` or `llama.cpp`
-- Better token budgeting / context compression for long agent sessions
-- Installer script that checks for Ollama and installs a recommended model
+Ctrl+C stops a running task. A correction typed after that continues the same
+conversation.
+
+On macOS, the performance panel shows no GPU data, because it reads
+`tegrastats` or `nvidia-smi`, and its CPU and memory figures stay at zero,
+because they come from `/proc`.
+
+## Development
+
+```sh
+cargo test
+cargo clippy --all-targets
+cargo llvm-cov --summary-only               # line coverage
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) describes the development setup and the
+guidelines for pull requests.
 
 ## License
 
-[AGPL-3.0](LICENSE). Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+openbatrangs is licensed under the [GNU Affero General Public License v3.0](LICENSE).
