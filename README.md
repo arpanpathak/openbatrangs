@@ -16,7 +16,7 @@ A terminal coding agent for local language models, on any hardware.
 [![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-fcc624?style=for-the-badge&logo=linux&logoColor=black)](#install)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20silicon%20%7C%20Intel-000000?style=for-the-badge&logo=apple&logoColor=white)](#install)
 
-<img src="assets/demo.gif" alt="openbatrangs adding a median function and its tests to a Rust crate" width="900">
+<img src="assets/demo.gif" alt="openbatrangs adding a median function and its tests to a Rust crate, with folded steps and the model server's GPU load in the panel" width="900">
 
 </div>
 
@@ -43,9 +43,18 @@ only for the hardware or the VM time.
   timeout.
 - **Web search:** `web_search` and `web_read` through a
   [SearXNG](https://github.com/searxng/searxng) instance.
-- **Terminal UI:** a transcript with syntax-highlighted code, slash commands, a
-  model picker, and a live panel with GPU, CPU and memory use and tokens per
-  second.
+- **Folded steps:** one line per step with a title, the model and the time
+  taken. Open a step for its reasoning, its decision and each tool call with
+  its result, then open those for the full text.
+- **Markdown answers:** headings, lists, tables, links and highlighted code.
+- **Live server stats:** the model server's GPU utilization, power, temperature
+  and memory from servers that publish `/v1/system`, such as
+  [thor-tigress-agent](https://github.com/arpanpathak/thor-thunder-tigress-platform),
+  or running requests and KV-cache use from vLLM, SGLang and llama.cpp
+  `/metrics`, with this machine's CPU, memory and tokens per second below them.
+- **Terminal UI:** slash commands and a model picker. Click a step to fold it,
+  or press Tab to reach the transcript, the arrow keys to choose a step, and
+  Enter to fold it.
 - **Reasoning display:** the reasoning of thinking models such as Qwen3 and
   Nemotron, dimmed before each step, or hidden with `--no-think`.
 
