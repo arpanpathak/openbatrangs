@@ -41,6 +41,12 @@ pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -
         .arg("-lc")
         .arg(command)
         .current_dir(root)
+        // A command that reads input, such as git asking for a username, gets
+        // end-of-file at once. With the TUI's stdin, it would wait for keys
+        // that the TUI keeps for itself, and the agent would freeze.
+        .stdin(std::process::Stdio::null())
+        // git fails with an error in place of asking for a username or password.
+        .env("GIT_TERMINAL_PROMPT", "0")
         // If `timeout` below fires, the `Child` is dropped and must take the
         // shell (and its descendants) down with it instead of leaving an
         // orphaned command running in the background.
@@ -164,6 +170,28 @@ mod tests {
         assert!(output.contains("[stderr]"));
         assert!(output.contains("oops"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_reads_get_end_of_file() -> anyhow::Result<()> {
+        let root = temp_dir();
+        let output = run_command(&root, "read -r line; echo read-exit:$?", 5).await?;
+
+        assert!(output.contains("read-exit:1"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn git_never_prompts() -> anyhow::Result<()> {
+        let root = temp_dir();
+        let output = run_command(&root, "echo prompt:$GIT_TERMINAL_PROMPT", 5).await?;
+
+        assert!(output.contains("prompt:0"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
