@@ -41,6 +41,20 @@ pub const MIN_OUTPUT_TOKENS: u64 = 1_024;
 /// Upper cap for `num_predict`; Ollama also stops at the context window.
 pub const MAX_OUTPUT_TOKENS: u64 = 8_192;
 
+/// Share of the prompt budget, in percent, that the earlier turns of the
+/// conversation may use in a new task's first message.
+pub const EARLIER_TURNS_BUDGET_PERCENT: usize = 25;
+
+/// Maximum characters kept from one earlier turn of the conversation.
+pub const MAX_EARLIER_TURN_CHARS: usize = 2_000;
+
+/// Heading of the earlier turns in a new task's first message.
+pub const EARLIER_TURNS_HEADING: &str = "Earlier in this conversation:";
+
+/// Fewest characters a tool result is shortened to when the prompt is over
+/// its budget.
+pub const MIN_TOOL_RESULT_CHARS: usize = 512;
+
 /// Prefix of the user messages that carry a tool's output in the JSON loop.
 pub const TOOL_RESULT_PREFIX: &str = "Tool result:";
 

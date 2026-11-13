@@ -597,12 +597,9 @@ impl App {
         self.last_chunk_at = None;
     }
 
-    /// Add a turn to the chat history in chat mode; other modes keep none.
+    /// Add a turn to the session's history, in every mode, so a later task
+    /// or a change of mode or model keeps the conversation.
     fn remember_chat_turn(&mut self, role: Role, content: String) {
-        if self.run_config.mode != AgentMode::Chat {
-            return;
-        }
-
         self.remember_chat(ChatMessage { role, content });
     }
 
@@ -655,11 +652,11 @@ impl App {
                 name, arguments, ..
             } => self.last_action = format!("🔧 {}", describe_call(name, arguments)),
             AgentEvent::AskUser { question } => self.on_question(question),
+            AgentEvent::Finished { answer, .. } => self.reply = answer.clone(),
             AgentEvent::StepStarted { .. }
             | AgentEvent::TextEnded(_)
             | AgentEvent::ToolResult { .. }
-            | AgentEvent::Notice(_)
-            | AgentEvent::Finished { .. } => {}
+            | AgentEvent::Notice(_) => {}
         }
 
         self.transcript.apply(event);
@@ -755,7 +752,8 @@ impl App {
         }
     }
 
-    /// Keep the streamed reply in the chat history in chat mode.
+    /// Keep the reply in the session's history: the streamed chat reply, or
+    /// the agent's final answer.
     fn save_assistant_reply(&mut self) {
         let reply = std::mem::take(&mut self.reply);
 
@@ -1858,6 +1856,33 @@ mod tests {
         assert_eq!(app.chat_history.len(), 2);
         assert_eq!(app.chat_history[1].role, crate::ollama::Role::Assistant);
         assert_eq!(app.chat_history[1].content, "world");
+    }
+
+    #[test]
+    fn an_agent_run_keeps_its_final_answer_in_the_history() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.run_config.mode = AgentMode::Agent;
+        app.remember_chat_turn(crate::ollama::Role::User, "rename the parser".to_string());
+
+        app.handle_event(UiEvent::Agent(answer("Let me look. ")), &client, &tx);
+        let finished = AgentEvent::Finished {
+            answer: "Renamed it to reader.".to_string(),
+            answer_was_streamed: false,
+            changed_files: Vec::new(),
+        };
+        app.handle_event(UiEvent::Agent(finished), &client, &tx);
+        app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
+
+        let turns: Vec<&str> = app
+            .chat_history
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect();
+        assert_eq!(turns, ["rename the parser", "Renamed it to reader."]);
+
+        Ok(())
     }
 
     #[test]

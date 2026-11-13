@@ -16,6 +16,7 @@
 //! - OpenAI function calling: <https://platform.openai.com/docs/guides/function-calling>
 //! - llama.cpp server, router mode: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
+use super::context::{max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
 use super::quality::{FinishGate, command_succeeded};
@@ -23,11 +24,12 @@ use super::research::task_with_documentation;
 use super::tool::{Tool, ToolCall, strip_code_fence};
 use super::{
     AgentConfig, AgentEvent, Confirmer, HistorySink, LoopKind, Reporter, RunContinuation, TextKind,
-    effective_context, ensure_workspace_exists,
+    earlier_turns_section, effective_context, ensure_workspace_exists,
 };
 use crate::constants::agent::{
     AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
-    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, NATIVE_SYSTEM_PROMPT,
+    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
+    NATIVE_SYSTEM_PROMPT,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use anyhow::{Context, Result};
@@ -181,6 +183,16 @@ impl Message {
     /// True for a tool result.
     fn is_tool_result(&self) -> bool {
         matches!(self, Self::Tool { .. })
+    }
+
+    /// Shorten a tool result to at most `max_chars` characters; other
+    /// messages stay as they are.
+    fn shorten_tool_result(&mut self, max_chars: usize) {
+        let Self::Tool { content, .. } = self else {
+            return;
+        };
+
+        *content = truncate_chars(content, max_chars);
     }
 
     /// The text of a tool result.
@@ -392,6 +404,9 @@ struct Run<'a, R, C> {
     model: &'a str,
     /// Context window, in tokens.
     num_ctx: u64,
+    /// Characters the messages may use, so the prompt, the tool schema and
+    /// the reply fit in `num_ctx`.
+    prompt_budget: usize,
     /// Whether the model is asked to think, from `--no-think` on the client.
     think: bool,
     /// Whether the project has a build or test manifest, so changed files
@@ -453,6 +468,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             loop_kind: LoopKind::Native,
         });
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
+        fit_to_budget(&mut self.messages, self.prompt_budget);
 
         State::Stream
     }
@@ -508,14 +524,17 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         let answer = text.trim();
         self.empty_retries = 0;
 
-        let Some(feedback) = self.finish_feedback() else {
-            return self.report_done(answer, true);
-        };
-
+        // The answer stays in the conversation either way: a resumed run
+        // needs it, and a rejected one needs it before the feedback.
         self.messages.push(Message::Assistant {
             content: answer.to_string(),
             calls: Vec::new(),
         });
+
+        let Some(feedback) = self.finish_feedback() else {
+            return self.report_done(answer, true);
+        };
+
         self.reject_finish(feedback)
     }
 
@@ -733,14 +752,22 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
 ) -> Result<()> {
     ensure_workspace_exists(&config.cwd)?;
 
-    let (resume, sink) = continuation
-        .map(|run| (run.messages, run.sink))
-        .unwrap_or((None, None));
+    let RunContinuation {
+        messages: resume,
+        earlier,
+        sink,
+    } = continuation.unwrap_or_default();
     let think = client.requests_thinking();
     let resuming = resume.is_some();
+    let num_ctx = effective_context(config.model_context, config.max_ctx);
 
     let opening_task = opening_task(task, config, resuming, reporter).await;
-    let messages = seed_messages(config, &opening_task, think, resume);
+    let opening = Opening {
+        task: &opening_task,
+        earlier: &earlier_turns_section(&earlier, num_ctx),
+        think,
+    };
+    let messages = seed_messages(config, &opening, resume);
 
     // Carry the prior run's state forward so the gate does not demand a
     // check that already passed before the interrupt.
@@ -751,7 +778,8 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         config,
         client,
         model,
-        num_ctx: effective_context(config.model_context, config.max_ctx),
+        num_ctx,
+        prompt_budget: prompt_budget(num_ctx),
         think,
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
@@ -783,27 +811,37 @@ async fn opening_task<R: Reporter>(
     task_with_documentation(task, config, reporter).await
 }
 
+/// What the first user turn of a run is made of.
+struct Opening<'a> {
+    /// The task, or the correction when resuming.
+    task: &'a str,
+    /// The earlier turns of the session as a section of the first message;
+    /// empty when there are none.
+    earlier: &'a str,
+    /// Whether the model is asked to think.
+    think: bool,
+}
+
 /// The opening messages: the stored conversation plus the new task when
 /// resuming, or the fresh system + task pair otherwise.
 fn seed_messages(
     config: &AgentConfig,
-    task: &str,
-    think: bool,
+    opening: &Opening,
     resume: Option<Vec<Value>>,
 ) -> Vec<Message> {
     let Some(mut messages) = resume.as_deref().and_then(Message::conversation) else {
-        return fresh_messages(config, task, think);
+        return fresh_messages(config, opening);
     };
 
-    messages.push(Message::User(task.to_string()));
+    messages.push(Message::User(opening.task.to_string()));
     messages
 }
 
 /// The system prompt and initial user turn for a fresh run.
-fn fresh_messages(config: &AgentConfig, task: &str, think: bool) -> Vec<Message> {
+fn fresh_messages(config: &AgentConfig, opening: &Opening) -> Vec<Message> {
     vec![
         Message::System(NATIVE_SYSTEM_PROMPT.to_string()),
-        Message::User(initial_user_message(config, task, think)),
+        Message::User(initial_user_message(config, opening)),
     ]
 }
 
@@ -879,14 +917,16 @@ const TASK_HEADING: &str = "\n\nTask:\n";
 /// system prompt says to use `out/`, and it writes to `out/` again once the
 /// same text is in the user turn. So the task carries the instructions
 /// whenever thinking is off.
-fn initial_user_message(config: &AgentConfig, task: &str, think: bool) -> String {
+fn initial_user_message(config: &AgentConfig, opening: &Opening) -> String {
     let task = format!(
-        "Workspace root: {}\n\nEnvironment:\n{}{TASK_HEADING}{task}",
+        "Workspace root: {}\n\nEnvironment:\n{}{}{TASK_HEADING}{}",
         config.cwd.display(),
-        environment_facts(&config.cwd)
+        environment_facts(&config.cwd),
+        opening.earlier,
+        opening.task
     );
 
-    match think {
+    match opening.think {
         true => task,
         false => format!("Instructions (highest priority):\n{NATIVE_SYSTEM_PROMPT}\n\n{task}"),
     }
@@ -916,8 +956,12 @@ fn parse_arguments(raw: &str) -> Value {
 }
 
 /// Build the `/chat/completions` body for one turn.
+///
+/// The tool schema goes with every request, so it counts toward the prompt
+/// that `max_tokens` leaves room for.
 fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) -> Value {
-    let prompt = messages.iter().map(Message::char_len).sum::<usize>();
+    let tools = tools_schema();
+    let prompt = total_chars(messages) + tools.to_string().len();
     let prompt_tokens = (prompt as f64 / CHARS_PER_TOKEN).ceil() as u64;
     let max_tokens = num_ctx
         .saturating_sub(prompt_tokens)
@@ -927,7 +971,7 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
     json!({
         "model": model,
         "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
-        "tools": tools_schema(),
+        "tools": tools,
         // "required" keeps served models from answering in plain text when a
         // tool call is what the task needs; the `finish` tool is the exit.
         "tool_choice": "required",
@@ -1045,6 +1089,77 @@ fn first_turn_length(messages: &[Message]) -> usize {
         .count();
 
     1 + results
+}
+
+/// Characters the messages may use in a `num_ctx` window: the prompt budget
+/// minus the tool schema, which goes with every request.
+fn prompt_budget(num_ctx: u64) -> usize {
+    let schema_chars = tools_schema().to_string().len();
+
+    max_prompt_chars(num_ctx).saturating_sub(schema_chars)
+}
+
+/// Make the messages fit in `budget` characters: drop the oldest turns after
+/// the system prompt and the task, keeping at least the newest turn, then
+/// shorten tool results when that is not enough.
+///
+/// Turns are dropped whole, so no tool call loses its result.
+fn fit_to_budget(messages: &mut Vec<Message>, budget: usize) {
+    if total_chars(messages) <= budget {
+        return;
+    }
+
+    let mut recent = messages.split_off(messages.len().min(2));
+    let room = budget.saturating_sub(total_chars(messages));
+
+    drop_turns_over_room(&mut recent, room);
+    drop_orphan_results(&mut recent);
+    messages.append(&mut recent);
+    shorten_tool_results(messages, budget);
+}
+
+/// Drop whole turns from the front of `recent` until it fits in `room`
+/// characters or only one turn is left.
+fn drop_turns_over_room(recent: &mut Vec<Message>, room: usize) {
+    while has_turn_to_drop(recent, room) {
+        let turn_length = first_turn_length(recent);
+        recent.drain(..turn_length);
+    }
+}
+
+/// True while `recent` is over `room` characters and holds more than one turn.
+fn has_turn_to_drop(recent: &[Message], room: usize) -> bool {
+    total_chars(recent) > room && first_turn_length(recent) < recent.len()
+}
+
+/// Shorten every tool result to an equal share of what the other messages
+/// leave of `budget`, when the messages are still over it.
+fn shorten_tool_results(messages: &mut [Message], budget: usize) {
+    if total_chars(messages) <= budget {
+        return;
+    }
+
+    let share = tool_result_share(messages, budget);
+
+    messages
+        .iter_mut()
+        .for_each(|message| message.shorten_tool_result(share));
+}
+
+/// The characters each tool result may keep: what the other messages leave
+/// of `budget`, split evenly, and never below [`MIN_TOOL_RESULT_CHARS`].
+fn tool_result_share(messages: &[Message], budget: usize) -> usize {
+    let results: Vec<&str> = messages.iter().filter_map(Message::tool_content).collect();
+    let result_chars: usize = results.iter().map(|content| content.len()).sum();
+    let other_chars = total_chars(messages) - result_chars;
+    let room = budget.saturating_sub(other_chars);
+
+    (room / results.len().max(1)).max(MIN_TOOL_RESULT_CHARS)
+}
+
+/// Combined character size of `messages`.
+fn total_chars(messages: &[Message]) -> usize {
+    messages.iter().map(Message::char_len).sum()
 }
 
 /// A tail that starts with a tool result has lost its assistant message;
@@ -1221,6 +1336,7 @@ mod tests {
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_replies, test_config,
         text_delta, tool_call_delta,
     };
+    use crate::ollama::ChatMessage;
     use std::path::{Path, PathBuf};
 
     /// A `read_file` invocation with id `id`.
@@ -1483,11 +1599,17 @@ mod tests {
     fn the_task_carries_the_rules_only_when_thinking_is_off() {
         let config = test_config(Path::new("/tmp/workspace"), 4);
 
-        let thinking = initial_user_message(&config, "write it", true);
+        let opening = |think| Opening {
+            task: "write it",
+            earlier: "",
+            think,
+        };
+
+        let thinking = initial_user_message(&config, &opening(true));
         assert!(thinking.starts_with("Workspace root: /tmp/workspace"));
         assert!(!thinking.contains(NATIVE_SYSTEM_PROMPT));
 
-        let not_thinking = initial_user_message(&config, "write it", false);
+        let not_thinking = initial_user_message(&config, &opening(false));
         assert!(not_thinking.contains(NATIVE_SYSTEM_PROMPT));
         assert!(not_thinking.ends_with("Task:\nwrite it"));
     }
@@ -1581,7 +1703,13 @@ mod tests {
         ];
         let config = test_config(Path::new("/tmp"), 4);
 
-        let messages = seed_messages(&config, "use the other API instead", true, Some(prior));
+        let opening = Opening {
+            task: "use the other API instead",
+            earlier: "",
+            think: true,
+        };
+
+        let messages = seed_messages(&config, &opening, Some(prior));
 
         assert_eq!(messages.len(), 5);
         assert!(matches!(messages[0], Message::System(_)));
@@ -1598,7 +1726,13 @@ mod tests {
         let config = test_config(Path::new("/tmp"), 4);
         let bad_history = vec![json!({"role": "oracle", "content": "x"})];
 
-        let messages = seed_messages(&config, "task", true, Some(bad_history));
+        let opening = Opening {
+            task: "task",
+            earlier: "",
+            think: true,
+        };
+
+        let messages = seed_messages(&config, &opening, Some(bad_history));
 
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0], Message::System(_)));
@@ -1850,8 +1984,8 @@ mod tests {
         let config = test_config(&root, 5);
         let mut sink = RecordingSink::default();
         let continuation = RunContinuation {
-            messages: None,
             sink: Some(&mut sink),
+            ..RunContinuation::default()
         };
         let mut reporter = RecordingReporter::default();
         let mut confirmer = FixedConfirmer::new(true);
@@ -1934,6 +2068,7 @@ mod tests {
         let continuation = RunContinuation {
             messages: Some(prior),
             sink: Some(&mut sink),
+            ..RunContinuation::default()
         };
         let mut reporter = RecordingReporter::default();
         let mut confirmer = FixedConfirmer::new(true);
@@ -1949,13 +2084,134 @@ mod tests {
         )
         .await?;
 
+        // The prior three messages, the correction, and the answer.
         assert_eq!(sink.snapshots.len(), 2);
-        let last = sink.snapshots.last().map(Vec::len);
-        assert_eq!(last, Some(4));
+        let last = sink.snapshots.last().cloned().unwrap_or_default();
+        assert_eq!(last.len(), 5);
+        assert_eq!(last[4], json!({"role": "assistant", "content": "switched"}));
         assert!(!reporter.output.contains("web_search"));
         assert!(reporter.output.contains("✅ switched"));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_run_gets_the_earlier_turns_in_its_first_message() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-earlier");
+        let url = serve_replies(vec![Reply::openai_stream(&[text_delta("done")])]).await?;
+        let client = OllamaClient::openai(&url, None, false)?;
+        let config = test_config(&root, 2);
+        let earlier = vec![
+            ChatMessage {
+                role: crate::ollama::Role::User,
+                content: "rename the parser".to_string(),
+            },
+            ChatMessage {
+                role: crate::ollama::Role::Assistant,
+                content: "Renamed it to reader.".to_string(),
+            },
+        ];
+        let mut sink = RecordingSink::default();
+        let continuation = RunContinuation {
+            earlier,
+            sink: Some(&mut sink),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "print our conversation so far",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let first = sink.snapshots.first().cloned().unwrap_or_default();
+        let task = first[1]["content"].as_str().unwrap_or_default();
+        assert!(task.contains("Earlier in this conversation:"));
+        assert!(task.contains("User: rename the parser\nAssistant: Renamed it to reader."));
+        assert!(task.ends_with("Task:\nprint our conversation so far"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// An assistant turn that calls `read_file` with call id `id`.
+    fn read_turn(id: &str) -> Message {
+        Message::Assistant {
+            content: String::new(),
+            calls: vec![Invocation {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn large_tool_results_are_cut_to_fit_the_context_window() {
+        let mut messages = vec![
+            Message::System("rules".to_string()),
+            Message::User("task".to_string()),
+        ];
+
+        for index in 0..19 {
+            let id = format!("c{index}");
+            messages.push(read_turn(&id));
+            messages.push(Message::Tool {
+                id,
+                content: "x".repeat(20_000),
+            });
+        }
+
+        let budget = prompt_budget(8_192);
+        trim_messages(&mut messages, MAX_HISTORY_MESSAGES);
+        fit_to_budget(&mut messages, budget);
+
+        let body = request_body("m", &messages, 8_192, true);
+        let prompt_chars = total_chars(&messages) + tools_schema().to_string().len();
+        let prompt_tokens = (prompt_chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
+        let max_tokens = body["max_tokens"].as_u64().unwrap_or(u64::MAX);
+        assert!(prompt_tokens + max_tokens <= 8_192);
+
+        // The newest turn is kept, with its call and its result.
+        assert!(matches!(messages[2], Message::Assistant { .. }));
+        assert!(messages.last().is_some_and(Message::is_tool_result));
+    }
+
+    #[test]
+    fn a_turn_too_large_alone_keeps_its_call_and_a_shortened_result() {
+        let mut messages = vec![
+            Message::System("rules".to_string()),
+            Message::User("task".to_string()),
+            read_turn("c1"),
+            Message::Tool {
+                id: "c1".to_string(),
+                content: "y".repeat(100_000),
+            },
+        ];
+
+        fit_to_budget(&mut messages, 4_000);
+
+        assert_eq!(messages.len(), 4);
+        assert!(total_chars(&messages) < 4_000 + 100);
+    }
+
+    #[test]
+    fn messages_within_the_budget_stay_as_they_are() {
+        let mut messages = vec![
+            Message::System("rules".to_string()),
+            Message::User("task".to_string()),
+        ];
+
+        fit_to_budget(&mut messages, 1_000);
+
+        assert_eq!(messages.len(), 2);
     }
 }

@@ -22,7 +22,7 @@ use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
 use super::{
     AgentConfig, AgentEvent, Confirmer, LoopKind, Reporter, RunContinuation, compact_context,
-    effective_context, ensure_workspace_exists, max_output_tokens,
+    earlier_turns_section, effective_context, ensure_workspace_exists, max_output_tokens,
 };
 use crate::constants::agent::{
     AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
@@ -144,7 +144,12 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
     warn_when_resume_is_unsupported(continuation.as_ref(), reporter);
 
     let num_ctx = effective_context(config.model_context, config.max_ctx);
+    let earlier = continuation.map(|run| run.earlier).unwrap_or_default();
     let task_with_docs = task_with_documentation(task, config, reporter).await;
+    let opening = Opening {
+        task: &task_with_docs,
+        earlier: &earlier_turns_section(&earlier, num_ctx),
+    };
 
     let run = JsonRun {
         config,
@@ -153,13 +158,22 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         num_ctx,
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
-        messages: initial_messages(&config.cwd, &task_with_docs),
+        messages: initial_messages(&config.cwd, &opening),
         changed_files: Vec::new(),
         finish_gate: FinishGate::default(),
         reporter,
         confirmer,
     };
     run.run().await
+}
+
+/// What the first user turn of a run is made of.
+struct Opening<'a> {
+    /// The task, with any documentation found for it.
+    task: &'a str,
+    /// The earlier turns of the session as a section of the first message;
+    /// empty when there are none.
+    earlier: &'a str,
 }
 
 /// Report that the interrupted conversation is dropped, when there is one:
@@ -486,11 +500,13 @@ fn task_requests_workspace_scan(task: &str) -> bool {
 /// directory/project structure. For any other task the agent starts with zero
 /// filesystem scanning, which keeps agent mode fast and avoids flooding the
 /// model with irrelevant files.
-fn initial_messages(cwd: &Path, task: &str) -> Vec<ChatMessage> {
+fn initial_messages(cwd: &Path, opening: &Opening) -> Vec<ChatMessage> {
     let user_content = format!(
-        "{}\n\nEnvironment:\n{}\n\nTask:\n{task}",
-        workspace_note(cwd, task),
-        environment_facts(cwd)
+        "{}\n\nEnvironment:\n{}{}\n\nTask:\n{}",
+        workspace_note(cwd, opening.task),
+        environment_facts(cwd),
+        opening.earlier,
+        opening.task
     );
 
     vec![
@@ -569,6 +585,11 @@ mod tests {
     };
     use crate::constants::ansi::ANSI_GREEN_CHECK;
     use std::path::PathBuf;
+
+    /// The opening of a run for `task`, with no earlier turns.
+    fn opening(task: &str) -> Opening<'_> {
+        Opening { task, earlier: "" }
+    }
 
     /// The output of a JSON-loop run of `task` with `max_steps` steps against
     /// a server that sends `replies` in order, and the run's result.
@@ -744,6 +765,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_with_earlier_turns_answers() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-json-earlier");
+        let url = serve_replies(vec![Reply::ollama_stream(
+            r#"{"answer":"You asked me to rename it."}"#,
+        )])
+        .await?;
+        let client = OllamaClient::new(&url)?;
+        let config = test_config(&root, 2);
+        let continuation = RunContinuation {
+            earlier: vec![message(Role::User, "rename the parser")],
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_json_agent(
+            &config,
+            &client,
+            "m",
+            "what did I ask?",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        assert!(reporter.output.contains("You asked me to rename it."));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn initial_messages_put_the_earlier_turns_before_the_task() {
+        let opening = Opening {
+            task: "what did I ask?",
+            earlier: "\n\nEarlier in this conversation:\nUser: rename the parser",
+        };
+
+        let messages = initial_messages(Path::new("/definitely/not/a/workspace"), &opening);
+
+        assert!(messages[1].content.ends_with(
+            "Earlier in this conversation:\nUser: rename the parser\n\nTask:\nwhat did I ask?"
+        ));
+    }
+
+    #[tokio::test]
     async fn a_failed_model_call_names_the_step() -> Result<()> {
         let root = crate::test_support::unique_temp_dir("openbatrangs-json-fail");
         let url = serve_replies(vec![Reply::server_error("no model")]).await?;
@@ -797,11 +865,9 @@ mod tests {
         let continuation = RunContinuation {
             messages: Some(Vec::new()),
             sink: Some(&mut sink),
+            ..RunContinuation::default()
         };
-        let fresh = RunContinuation {
-            messages: None,
-            sink: None,
-        };
+        let fresh = RunContinuation::default();
         let mut reporter = RecordingReporter::default();
 
         warn_when_resume_is_unsupported(Some(&fresh), &mut reporter);
@@ -892,7 +958,7 @@ mod tests {
         std::fs::write(root.join("top.txt"), "top")?;
         std::fs::write(root.join("sub/nested/deep.txt"), "deep")?;
 
-        let messages = initial_messages(&root, "analyze this codebase");
+        let messages = initial_messages(&root, &opening("analyze this codebase"));
 
         let user_content = &messages[1].content;
         assert!(user_content.contains("top.txt"));
@@ -907,7 +973,7 @@ mod tests {
     fn initial_messages_report_a_listing_failure() {
         let missing = PathBuf::from("/definitely/not/a/workspace");
 
-        let messages = initial_messages(&missing, "explore this repo");
+        let messages = initial_messages(&missing, &opening("explore this repo"));
 
         assert!(messages[1].content.contains("(could not list files:"));
     }
@@ -917,7 +983,7 @@ mod tests {
         let root = crate::test_support::unique_temp_dir("openbatrangs-no-scan-test");
         std::fs::write(root.join("top.txt"), "top")?;
 
-        let messages = initial_messages(&root, "write a quicksort function in Rust");
+        let messages = initial_messages(&root, &opening("write a quicksort function in Rust"));
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, Role::System);
