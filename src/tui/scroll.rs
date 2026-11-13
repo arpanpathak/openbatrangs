@@ -1,8 +1,8 @@
 //! # Chat scrolling and scrollbar hit-testing
 //!
-//! The chat area is a wrapped paragraph with its own vertical offset. Keeping
-//! the scroll math in one small module means it can be tested in isolation and
-//! the rest of the TUI does not need to reason about wrapped-row arithmetic.
+//! The transcript is drawn from a vertical offset in rows. Keeping the scroll
+//! math in one small module means it can be tested in isolation and the rest
+//! of the TUI does not need to reason about row arithmetic.
 //!
 //! Two input paths feed this module:
 //!
@@ -18,33 +18,68 @@
 
 use super::ScrollMode;
 use super::app::App;
-use super::text_wrapped_height;
-use crate::constants::tui::{CHAT_SCROLL_STEP, LOG_LOAD_CHUNK};
+use crate::constants::tui::{BLOCK_LOAD_CHUNK, CHAT_SCROLL_STEP};
 use ratatui::layout::Rect;
+
+/// Width of the transcript text in a chat area `area_width` cells wide: the
+/// borders and the scrollbar column are left out.
+pub(super) fn chat_text_width(area_width: u16) -> usize {
+    (area_width as usize).saturating_sub(3).max(1)
+}
+
+/// Number of text rows inside the chat area's borders.
+pub(super) fn chat_visible_height(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
 
 impl App {
     /// Scroll the chat by `delta` wrapped rows.
     ///
     /// Scrolling always switches to [`ScrollMode::Manual`]. When the user
-    /// scrolls up past the top of the in-memory window, the next chunk of
-    /// disk-backed history is loaded and the offset resets to the top of that
-    /// chunk.
+    /// scrolls up past the top of the blocks in memory, older blocks are
+    /// loaded from the session file and the offset resets to the top of them.
+    /// Scrolling down past the bottom loads newer blocks the same way.
     pub(super) fn scroll_chat(&mut self, delta: i32) {
         self.scroll_mode = ScrollMode::Manual;
+        self.sync_transcript_scroll();
 
         if self.reaches_unloaded_history(delta) {
-            self.log.load_more(LOG_LOAD_CHUNK);
+            self.transcript.load_older(BLOCK_LOAD_CHUNK);
             self.chat_scroll_offset = 0;
             return;
         }
 
         let next = self.chat_scroll_offset as i32 + delta;
         self.chat_scroll_offset = next.max(0) as usize;
+        self.load_newer_at_bottom(delta);
     }
 
-    /// Whether scrolling by `delta` passes the top while older lines wait on disk.
+    /// Whether scrolling by `delta` passes the top while older blocks wait on disk.
     fn reaches_unloaded_history(&self, delta: i32) -> bool {
-        scrolls_past_top(self.chat_scroll_offset, delta) && self.log.has_more_history()
+        scrolls_past_top(self.chat_scroll_offset, delta) && self.transcript.has_older()
+    }
+
+    /// Load newer blocks when a scroll down reached the bottom while newer
+    /// blocks wait on disk.
+    fn load_newer_at_bottom(&mut self, delta: i32) {
+        let is_at_bottom = self.chat_scroll_offset >= self.max_chat_scroll();
+
+        if matches!(
+            (delta > 0, is_at_bottom, self.transcript.has_newer()),
+            (true, true, true)
+        ) {
+            self.transcript.load_newer(BLOCK_LOAD_CHUNK);
+            self.sync_transcript_scroll();
+        }
+    }
+
+    /// The largest scroll offset: the transcript height minus the rows on
+    /// screen. Without a measured chat area the whole height counts.
+    fn max_chat_scroll(&mut self) -> usize {
+        let area = self.last_chat_area.unwrap_or_default();
+        let total_rows = self.transcript.layout(chat_text_width(area.width));
+
+        total_rows.saturating_sub(chat_visible_height(area))
     }
 
     /// Scroll by one full viewport page (`PageUp`/`PageDown`).
@@ -83,9 +118,8 @@ impl App {
     /// Jump to the offset that `track_row` (counted from the top of the
     /// scrollbar track) stands for, in proportion to the wrapped content.
     fn scroll_to_track_row(&mut self, area: Rect, track_row: usize) {
-        let visible_height = area.height.saturating_sub(2).max(1) as usize;
-        let max_text_width = (area.width as usize).saturating_sub(2).max(1);
-        let content_height = text_wrapped_height(&self.chat_text(), max_text_width);
+        let visible_height = chat_visible_height(area).max(1);
+        let content_height = self.transcript.layout(chat_text_width(area.width));
         let max_scroll = content_height.saturating_sub(visible_height);
 
         let track_height = visible_height.saturating_sub(1).max(1) as f64;
@@ -222,7 +256,7 @@ mod tests {
         let mut app = test_app();
         // Fill the log with enough content so max_scroll > 0
         for i in 0..50 {
-            app.log.push(format!("line {i}"));
+            app.notice(format!("line {i}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
         let scrollbar_col = 80 - 2;
@@ -235,7 +269,7 @@ mod tests {
         let mut app = test_app();
         // Need content taller than viewport for Follow to kick in
         for i in 0..100 {
-            app.log.push(format!("line {i}"));
+            app.notice(format!("line {i}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
         let scrollbar_col = 80 - 2;
@@ -248,23 +282,30 @@ mod tests {
     #[test]
     fn scrolling_up_past_the_top_loads_older_lines_from_disk() {
         let mut app = test_app();
-        app.log = crate::tui::session::SessionLog::new(2);
+        app.transcript = crate::tui::transcript::Transcript::new(2);
         for index in 0..5 {
-            app.log.push(format!("line {index}"));
+            app.notice(format!("line {index}"));
         }
         app.chat_scroll_offset = 3;
 
         app.scroll_chat(-3);
 
         assert_eq!(app.chat_scroll_offset, 0);
-        assert!(app.log.text().starts_with("line 0"));
+        assert!(app.transcript.text().starts_with("line 0"));
+        assert!(app.transcript.has_newer());
+
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 3));
+        app.scroll_chat(5);
+
+        assert!(app.transcript.text().starts_with("line 3"));
+        assert!(!app.transcript.has_newer());
     }
 
     #[test]
     fn handle_scrollbar_click_with_offset_area() {
         let mut app = test_app();
         for i in 0..50 {
-            app.log.push(format!("line {i}"));
+            app.notice(format!("line {i}"));
         }
         // Area offset from (0,0) to (5,3)
         app.last_chat_area = Some(Rect::new(5, 3, 75, 17));

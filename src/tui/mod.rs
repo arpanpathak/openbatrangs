@@ -11,24 +11,30 @@
 //!
 //! Responsibilities are split into:
 //! - `app`: application state, editing, and event handling.
+//! - `transcript`: the transcript blocks, kept in a bounded window and drawn by viewport.
+//! - `block`: one transcript block: a user message, a step, an answer, a question, a notice.
+//! - `markdown`: Markdown to styled terminal rows.
+//! - `session`: the session file that holds blocks outside the window.
 //! - `commands`: slash-command handlers.
 //! - `text`: ANSI stripping, wrapping, path extraction, and editor launch.
 //! - `worker`: background agent/chat workers.
 //! - `ui`: ratatui rendering.
 
 mod app;
+mod block;
 mod chat;
 mod commands;
 mod input;
+mod markdown;
 mod scroll;
 mod session;
 mod text;
+mod transcript;
 mod ui;
 mod worker;
 
 pub(super) use text::{
-    chat_visual_line_indices, extract_path_from_line, open_in_vim, split_command,
-    text_wrapped_height, wrap_text_to_lines,
+    extract_path_from_line, open_in_vim, split_command, text_wrapped_height, wrap_text_to_lines,
 };
 pub(super) use worker::{
     UiEvent, WorkerHistory, run_agent_worker, run_pull_worker, run_setup_worker,
@@ -422,10 +428,7 @@ mod tests {
             viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
         };
 
-        Ok(Terminal::with_options(
-            CrosstermBackend::new(output),
-            options,
-        )?)
+        Terminal::with_options(CrosstermBackend::new(output), options).map_err(anyhow::Error::from)
     }
 
     /// An app with default settings.
@@ -553,7 +556,7 @@ mod tests {
             "the timer must tick while input waits"
         );
         assert!(!app.is_running, "the failed task must report back");
-        assert!(app.log.iter().any(|line| line.starts_with("⚠️")));
+        assert!(app.transcript.text().contains("⚠️"));
 
         Ok(())
     }
@@ -572,7 +575,7 @@ mod tests {
 
         assert_eq!(control, LoopControl::Continue);
         assert_eq!(after_close, LoopControl::Continue);
-        assert_eq!(app.log.text(), "first\nsecond\nthird");
+        assert_eq!(app.transcript.text(), "first\nsecond\nthird");
 
         Ok(())
     }
@@ -646,8 +649,11 @@ mod tests {
         let mut app = app::App::new(&cli, shared);
 
         tx.send(UiEvent::Log("🦇 Step 1/1".to_string())).unwrap();
-        tx.send(UiEvent::Chunk("HELLO from agent".to_string()))
-            .unwrap();
+        tx.send(UiEvent::Agent(crate::agent::AgentEvent::Text {
+            kind: crate::agent::TextKind::Answer,
+            text: "HELLO from agent".to_string(),
+        }))
+        .unwrap();
         tx.send(UiEvent::Done(Ok(()))).unwrap();
         while let Ok(event) = rx.try_recv() {
             app.handle_event(event, &client, &tx);

@@ -54,7 +54,9 @@ pub const HELP_LINES: &[&str] = &[
     "",
     "═══ Keys ═══",
     "  Enter = send · Shift+Enter / Ctrl+J = newline · Ctrl+C = cancel",
-    "  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete",
+    "  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete, or switch to the transcript",
+    "  In the transcript: ↑↓ = move · Enter / Space = fold or unfold · Tab / Esc = back",
+    "  Click a step, thinking line or tool line to fold or unfold it",
 ];
 
 /// Spinner frames shown while the agent is working.
@@ -68,9 +70,6 @@ pub const INPUT_BOX_PADDING: usize = 2;
 
 /// Minimum input box height (border + one line).
 pub const MIN_INPUT_BOX_HEIGHT: usize = 3;
-
-/// Cap for the streaming live line to avoid unbounded memory.
-pub const MAX_LIVE_CHARS: usize = 50_000;
 
 /// Maximum chat messages kept in memory for conversational context.
 pub const MAX_CHAT_HISTORY_MESSAGES: usize = 40;
@@ -119,15 +118,12 @@ pub const CHARS_PER_TOKEN: f64 = 4.0;
 /// Separator line length used before a user task in the TUI log.
 pub const CHAT_SEPARATOR_LENGTH: usize = 60;
 
-/// Maximum chat lines kept in memory before older lines spill to disk.
-pub const MAX_LOG_LINES: usize = 1_000;
+/// Maximum transcript blocks kept in memory before older blocks spill to disk.
+pub const MAX_TRANSCRIPT_BLOCKS: usize = 300;
 
-/// How many older lines to load from disk at a time when scrolling up.
-pub const LOG_LOAD_CHUNK: usize = 500;
-
-/// Chat logs larger than this switch to the raw renderer (no syntax
-/// highlighting) so generation stays responsive on low-power devices.
-pub const RAW_CHAT_RENDER_THRESHOLD: usize = 50_000;
+/// How many blocks to load from disk at a time when scrolling past the
+/// blocks in memory.
+pub const BLOCK_LOAD_CHUNK: usize = 50;
 
 /// Chat-mode system prompt: no tools, direct conversation and code.
 pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a coding assistant.

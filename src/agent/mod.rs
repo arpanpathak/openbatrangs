@@ -15,7 +15,8 @@
 //! native tool-calling loop in `native`.
 //!
 //! Responsibilities are split into focused submodules:
-//! - `reporter`: output abstraction for stdout and TUI.
+//! - `reporter`: structured agent events and the stdout reporter.
+//! - `summary`: short summaries of tool results.
 //! - `tool`: typed tool calls, argument parsing, and JSON response parsing.
 //! - `stream`: incremental JSON field streaming.
 //! - `execute`: tool execution, confirmation, and path formatting.
@@ -38,6 +39,7 @@ mod quality;
 mod reporter;
 mod research;
 mod stream;
+mod summary;
 mod tool;
 
 use crate::constants::agent::MIN_CONTEXT_TOKENS;
@@ -48,7 +50,8 @@ use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, max_output_tokens};
-pub use reporter::{Reporter, StdoutReporter};
+pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind};
+pub(crate) use tool::describe_call;
 
 /// Receives snapshots of the conversation as it grows.
 ///

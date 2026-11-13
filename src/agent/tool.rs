@@ -23,7 +23,7 @@
 use crate::constants::agent::{DEFAULT_GREP_MAX_RESULTS, DEFAULT_READ_CHARS};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// A raw tool call as deserialized from the model's JSON response.
 #[derive(Debug, Deserialize)]
@@ -99,6 +99,11 @@ pub(super) enum Tool {
         /// Short summary of what was done.
         summary: String,
     },
+    /// Stop and ask the user a question; their next message is the answer.
+    AskUser {
+        /// The question to show the user.
+        question: String,
+    },
 }
 
 impl Tool {
@@ -137,6 +142,7 @@ impl Tool {
             Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),
             Self::Finish { .. } => "finish".to_string(),
+            Self::AskUser { question } => format!("ask_user → {question}"),
         }
     }
 }
@@ -145,7 +151,7 @@ impl Tool {
 type ToolParser = fn(&Value) -> Result<Tool>;
 
 /// The parser for each tool name the model may call.
-const TOOL_PARSERS: [(&str, ToolParser); 9] = [
+const TOOL_PARSERS: [(&str, ToolParser); 10] = [
     ("list_files", list_files_tool),
     ("read_file", read_file_tool),
     ("grep_files", grep_files_tool),
@@ -155,6 +161,7 @@ const TOOL_PARSERS: [(&str, ToolParser); 9] = [
     ("edit_file", edit_file_tool),
     ("run_command", run_command_tool),
     ("finish", finish_tool),
+    ("ask_user", ask_user_tool),
 ];
 
 /// `list_files`: the directory defaults to the workspace root.
@@ -228,6 +235,24 @@ fn finish_tool(args: &Value) -> Result<Tool> {
     Ok(Tool::Finish {
         summary: string_arg(args, "summary")?.unwrap_or("done").to_string(),
     })
+}
+
+/// `ask_user`: a required question.
+fn ask_user_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::AskUser {
+        question: required_string_arg(args, "question", "ask_user")?.to_string(),
+    })
+}
+
+/// The one-line description of a call to tool `name` with JSON `arguments`;
+/// the bare name when the call does not parse.
+pub(crate) fn describe_call(name: &str, arguments: &str) -> String {
+    let call = ToolCall {
+        name: name.to_string(),
+        arguments: serde_json::from_str(arguments.trim()).unwrap_or_else(|_error| json!({})),
+    };
+
+    Tool::from_call(call).map_or_else(|_error| name.to_string(), |tool| tool.describe())
 }
 
 /// The two possible shapes of a model response: either a final `answer` or a
@@ -510,12 +535,26 @@ mod tests {
             ),
             ("run_command", json!({"command": "ls"}), "run_command → ls"),
             ("finish", json!({}), "finish"),
+            (
+                "ask_user",
+                json!({"question": "Which file?"}),
+                "ask_user → Which file?",
+            ),
         ];
 
         for (name, arguments, description) in calls {
             let described = tool(name, arguments).map(|parsed| parsed.describe());
             assert_eq!(described.ok().as_deref(), Some(description));
         }
+    }
+
+    #[test]
+    fn describe_call_names_a_call_that_does_not_parse() {
+        assert_eq!(
+            describe_call("read_file", r#"{"path":"a.rs"}"#),
+            "read_file → a.rs"
+        );
+        assert_eq!(describe_call("rm_rf", "not json"), "rm_rf");
     }
 
     #[test]

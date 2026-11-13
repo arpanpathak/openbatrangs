@@ -67,14 +67,14 @@ impl App {
     fn log_help(&mut self) {
         let lines = HELP_LINES.iter().map(|line| line.to_string()).collect();
 
-        self.log.push_lines(lines);
+        self.notice_lines(lines);
     }
 
     /// Print the current configuration and model status to the chat log.
     fn log_status(&mut self) {
         let lines = self.status_lines();
 
-        self.log.push_lines(lines);
+        self.notice_lines(lines);
     }
 
     /// The lines `/status` prints: mode, model, server, and every setting.
@@ -121,8 +121,7 @@ impl App {
     /// Open the picker on `models`, or point to `/setup` when there are none.
     fn open_model_picker(&mut self, models: Vec<String>) {
         if models.is_empty() {
-            self.log
-                .push("No models installed. Run /setup.".to_string());
+            self.notice("No models installed. Run /setup.".to_string());
             return;
         }
 
@@ -170,7 +169,7 @@ impl App {
         name: &str,
     ) {
         if !model_installed(tags, name) {
-            self.log.push(format!(
+            self.notice(format!(
                 "❌ Model '{name}' is not installed. Pull it first with /pull {name}."
             ));
             return;
@@ -182,10 +181,10 @@ impl App {
     /// Print the currently selected model name to the chat log.
     fn log_current_model(&mut self) {
         match &self.model {
-            Some(model) => self.log.push(format!("Current model: {model}")),
-            None => self
-                .log
-                .push("Auto mode — best model will be selected on first task.".to_string()),
+            Some(model) => self.notice(format!("Current model: {model}")),
+            None => {
+                self.notice("Auto mode — best model will be selected on first task.".to_string())
+            }
         }
     }
 
@@ -197,7 +196,7 @@ impl App {
     /// - `name`: the model tag to activate.
     pub(super) async fn activate_model(&mut self, client: &OllamaClient, name: &str) {
         self.model = Some(name.to_string());
-        self.log.push(format!("✅ Model set to {name}"));
+        self.notice(format!("✅ Model set to {name}"));
         self.refresh_model_info(client).await;
     }
 
@@ -217,7 +216,7 @@ impl App {
         let name = arg.trim();
 
         if name.is_empty() {
-            self.log.push("Usage: /pull <model-tag>".to_string());
+            self.notice("Usage: /pull <model-tag>".to_string());
             return;
         }
 
@@ -232,13 +231,11 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         if self.is_running {
-            self.log
-                .push("⚠️  Busy — finish the current task before pulling a model.".to_string());
+            self.notice("⚠️  Busy — finish the current task before pulling a model.".to_string());
             return;
         }
 
-        self.log
-            .push(format!("⬇️  Pulling model '{name}' in background..."));
+        self.notice(format!("⬇️  Pulling model '{name}' in background..."));
         self.start_pull(client, name, tx);
     }
 
@@ -272,7 +269,7 @@ impl App {
         self.run_config.is_read_only = !self.run_config.is_read_only;
 
         let state = on_off(self.run_config.is_read_only);
-        self.log.push(format!("Read-only mode: {state}"));
+        self.notice(format!("Read-only mode: {state}"));
     }
 
     /// Toggle confirmation prompts on/off for writes and shell commands.
@@ -280,7 +277,7 @@ impl App {
         self.run_config.should_confirm = !self.run_config.should_confirm;
 
         let state = on_off(self.run_config.should_confirm);
-        self.log.push(format!("Confirm mode: {state}"));
+        self.notice(format!("Confirm mode: {state}"));
     }
 
     /// Switch the agent mode: agent (full tools), plan (read-only), or chat (no tools).
@@ -290,12 +287,12 @@ impl App {
     /// - `arg`: one of "agent", "plan", or "chat".
     fn handle_mode_command(&mut self, arg: &str) {
         let Some(mode) = parse_mode(arg) else {
-            self.log.push("Usage: /mode agent|plan|chat".to_string());
+            self.notice("Usage: /mode agent|plan|chat".to_string());
             return;
         };
 
         self.run_config.mode = mode;
-        self.log.push(mode_switch_message(mode).to_string());
+        self.notice(mode_switch_message(mode).to_string());
     }
 
     /// Toggle or display the model reasoning/thinking display.
@@ -306,15 +303,14 @@ impl App {
     fn handle_thinking_command(&mut self, arg: &str) {
         let Some(show_thinking) = parse_on_off(arg) else {
             let state = on_off(self.run_config.show_thinking);
-            self.log.push(format!(
+            self.notice(format!(
                 "Thinking display: {state} · Usage: /thinking on|off"
             ));
             return;
         };
 
         self.run_config.show_thinking = show_thinking;
-        self.log
-            .push(format!("Thinking display: {}", on_off(show_thinking)));
+        self.notice(format!("Thinking display: {}", on_off(show_thinking)));
     }
 
     /// Toggle mouse capture: on for wheel/scrollbar, off for native select/copy.
@@ -325,19 +321,18 @@ impl App {
     fn handle_mouse_command(&mut self, arg: &str) {
         let Some(mouse_capture) = parse_on_off(arg) else {
             let state = on_off(self.mouse_capture);
-            self.log
-                .push(format!("Mouse mode: {state} · Usage: /mouse on|off"));
+            self.notice(format!("Mouse mode: {state} · Usage: /mouse on|off"));
             return;
         };
 
         self.mouse_capture = mouse_capture;
-        self.log.push(mouse_mode_message(mouse_capture).to_string());
+        self.notice(mouse_mode_message(mouse_capture).to_string());
     }
 
     /// Disable confirmation prompts ("YOLO mode") for writes and commands.
     fn handle_yolo_command(&mut self) {
         self.run_config.should_confirm = false;
-        self.log.push(
+        self.notice(
             "⚠️  YOLO mode ON — agent writes/commands run without confirmation. Be careful!"
                 .to_string(),
         );
@@ -350,12 +345,12 @@ impl App {
     /// - `arg`: positive integer string, or empty/invalid to show usage.
     fn handle_steps_command(&mut self, arg: &str) {
         let Some(steps) = positive_number(arg) else {
-            self.log.push("Usage: /steps <positive number>".to_string());
+            self.notice("Usage: /steps <positive number>".to_string());
             return;
         };
 
         self.run_config.max_steps = steps;
-        self.log.push(format!("Max steps set to {steps}"));
+        self.notice(format!("Max steps set to {steps}"));
     }
 
     /// Show or change the agent's working directory.
@@ -365,13 +360,12 @@ impl App {
     /// - `arg`: new directory path, or empty to show the current workspace.
     fn handle_cwd_command(&mut self, arg: &str) {
         if arg.is_empty() {
-            self.log
-                .push(format!("Workspace: {}", self.run_config.cwd.display()));
+            self.notice(format!("Workspace: {}", self.run_config.cwd.display()));
             return;
         }
 
         self.run_config.cwd = PathBuf::from(arg);
-        self.log.push(format!(
+        self.notice(format!(
             "Workspace set to {}",
             self.run_config.cwd.display()
         ));
@@ -385,7 +379,7 @@ impl App {
     async fn handle_doctor_command(&mut self, client: &OllamaClient) -> anyhow::Result<()> {
         let lines = crate::commands::doctor_lines(client, self.min_context).await?;
 
-        self.log.push_lines(lines);
+        self.notice_lines(lines);
 
         Ok(())
     }
@@ -398,13 +392,11 @@ impl App {
     /// - `tx`: channel for progress events.
     fn handle_setup_command(&mut self, client: &OllamaClient, tx: &mpsc::UnboundedSender<UiEvent>) {
         if self.is_running {
-            self.log
-                .push("⚠️  Busy — finish the current task before running setup.".to_string());
+            self.notice("⚠️  Busy — finish the current task before running setup.".to_string());
             return;
         }
 
-        self.log
-            .push("🔄 Running setup in background...".to_string());
+        self.notice("🔄 Running setup in background...".to_string());
         self.is_running = true;
         self.status = "running setup".to_string();
         self.last_action = "setup".to_string();
@@ -415,10 +407,11 @@ impl App {
         self.current_task = Some(handle);
     }
 
-    /// Clear the chat log, live output, prompt, and conversation history.
+    /// Clear the transcript, the streamed reply, the prompt, and the
+    /// conversation history.
     pub(super) fn clear_chat(&mut self) {
-        self.log.clear();
-        self.live.clear();
+        self.transcript.clear();
+        self.reply.clear();
         self.current_prompt = None;
         self.interrupted_task = None;
         self.agent_conversation = None;
@@ -432,8 +425,7 @@ impl App {
     fn toggle_perf(&mut self) {
         self.show_perf = !self.show_perf;
 
-        self.log
-            .push(format!("Perf panel: {}", on_off(self.show_perf)));
+        self.notice(format!("Perf panel: {}", on_off(self.show_perf)));
     }
 
     /// Log a "command not found" message with a hint to use `/help`.
@@ -442,8 +434,7 @@ impl App {
     ///
     /// - `name`: the unrecognized command name.
     fn log_unknown_command(&mut self, name: &str) {
-        self.log
-            .push(format!("Unknown command: /{name}. Try /help"));
+        self.notice(format!("Unknown command: /{name}. Try /help"));
     }
 }
 
@@ -551,7 +542,7 @@ mod tests {
         let client = OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         app.handle_pull_command(&client, "", &tx);
-        assert!(app.log.iter().any(|line| line.contains("Usage: /pull")));
+        assert!(app.transcript.text().contains("Usage: /pull"));
         assert!(!app.is_running);
         assert!(app.current_task.is_none());
     }
@@ -560,9 +551,9 @@ mod tests {
     fn log_help_pushes_command_list() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.log_help();
-        let text = app.log.text();
+        let text = app.transcript.text();
         assert!(text.contains("Commands"));
         assert!(text.contains("/help"));
         assert!(text.contains("/exit"));
@@ -574,9 +565,9 @@ mod tests {
     fn log_status_shows_current_settings() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.log_status();
-        let text = app.log.text();
+        let text = app.transcript.text();
         assert!(text.contains("Status"));
         assert!(text.contains("Mode:"));
         assert!(text.contains("Model:"));
@@ -590,7 +581,7 @@ mod tests {
         let initial = app.run_config.is_read_only;
         app.toggle_read_only();
         assert_eq!(app.run_config.is_read_only, !initial);
-        assert!(app.log.text().contains("Read-only mode:"));
+        assert!(app.transcript.text().contains("Read-only mode:"));
         app.toggle_read_only();
         assert_eq!(app.run_config.is_read_only, initial);
     }
@@ -602,123 +593,135 @@ mod tests {
         let initial = app.run_config.should_confirm;
         app.toggle_confirm();
         assert_eq!(app.run_config.should_confirm, !initial);
-        assert!(app.log.text().contains("Confirm mode:"));
+        assert!(app.transcript.text().contains("Confirm mode:"));
     }
 
     #[test]
     fn handle_mode_command_sets_agent() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mode_command("agent");
         assert_eq!(app.run_config.mode, AgentMode::Agent);
-        assert!(app.log.text().contains("agent (full tools enabled)"));
+        assert!(app.transcript.text().contains("agent (full tools enabled)"));
     }
 
     #[test]
     fn handle_mode_command_sets_plan() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mode_command("plan");
         assert_eq!(app.run_config.mode, AgentMode::Plan);
-        assert!(app.log.text().contains("plan (read-only"));
+        assert!(app.transcript.text().contains("plan (read-only"));
     }
 
     #[test]
     fn handle_mode_command_sets_chat() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mode_command("chat");
         assert_eq!(app.run_config.mode, AgentMode::Chat);
-        assert!(app.log.text().contains("chat (no tools"));
+        assert!(app.transcript.text().contains("chat (no tools"));
     }
 
     #[test]
     fn handle_mode_command_invalid_shows_usage() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mode_command("invalid");
-        assert!(app.log.text().contains("Usage: /mode agent|plan|chat"));
+        assert!(
+            app.transcript
+                .text()
+                .contains("Usage: /mode agent|plan|chat")
+        );
     }
 
     #[test]
     fn handle_steps_command_sets_valid_steps() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_steps_command("25");
         assert_eq!(app.run_config.max_steps, 25);
-        assert!(app.log.text().contains("Max steps set to 25"));
+        assert!(app.transcript.text().contains("Max steps set to 25"));
     }
 
     #[test]
     fn handle_steps_command_rejects_zero() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_steps_command("0");
-        assert!(app.log.text().contains("Usage: /steps <positive number>"));
+        assert!(
+            app.transcript
+                .text()
+                .contains("Usage: /steps <positive number>")
+        );
     }
 
     #[test]
     fn handle_steps_command_rejects_non_numeric() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_steps_command("abc");
-        assert!(app.log.text().contains("Usage: /steps <positive number>"));
+        assert!(
+            app.transcript
+                .text()
+                .contains("Usage: /steps <positive number>")
+        );
     }
 
     #[test]
     fn handle_thinking_command_on() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_thinking_command("on");
         assert!(app.run_config.show_thinking);
-        assert!(app.log.text().contains("Thinking display: ON"));
+        assert!(app.transcript.text().contains("Thinking display: ON"));
     }
 
     #[test]
     fn handle_thinking_command_off() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_thinking_command("off");
         assert!(!app.run_config.show_thinking);
-        assert!(app.log.text().contains("Thinking display: OFF"));
+        assert!(app.transcript.text().contains("Thinking display: OFF"));
     }
 
     #[test]
     fn handle_thinking_command_invalid_shows_current_state() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_thinking_command("maybe");
-        assert!(app.log.text().contains("Usage: /thinking on|off"));
+        assert!(app.transcript.text().contains("Usage: /thinking on|off"));
     }
 
     #[test]
     fn handle_mouse_command_on() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mouse_command("on");
         assert!(app.mouse_capture);
-        assert!(app.log.text().contains("Mouse mode: ON"));
+        assert!(app.transcript.text().contains("Mouse mode: ON"));
     }
 
     #[test]
     fn handle_mouse_command_off() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_mouse_command("off");
         assert!(!app.mouse_capture);
-        assert!(app.log.text().contains("Mouse mode: OFF"));
+        assert!(app.transcript.text().contains("Mouse mode: OFF"));
     }
 
     #[test]
@@ -726,20 +729,20 @@ mod tests {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         app.run_config.should_confirm = true;
-        app.log.clear();
+        app.transcript.clear();
         app.handle_yolo_command();
         assert!(!app.run_config.should_confirm);
-        assert!(app.log.text().contains("YOLO mode ON"));
+        assert!(app.transcript.text().contains("YOLO mode ON"));
     }
 
     #[test]
     fn log_unknown_command_shows_message() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.log_unknown_command("foobar");
-        assert!(app.log.text().contains("Unknown command: /foobar"));
-        assert!(app.log.text().contains("/help"));
+        assert!(app.transcript.text().contains("Unknown command: /foobar"));
+        assert!(app.transcript.text().contains("/help"));
     }
 
     #[test]
@@ -747,10 +750,10 @@ mod tests {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         let original_cwd = app.run_config.cwd.clone();
-        app.log.clear();
+        app.transcript.clear();
         app.handle_cwd_command("");
         assert!(
-            app.log
+            app.transcript
                 .text()
                 .contains(&format!("Workspace: {}", original_cwd.display()))
         );
@@ -760,14 +763,14 @@ mod tests {
     fn handle_cwd_command_with_path_changes_workspace() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.log.clear();
+        app.transcript.clear();
         app.handle_cwd_command("/tmp/new_workspace");
         assert_eq!(
             app.run_config.cwd,
             std::path::PathBuf::from("/tmp/new_workspace")
         );
         assert!(
-            app.log
+            app.transcript
                 .text()
                 .contains("Workspace set to /tmp/new_workspace")
         );
@@ -777,11 +780,11 @@ mod tests {
     fn clear_chat_resets_all_state() {
         let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
-        app.live = "streaming text".to_string();
+        app.reply = "streaming text".to_string();
         app.chat_scroll_offset = 42;
         app.scroll_mode = ScrollMode::Manual;
         app.clear_chat();
-        assert_eq!(app.live, "");
+        assert_eq!(app.reply, "");
         assert_eq!(app.chat_scroll_offset, 0);
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
     }
@@ -836,7 +839,7 @@ mod tests {
 
         let results = run_commands(&mut app, &client, &commands, &tx).await;
 
-        let text = app.log.text();
+        let text = app.transcript.text();
         assert!(results.iter().all(Result::is_ok));
         assert!(text.contains("Auto mode"));
         assert!(text.contains("Current model: qwen2.5-coder:7b"));
@@ -901,7 +904,7 @@ mod tests {
         app.run_slash_command(&client, "/models", &tx).await?;
 
         assert!(!app.is_showing_picker());
-        assert!(app.log.text().contains("No models installed"));
+        assert!(app.transcript.text().contains("No models installed"));
 
         Ok(())
     }
@@ -923,12 +926,12 @@ mod tests {
         app.run_slash_command(&client, "/setup", &tx).await?;
 
         assert!(
-            app.log
+            app.transcript
                 .text()
                 .contains("Busy — finish the current task before pulling")
         );
         assert!(
-            app.log
+            app.transcript
                 .text()
                 .contains("Busy — finish the current task before running setup")
         );
@@ -947,11 +950,11 @@ mod tests {
         let client = OllamaClient::new("http://127.0.0.1:1")?;
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
-        app.log.push("old line".to_string());
+        app.notice("old line".to_string());
 
         app.run_slash_command(&client, "/clear", &tx).await?;
 
-        assert!(app.log.is_empty());
+        assert!(app.transcript.is_empty());
 
         Ok(())
     }
@@ -963,7 +966,11 @@ mod tests {
         app.handle_mode_command("plan");
         app.handle_mode_command("agent");
 
-        assert!(app.log.text().contains("Mode: agent (full tools enabled)"));
+        assert!(
+            app.transcript
+                .text()
+                .contains("Mode: agent (full tools enabled)")
+        );
     }
 
     #[test]
@@ -973,6 +980,6 @@ mod tests {
         let initial = app.show_perf;
         app.toggle_perf();
         assert_eq!(app.show_perf, !initial);
-        assert!(app.log.text().contains("Perf panel:"));
+        assert!(app.transcript.text().contains("Perf panel:"));
     }
 }

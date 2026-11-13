@@ -159,12 +159,12 @@ async fn search_results<R: Reporter>(
     query: &str,
     reporter: &mut R,
 ) -> String {
-    reporter.line(format!("\n🔎 web_search → {query}"));
+    reporter.notice(format!("\n🔎 web_search → {query}"));
 
     match tools::web_search(searxng_url, search_key, query).await {
         Ok(results) => results,
         Err(error) => {
-            reporter.line(format!("⚠️ Documentation search failed: {error:#}"));
+            reporter.notice(format!("⚠️ Documentation search failed: {error:#}"));
             String::new()
         }
     }
@@ -195,7 +195,7 @@ fn report_missing_page<R: Reporter>(urls: &[String], reporter: &mut R) {
         return;
     }
 
-    reporter.line("⚠️ Search returned no approved official documentation URL.".to_string());
+    reporter.notice("⚠️ Search returned no approved official documentation URL.".to_string());
 }
 
 /// Read every page in `urls`, keeping each page's error instead of stopping.
@@ -203,7 +203,7 @@ async fn read_pages<R: Reporter>(urls: &[String], reporter: &mut R) -> Vec<PageR
     let mut pages = Vec::new();
 
     for url in urls {
-        reporter.line(format!("📄 web_read → {url}"));
+        reporter.notice(format!("📄 web_read → {url}"));
         let text = tools::web_read(url).await;
         pages.push(PageRead {
             url: url.clone(),

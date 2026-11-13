@@ -1,9 +1,8 @@
 //! Background agent/chat workers for the TUI.
 
-use super::text::strip_ansi;
 use crate::agent::{
-    AgentConfig, Confirmer, HistorySink, Reporter, RunContinuation, compact_context,
-    effective_context, max_output_tokens, run_agent,
+    AgentConfig, AgentEvent, Confirmer, HistorySink, Reporter, RunContinuation, TextKind,
+    compact_context, effective_context, max_output_tokens, run_agent,
 };
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE};
@@ -19,10 +18,10 @@ use tokio::sync::oneshot;
 
 /// Messages sent from background workers to the TUI event loop.
 pub(crate) enum UiEvent {
-    /// A complete log line to append to the chat (e.g. tool output, status).
+    /// A status line to show in the transcript (model selection, pulls).
     Log(String),
-    /// A streaming text chunk to append to the live output area.
-    Chunk(String),
+    /// An event from the agent loop, or reply text in chat mode.
+    Agent(AgentEvent),
     /// The agent task finished, either successfully or with an error message.
     Done(Result<(), String>),
     /// A snapshot of the agent conversation, kept so an interrupted run can
@@ -94,21 +93,16 @@ impl Confirmer for ChannelConfirmer {
     }
 }
 
-/// Bridges agent output (lines and chunks) to the TUI event channel.
+/// Forwards agent events to the TUI event channel.
 struct ChannelReporter {
-    /// Channel for forwarding agent output to the TUI event loop.
+    /// Channel for forwarding agent events to the TUI event loop.
     tx: mpsc::UnboundedSender<UiEvent>,
 }
 
 impl Reporter for ChannelReporter {
-    /// Send one complete line, without terminal escape codes.
-    fn line(&mut self, msg: String) {
-        send_event(&self.tx, UiEvent::Log(strip_ansi(&msg)));
-    }
-
-    /// Send one streamed chunk, without terminal escape codes.
-    fn chunk(&mut self, msg: &str) {
-        send_event(&self.tx, UiEvent::Chunk(strip_ansi(msg)));
+    /// Send `event` to the TUI.
+    fn report(&mut self, event: AgentEvent) {
+        send_event(&self.tx, UiEvent::Agent(event));
     }
 }
 
@@ -322,13 +316,21 @@ async fn forward_chat_stream(
         .await
 }
 
-/// Send reply text as a chunk, and note the first reasoning delta once.
+/// Send reply text as answer text, and note the first reasoning delta once.
 /// Chat mode has no tools, so tool-call deltas are dropped.
 fn forward_delta(delta: Delta, has_noted_thinking: &mut bool, tx: &mpsc::UnboundedSender<UiEvent>) {
     match delta {
-        Delta::Content(chunk) => send_event(tx, UiEvent::Chunk(chunk)),
+        Delta::Content(text) => send_event(tx, UiEvent::Agent(answer_text(text))),
         Delta::Thinking(_reasoning) => note_thinking(has_noted_thinking, tx),
         Delta::ToolCalls(_calls) => {}
+    }
+}
+
+/// An answer-text event carrying `text`.
+fn answer_text(text: String) -> AgentEvent {
+    AgentEvent::Text {
+        kind: TextKind::Answer,
+        text,
     }
 }
 
@@ -409,15 +411,18 @@ mod tests {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
-    /// The log lines and streamed chunks among `events`, in order.
+    /// The log lines and streamed answer text among `events`, in order.
     fn texts(events: &[UiEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                UiEvent::Log(line) | UiEvent::Chunk(line) => Some(line.clone()),
-                _other => None,
-            })
-            .collect()
+        events.iter().filter_map(event_text).collect()
+    }
+
+    /// The text of a log line or of streamed answer text.
+    fn event_text(event: &UiEvent) -> Option<String> {
+        match event {
+            UiEvent::Log(line) => Some(line.clone()),
+            UiEvent::Agent(AgentEvent::Text { text, .. }) => Some(text.clone()),
+            _other => None,
+        }
     }
 
     /// The base URL of a mock Ollama server with model `coder:1b` that
@@ -502,13 +507,16 @@ mod tests {
         let mut reporter = ChannelReporter { tx: tx.clone() };
         let mut history = ChannelHistorySink { tx };
 
-        reporter.line("\x1b[31mred\x1b[0m".to_string());
-        reporter.chunk("\x1b[1mbold\x1b[0m");
+        reporter.notice("a notice".to_string());
+        reporter.report(answer_text("bold".to_string()));
         history.save(vec![serde_json::json!({"role": "user"})]);
 
         let events = sent_events(&mut rx);
 
-        assert_eq!(texts(&events), ["red", "bold"]);
+        assert!(
+            matches!(&events[0], UiEvent::Agent(AgentEvent::Notice(text)) if text == "a notice")
+        );
+        assert_eq!(texts(&events), ["bold"]);
         assert!(matches!(events.last(), Some(UiEvent::History(_))));
     }
 

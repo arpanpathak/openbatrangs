@@ -4,9 +4,9 @@
 //! of the event loop makes the TUI testable with ratatui's `TestBackend` and
 //! keeps the state transitions in `App` free of layout concerns.
 //!
-//! Large chat logs are rendered with a raw paragraph (no syntect pass) so
-//! streaming stays responsive on Jetson-class devices; smaller logs keep code
-//! syntax highlighting.
+//! The transcript pane draws only the rows on screen: the transcript finds
+//! the blocks that intersect the view and draws those, so syntax
+//! highlighting stays on however long the session grows.
 //!
 //! ## References
 //!
@@ -14,14 +14,15 @@
 //! - Ratatui `Paragraph`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 //! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
-use super::app::App;
+use super::app::{App, FocusArea};
+use super::scroll::{chat_text_width, chat_visible_height};
 use super::{ScrollMode, text_wrapped_height, wrap_text_to_lines};
 use crate::banner;
 use crate::cli::{AgentMode, AgentRunConfig};
 use crate::constants::tui::{
     HEADER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
     MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, RAW_CHAT_RENDER_THRESHOLD, WELCOME_HINTS,
+    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, WELCOME_HINTS,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -159,12 +160,12 @@ fn header_prompt_line(prompt: &str, inner_width: usize) -> Line<'static> {
     ))
 }
 
-/// Shared frame for the transcript pane.
-fn transcript_block() -> Block<'static> {
+/// Shared frame for the transcript pane; cyan while it has the keys.
+fn transcript_block(focus_area: FocusArea) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(pane_border_color(focus_area, FocusArea::Transcript)))
         .title(Span::styled(
             " transcript ",
             Style::default()
@@ -175,8 +176,8 @@ fn transcript_block() -> Block<'static> {
 
 /// Draw the welcome banner while the transcript is empty, and the chat after that.
 fn render_transcript(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    if app.transcript_is_empty() {
-        return render_welcome(frame, area);
+    if app.transcript.is_empty() {
+        return render_welcome(frame, app.focus_area, area);
     }
 
     render_chat_area(frame, app, area);
@@ -184,7 +185,7 @@ fn render_transcript(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 /// Draw the batarang banner and the starting hints in the middle of the empty
 /// transcript pane.
-fn render_welcome(frame: &mut ratatui::Frame, area: Rect) {
+fn render_welcome(frame: &mut ratatui::Frame, focus_area: FocusArea, area: Rect) {
     let hint_style = Style::default().fg(Color::DarkGray);
     let mut lines = banner::banner_lines();
     lines.push(Line::default());
@@ -197,9 +198,9 @@ fn render_welcome(frame: &mut ratatui::Frame, area: Rect) {
     let widest = lines.iter().map(Line::width).max().unwrap_or(0);
     let width = widest.min(u16::MAX as usize) as u16;
     let height = lines.len().min(u16::MAX as usize) as u16;
-    let inner = transcript_block().inner(area);
+    let inner = transcript_block(focus_area).inner(area);
 
-    frame.render_widget(transcript_block(), area);
+    frame.render_widget(transcript_block(focus_area), area);
     frame.render_widget(Paragraph::new(lines), middle_rect(inner, width, height));
 }
 
@@ -216,23 +217,27 @@ fn middle_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Render the chat scrollback area with optional syntax highlighting and scrollbar.
+/// Draw the rows of the transcript that are on screen, and the scrollbar.
 fn render_chat_area(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let chat_text = app.chat_text();
     app.last_chat_area = Some(area);
+    app.sync_transcript_scroll();
 
-    let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let width = chat_text_width(area.width);
+    let visible_height = chat_visible_height(area);
+    let content_height = app.transcript.layout(width);
 
     follow_when_at_bottom(app, content_height.saturating_sub(visible_height));
 
     let scroll_y = chat_scroll(app, area, content_height);
-    let chat = chat_paragraph(app, chat_text)
-        .block(transcript_block())
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y.min(u16::MAX as usize) as u16, 0));
+    let show_focus = app.focus_area == FocusArea::Transcript;
+    let lines = app
+        .transcript
+        .visible_lines(width, scroll_y, visible_height, show_focus);
 
-    frame.render_widget(chat, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(transcript_block(app.focus_area)),
+        area,
+    );
     render_chat_scrollbar(frame, area, content_height, scroll_y);
 }
 
@@ -242,19 +247,6 @@ fn follow_when_at_bottom(app: &mut App, max_scroll: usize) {
     if app.chat_scroll_offset >= max_scroll {
         app.scroll_mode = ScrollMode::Follow;
     }
-}
-
-/// The chat text as a paragraph, syntax-highlighted unless the log is huge.
-///
-/// Huge logs skip the syntect code-highlighting path entirely. Building
-/// styled `Vec<Line>`s for every streaming token is what made generation
-/// freeze on low-power devices once the chat grew long.
-fn chat_paragraph(app: &mut App, chat_text: String) -> Paragraph<'static> {
-    if chat_text.len() > RAW_CHAT_RENDER_THRESHOLD {
-        return Paragraph::new(chat_text);
-    }
-
-    Paragraph::new(app.chat_render.lines(&chat_text).to_vec())
 }
 
 /// Draw the scrollbar on the right border when the chat is taller than the pane.
@@ -296,26 +288,10 @@ fn needs_scrollbar(max_scroll: usize, area_width: u16) -> bool {
     max_scroll > 0 && area_width >= 3
 }
 
-/// Inner width of the chat area in character cells (excluding borders).
-fn chat_inner_width(area_width: u16) -> usize {
-    (area_width as usize).saturating_sub(2).max(1)
-}
-
-/// Compute a safe vertical scroll offset as `usize`.
-///
-/// Content can be much taller than `u16::MAX` after long streamed output wraps
-/// into hundreds of thousands of visual rows. Keeping the math in `usize`
-/// prevents the previous `as u16` truncation that made scrolling stop/glitch
-/// once the chat grew past 65,535 rows. Ratatui only accepts `u16` offsets, so
-/// callers cap the final value before passing it to `Paragraph::scroll`.
+/// The first row on screen: the bottom while following, else the user's
+/// offset, never past the bottom.
 fn chat_scroll(app: &App, area: Rect, content_height: usize) -> usize {
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let max_scroll = content_height.saturating_sub(visible_height);
-
-    match app.scroll_mode {
-        ScrollMode::Follow => max_scroll,
-        ScrollMode::Manual => app.chat_scroll_offset.min(max_scroll),
-    }
+    app.chat_scroll_for(area, content_height)
 }
 
 /// Render the status bar showing the current state, mode, and key hints.
@@ -370,11 +346,28 @@ fn queued_status(app: &App) -> String {
 /// Status while idle with nothing queued.
 fn idle_status(app: &App) -> String {
     format!(
-        "{}{}{} · PgUp/PgDn scroll",
+        "{}{}{} · {}",
         app.status,
         mode_suffix(app.run_config.mode),
-        safety_suffix(&app.run_config)
+        safety_suffix(&app.run_config),
+        key_hint(app.focus_area)
     )
+}
+
+/// The keys that work in the focused pane.
+fn key_hint(focus_area: FocusArea) -> &'static str {
+    match focus_area {
+        FocusArea::Input => "PgUp/PgDn scroll",
+        FocusArea::Transcript => "↑↓ move · Enter fold · Tab back",
+    }
+}
+
+/// Cyan for the pane that has the keys, gray for the other.
+fn pane_border_color(focus_area: FocusArea, pane: FocusArea) -> Color {
+    match focus_area == pane {
+        true => Color::Cyan,
+        false => Color::DarkGray,
+    }
 }
 
 /// The mode shown after the status; agent mode is the default and shows nothing.
@@ -493,7 +486,9 @@ fn render_input_box(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(
+                    Style::default().fg(pane_border_color(app.focus_area, FocusArea::Input)),
+                )
                 .title(Span::styled(
                     " › ",
                     Style::default()
@@ -683,6 +678,7 @@ fn input_height(app: &App, width: u16, area_height: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentEvent;
     use crate::cli::Cli;
     use clap::Parser;
     use ratatui::Terminal;
@@ -726,20 +722,9 @@ mod tests {
 
     #[test]
     fn chat_scroll_handles_content_taller_than_u16_max() {
-        let cli = Cli::parse_from(["openbatrangs"]);
-        let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
-        // One wrapped line with more visual rows than u16::MAX. Before the fix,
-        // the `as u16` truncation made the scroll offset wrap to a tiny value.
-        app.live = "x".repeat(70_000 * 80);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 20,
-        };
-        let chat_text = app.chat_text();
-        let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
+        let mut app = test_app();
+        let area = Rect::new(0, 0, 80, 20);
+        let content_height = 70_000 * 80;
 
         app.scroll_mode = ScrollMode::Follow;
         let bottom = chat_scroll(&app, area, content_height);
@@ -751,26 +736,6 @@ mod tests {
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 10_000;
         assert_eq!(chat_scroll(&app, area, content_height), 10_000);
-    }
-
-    #[test]
-    fn scroll_offset_cap_never_wraps_for_ratatui() {
-        let cli = Cli::parse_from(["openbatrangs"]);
-        let shared = Arc::new(Mutex::new(None));
-        let mut app = App::new(&cli, shared);
-        app.live = "x".repeat(70_000 * 80);
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 20,
-        };
-        let chat_text = app.chat_text();
-        let content_height = text_wrapped_height(&chat_text, chat_inner_width(area.width));
-        app.scroll_mode = ScrollMode::Follow;
-        let scroll_y = chat_scroll(&app, area, content_height);
-        let ratatui_scroll = scroll_y.min(u16::MAX as usize) as u16;
-        assert_eq!(ratatui_scroll, u16::MAX);
     }
 
     /// An app with default settings.
@@ -801,7 +766,7 @@ mod tests {
     fn the_header_shows_the_task_prompt() -> anyhow::Result<()> {
         let mut app = test_app();
         app.current_prompt = Some("write a softmax kernel in CUDA Oxide please".to_string());
-        app.log.push("You: write a softmax kernel".to_string());
+        app.notice("You: write a softmax kernel".to_string());
 
         let screen = draw(&mut app, 40, 24)?;
 
@@ -830,8 +795,7 @@ mod tests {
     #[test]
     fn a_long_chat_gets_a_scrollbar_and_follows_at_the_bottom() -> anyhow::Result<()> {
         let mut app = test_app();
-        app.log
-            .push_lines((0..100).map(|index| format!("line {index}")).collect());
+        app.notice_lines((0..100).map(|index| format!("line {index}")).collect());
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 1_000;
 
@@ -845,15 +809,55 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_chat_is_drawn_without_highlighting() -> anyhow::Result<()> {
+    fn code_on_screen_is_highlighted_however_long_the_session() -> anyhow::Result<()> {
         let mut app = test_app();
-        app.log.push("x".repeat(RAW_CHAT_RENDER_THRESHOLD));
-        app.live = "tail of the reply".to_string();
+        app.notice("x".repeat(200_000));
+        app.transcript.apply(AgentEvent::Finished {
+            answer: "```rust\nfn main() {}\n```".to_string(),
+            answer_was_streamed: false,
+            changed_files: Vec::new(),
+        });
         app.scroll_mode = ScrollMode::Follow;
 
-        let screen = draw(&mut app, 60, 30)?;
+        let mut terminal = Terminal::new(TestBackend::new(60, 30))?;
+        terminal.draw(|frame| super::ui(frame, &mut app))?;
 
-        assert!(screen.contains("tail of the reply"));
+        let is_highlighted = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| matches!(cell.fg, Color::Rgb(..)));
+        assert!(is_highlighted);
+        assert_eq!(app.transcript.rendered_blocks(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_focused_pane_and_part_are_highlighted() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.notice("first".to_string());
+        app.notice("second".to_string());
+        app.focus_area = FocusArea::Transcript;
+        app.transcript.move_focus(0);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 24))?;
+        terminal.draw(|frame| super::ui(frame, &mut app))?;
+
+        let focused_rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.bg == Color::DarkGray)
+            .count();
+        assert!(focused_rows > 0);
+        assert!(status_text(&app).ends_with("↑↓ move · Enter fold · Tab back"));
+
+        app.transcript.clear();
+        let screen = draw(&mut app, 40, 24)?;
+        assert!(screen.contains("transcript"));
 
         Ok(())
     }

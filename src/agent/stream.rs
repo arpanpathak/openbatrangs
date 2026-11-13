@@ -23,8 +23,7 @@
 //! - JSON data model and string escapes, RFC 8259: <https://datatracker.ietf.org/doc/html/rfc8259#section-8.2>
 //! - Ollama `/api/chat` streaming API: <https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion>
 
-use super::reporter::Reporter;
-use crate::constants::ansi::{ANSI_GREEN_CHECK, COLOR_CYAN, COLOR_DIM, COLOR_RESET};
+use super::reporter::{AgentEvent, Reporter, TextKind};
 use crate::ollama::{ChatRequest, Delta, OllamaClient};
 use anyhow::Result;
 use futures_util::{Stream, TryStreamExt};
@@ -92,8 +91,8 @@ impl ResponsePrinter {
     fn new(show_thinking: bool) -> Self {
         Self {
             buffer: String::new(),
-            thought: StreamState::new("thought", show_thinking),
-            answer: StreamState::new("answer", true),
+            thought: StreamState::new("thought", TextKind::Thought, show_thinking),
+            answer: StreamState::new("answer", TextKind::Answer, true),
             show_thinking,
             is_reasoning: false,
         }
@@ -114,18 +113,11 @@ impl ResponsePrinter {
             return;
         }
 
-        self.start_reasoning(reporter);
-        reporter.chunk(text);
-    }
-
-    /// Print the reasoning prefix before the first reasoning text.
-    fn start_reasoning<R: Reporter>(&mut self, reporter: &mut R) {
-        if self.is_reasoning {
-            return;
-        }
-
-        reporter.chunk(&format!("💭 {COLOR_DIM}"));
         self.is_reasoning = true;
+        reporter.report(AgentEvent::Text {
+            kind: TextKind::Reasoning,
+            text: text.to_string(),
+        });
     }
 
     /// End the reasoning block, if one is open.
@@ -134,8 +126,7 @@ impl ResponsePrinter {
             return;
         }
 
-        reporter.chunk(COLOR_RESET);
-        reporter.line(String::new());
+        reporter.report(AgentEvent::TextEnded(TextKind::Reasoning));
         self.is_reasoning = false;
     }
 
@@ -172,10 +163,10 @@ enum FieldState {
 pub(super) struct StreamState {
     /// JSON key being extracted (e.g. "thought" or "answer").
     key: &'static str,
+    /// What the field's text is, for the reporter.
+    kind: TextKind,
     /// Current lifecycle state of this field.
     state: FieldState,
-    /// Whether the visual prefix (emoji + label) has been emitted.
-    has_printed_prefix: bool,
     /// Number of bytes of the field's text already forwarded to the reporter.
     printed_length: usize,
 }
@@ -186,19 +177,18 @@ impl StreamState {
     /// # Parameters
     ///
     /// - `key`: the JSON field name to extract (e.g. "thought", "answer").
-    /// - `enabled`: when `false` and key is "thought", output is suppressed.
-    pub(super) fn new(key: &'static str, enabled: bool) -> Self {
-        let is_hidden = matches!((key, enabled), ("thought", false));
-        let state = if is_hidden {
-            FieldState::Skipped
-        } else {
-            FieldState::Active
+    /// - `kind`: what the field's text is.
+    /// - `enabled`: when `false`, the field is not forwarded at all.
+    pub(super) fn new(key: &'static str, kind: TextKind, enabled: bool) -> Self {
+        let state = match enabled {
+            true => FieldState::Active,
+            false => FieldState::Skipped,
         };
 
         Self {
             key,
+            kind,
             state,
-            has_printed_prefix: false,
             printed_length: 0,
         }
     }
@@ -239,21 +229,8 @@ impl StreamState {
         };
 
         let text = unescape_json_string(&raw_text);
-        self.print_prefix_once(reporter, &text);
         self.print_new_text(reporter, &text);
         self.complete_when(is_complete, reporter);
-    }
-
-    /// Print the field's prefix before its first non-empty text.
-    fn print_prefix_once<R: Reporter>(&mut self, reporter: &mut R, text: &str) {
-        let is_first_text = matches!((self.has_printed_prefix, text.is_empty()), (false, false));
-
-        if !is_first_text {
-            return;
-        }
-
-        reporter.chunk(&self.prefix());
-        self.has_printed_prefix = true;
     }
 
     /// Print the text after the part already printed.
@@ -266,7 +243,10 @@ impl StreamState {
             return;
         };
 
-        reporter.chunk(new_text);
+        reporter.report(AgentEvent::Text {
+            kind: self.kind,
+            text: new_text.to_string(),
+        });
         self.printed_length = text.len();
     }
 
@@ -277,21 +257,12 @@ impl StreamState {
         }
 
         self.state = FieldState::Complete;
-        reporter.line(String::new());
-    }
-
-    /// Visual prefix (emoji + label) for this field's output.
-    fn prefix(&self) -> String {
-        match self.key {
-            "thought" => format!("{COLOR_CYAN}🧠 {COLOR_RESET}"),
-            "answer" => format!("{ANSI_GREEN_CHECK} "),
-            _ => String::new(),
-        }
+        reporter.report(AgentEvent::TextEnded(self.kind));
     }
 
     /// Whether any text was forwarded to the reporter for this field.
     pub(super) fn did_print(&self) -> bool {
-        self.has_printed_prefix
+        self.printed_length > 0
     }
 }
 
@@ -514,6 +485,7 @@ mod tests {
     use crate::agent::fakes::{
         RecordingReporter, Reply, serve_replies, text_delta, thinking_delta, tool_call_delta,
     };
+    use crate::constants::ansi::{ANSI_GREEN_CHECK, COLOR_DIM, COLOR_RESET};
     use crate::ollama::{ChatMessage, Role};
     use serde_json::json;
 
@@ -553,7 +525,7 @@ mod tests {
 
     #[test]
     fn stream_state_skips_when_disabled() {
-        let mut state = StreamState::new("thought", false);
+        let mut state = StreamState::new("thought", TextKind::Thought, false);
         let mut reporter = RecordingReporter::default();
 
         state.feed(&mut reporter, r#"{"thought":"secret"}"#);
@@ -565,7 +537,7 @@ mod tests {
 
     #[test]
     fn stream_state_streams_incrementally() {
-        let mut state = StreamState::new("answer", true);
+        let mut state = StreamState::new("answer", TextKind::Answer, true);
         let mut reporter = RecordingReporter::default();
 
         state.feed(&mut reporter, r#"{"answer":"hel"#);
@@ -579,7 +551,7 @@ mod tests {
 
     #[test]
     fn stream_state_renders_escaped_newlines_as_real_newlines() {
-        let mut state = StreamState::new("answer", true);
+        let mut state = StreamState::new("answer", TextKind::Answer, true);
         let mut reporter = RecordingReporter::default();
 
         state.feed(&mut reporter, r#"{"answer":"line1\nline2"}"#);
@@ -590,7 +562,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_hides_the_answer_field() {
-        let mut state = StreamState::new("answer", true);
+        let mut state = StreamState::new("answer", TextKind::Answer, true);
         let mut reporter = RecordingReporter::default();
 
         state.feed(
@@ -600,16 +572,6 @@ mod tests {
 
         assert_eq!(state.state, FieldState::Skipped);
         assert!(reporter.output.is_empty());
-    }
-
-    #[test]
-    fn an_unknown_field_streams_without_a_prefix() {
-        let mut state = StreamState::new("note", true);
-        let mut reporter = RecordingReporter::default();
-
-        state.feed(&mut reporter, r#"{"note":"plain"}"#);
-
-        assert_eq!(reporter.output, "plain\n");
     }
 
     #[test]

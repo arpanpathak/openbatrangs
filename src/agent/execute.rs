@@ -21,29 +21,67 @@
 
 use super::AgentConfig;
 use super::confirm::Confirmer;
+use super::quality::command_succeeded;
 use super::quality::placeholder_reason;
-use super::reporter::Reporter;
+use super::summary::result_summary;
 use super::tool::Tool;
 use crate::constants::agent::COMMAND_TIMEOUT_SECONDS;
-use crate::constants::ansi::{ANSI_GREEN_CHECK, ANSI_YELLOW_FILES_HEADER};
+use crate::constants::ansi::ANSI_GREEN_CHECK;
 use crate::constants::tools::{DEFAULT_LIST_DEPTH, MAX_TOOL_OUTPUT};
 use crate::tools;
 use anyhow::{Result, bail, ensure};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Execute a tool call, returning its output or a formatted error message.
+/// The outcome of one tool call, as the loops report and record it.
+pub(super) struct ToolReport {
+    /// Whether the tool did its job; a command must also exit with code 0.
+    pub(super) success: bool,
+    /// A few words on the result, such as `4 passed` or `exit 101`.
+    pub(super) summary: String,
+    /// The full result text handed back to the model.
+    pub(super) output: String,
+}
+
+/// Execute a tool call and describe how it went.
 ///
-/// Wraps [`execute_tool`] so the caller always gets a displayable string.
-pub(super) async fn execute_tool_or_report_error<C: Confirmer>(
+/// An error becomes the output text `Tool error: ...`, so the model can read
+/// it and retry.
+pub(super) async fn run_tool_call<C: Confirmer>(
     config: &AgentConfig,
     cwd: &Path,
     tool: &Tool,
     changed_files: &mut Vec<String>,
     confirmer: &mut C,
-) -> String {
-    match execute_tool(config, cwd, tool, changed_files, confirmer).await {
-        Ok(text) => text,
-        Err(error) => format!("Tool error: {error:#}"),
+) -> ToolReport {
+    let result = execute_tool(config, cwd, tool, changed_files, confirmer).await;
+
+    match result {
+        Ok(output) => successful_call_report(tool, output),
+        Err(error) => failed_call_report(&error),
+    }
+}
+
+/// The report for a tool that returned output. A command only succeeds when
+/// it exits with code 0.
+fn successful_call_report(tool: &Tool, output: String) -> ToolReport {
+    let is_failed_command = matches!(tool, Tool::RunCommand { .. }) && !command_succeeded(&output);
+
+    ToolReport {
+        success: !is_failed_command,
+        summary: result_summary(tool, &output),
+        output,
+    }
+}
+
+/// The report for a tool that failed: the first line of the error is the summary.
+fn failed_call_report(error: &anyhow::Error) -> ToolReport {
+    let output = format!("Tool error: {error:#}");
+    let summary = output.lines().next().unwrap_or_default().to_string();
+
+    ToolReport {
+        success: false,
+        summary,
+        output,
     }
 }
 
@@ -97,6 +135,7 @@ pub(super) async fn execute_tool<C: Confirmer>(
         }
         Tool::RunCommand { command } => run_command(config, cwd, command, confirmer).await,
         Tool::Finish { summary } => Ok(format!("{ANSI_GREEN_CHECK} {summary}")),
+        Tool::AskUser { question } => Ok(question.clone()),
     }
 }
 
@@ -169,7 +208,7 @@ async fn run_command<C: Confirmer>(
 fn record_change(cwd: &Path, path: &str, result: &str, changed_files: &mut Vec<String>) -> String {
     changed_files.push(path.to_string());
 
-    format!("{result}\n📎 {}", clickable_path(cwd, path))
+    format!("{result}\n📎 {}", clickable_link(&cwd.join(path)))
 }
 
 /// Allow a mutating tool: fail in read-only mode or when the user declines.
@@ -225,19 +264,29 @@ async fn ask_user<C: Confirmer>(confirmer: &mut C, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+/// `files` as absolute paths under `cwd`.
+pub(super) fn absolute_paths(cwd: &Path, files: &[String]) -> Vec<PathBuf> {
+    files
+        .iter()
+        .map(|file| cwd.join(file))
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+        .collect()
+}
+
 /// Terminal-clickable file path (OSC 8 hyperlink). Always emits an absolute path.
 ///
 /// Control characters are stripped first so a malicious model cannot inject
 /// ANSI escape sequences into the terminal through a crafted file name.
-pub(super) fn clickable_path(cwd: &Path, path: &str) -> String {
-    let joined = cwd.join(path);
-    let full = std::path::absolute(&joined).unwrap_or(joined);
+pub(super) fn clickable_link(path: &Path) -> String {
+    let given = path.to_path_buf();
+    let full = std::path::absolute(path).unwrap_or(given);
     let display = sanitize_terminal_text(&full.to_string_lossy());
     let encoded = display
         .replace('%', "%25")
         .replace(' ', "%20")
         .replace('#', "%23")
         .replace('?', "%3F");
+
     format!("\x1b]8;;file://{encoded}\x1b\\{display}\x1b]8;;\x1b\\")
 }
 
@@ -248,29 +297,10 @@ fn sanitize_terminal_text(text: &str) -> String {
         .collect()
 }
 
-/// Print clickable OSC 8 links for each file changed during the agent session.
-pub(super) fn print_changed_files<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
-    if files.is_empty() {
-        return;
-    }
-
-    reporter.line(format!("\n{ANSI_YELLOW_FILES_HEADER}"));
-    print_file_links(cwd, files, reporter);
-}
-
-/// Print one indented clickable link per file.
-fn print_file_links<R: Reporter>(cwd: &Path, files: &[String], reporter: &mut R) {
-    for file in files {
-        reporter.line(format!("   {}", clickable_path(cwd, file)));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::fakes::{
-        FixedConfirmer, RecordingReporter, Reply, serve_replies, test_config,
-    };
+    use crate::agent::fakes::{FixedConfirmer, Reply, serve_replies, test_config};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -291,7 +321,7 @@ mod tests {
 
     #[test]
     fn clickable_path_encodes_special_characters() {
-        let link = clickable_path(Path::new("/tmp/a b#c?d%"), "x");
+        let link = clickable_link(&Path::new("/tmp/a b#c?d%").join("x"));
 
         assert!(link.contains("a%20b%23c%3Fd%25"));
         assert!(link.contains("/tmp/a b#c?d%"));
@@ -299,7 +329,7 @@ mod tests {
 
     #[test]
     fn clickable_path_strips_terminal_escape_injection() {
-        let link = clickable_path(Path::new("/tmp"), "evil\x1b]8;;http://evil\x1b\\file.txt");
+        let link = clickable_link(&Path::new("/tmp").join("evil\x1b]8;;http://evil\x1b\\file.txt"));
 
         assert!(!link.contains("\x1b]8;;http://evil"));
         assert!(link.contains("file.txt"));
@@ -414,29 +444,58 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn finish_and_errors_become_text() -> Result<()> {
-        let root = temp_root();
-        let config = test_config(&root, 1);
+    /// The report of running `tool` in the workspace of `config`.
+    async fn report_for(config: &AgentConfig, tool: Tool) -> ToolReport {
         let mut changed = Vec::new();
         let mut confirmer = FixedConfirmer::new(true);
 
-        let finish = Tool::Finish {
-            summary: "all done".to_string(),
-        };
-        let finished =
-            execute_tool_or_report_error(&config, &root, &finish, &mut changed, &mut confirmer)
-                .await;
-        assert_eq!(finished, format!("{ANSI_GREEN_CHECK} all done"));
+        run_tool_call(config, &config.cwd, &tool, &mut changed, &mut confirmer).await
+    }
 
-        let missing = Tool::ReadFile {
+    #[tokio::test]
+    async fn tool_reports_carry_success_summary_and_output() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
+        let report = |tool: Tool| report_for(&config, tool);
+
+        let finished = report(Tool::Finish {
+            summary: "all done".to_string(),
+        })
+        .await;
+        assert_eq!(finished.output, format!("{ANSI_GREEN_CHECK} all done"));
+
+        let asked = report(Tool::AskUser {
+            question: "Which file?".to_string(),
+        })
+        .await;
+        assert_eq!(asked.output, "Which file?");
+
+        let missing = report(Tool::ReadFile {
             path: "missing.txt".to_string(),
             max_chars: 10,
-        };
-        let failed =
-            execute_tool_or_report_error(&config, &root, &missing, &mut changed, &mut confirmer)
-                .await;
-        assert!(failed.starts_with("Tool error: "), "{failed}");
+        })
+        .await;
+        assert!(!missing.success);
+        assert!(
+            missing.output.starts_with("Tool error: "),
+            "{}",
+            missing.output
+        );
+        assert!(missing.summary.starts_with("Tool error: "));
+
+        let failing = report(Tool::RunCommand {
+            command: "exit 3".to_string(),
+        })
+        .await;
+        assert!(!failing.success);
+        assert_eq!(failing.summary, "exit 3");
+
+        let passing = report(Tool::RunCommand {
+            command: "true".to_string(),
+        })
+        .await;
+        assert!(passing.success);
+        assert_eq!(passing.summary, "exit 0");
 
         std::fs::remove_dir_all(root)?;
         Ok(())
@@ -570,19 +629,5 @@ mod tests {
 
         std::fs::remove_dir_all(root)?;
         Ok(())
-    }
-
-    #[test]
-    fn changed_files_are_listed_only_when_there_are_some() {
-        let mut reporter = RecordingReporter::default();
-
-        print_changed_files(Path::new("/tmp"), &[], &mut reporter);
-        assert!(reporter.output.is_empty());
-
-        let files = ["a.rs".to_string(), "b.rs".to_string()];
-        print_changed_files(Path::new("/tmp"), &files, &mut reporter);
-        assert!(reporter.output.contains(ANSI_YELLOW_FILES_HEADER));
-        assert!(reporter.output.contains("/tmp/a.rs"));
-        assert!(reporter.output.contains("/tmp/b.rs"));
     }
 }
