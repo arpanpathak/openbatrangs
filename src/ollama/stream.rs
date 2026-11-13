@@ -10,8 +10,9 @@
 //! - NDJSON specification: <https://ndjson.org/>
 //! - Ollama streaming chat API: <https://github.com/ollama/ollama/blob/main/docs/api.md#generate-a-chat-completion>
 
-use super::types::StreamLine;
+use super::types::Delta;
 use serde_json::Value;
+use std::str::Utf8Error;
 
 /// Text received so far from a byte stream, decoded as UTF-8.
 ///
@@ -32,64 +33,86 @@ impl TextBuffer {
     pub(super) fn push(&mut self, bytes: &[u8]) {
         self.pending.extend_from_slice(bytes);
 
-        let complete = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => self.pending.len(),
-        };
-
+        let complete = decodable_len(&self.pending);
         self.text
             .push_str(&String::from_utf8_lossy(&self.pending[..complete]));
         self.pending.drain(..complete);
     }
 }
 
-/// Result of draining complete NDJSON lines from the stream buffer.
-pub(super) enum LineDrain {
-    /// A content delta is ready to emit.
-    Content(String),
-    /// The stream's terminal `done` marker was seen.
+/// How many leading bytes of `bytes` can be decoded now: all of them, except
+/// a character cut off at the end. Invalid bytes count as decodable; they
+/// become U+FFFD.
+fn decodable_len(bytes: &[u8]) -> usize {
+    std::str::from_utf8(bytes)
+        .map_or_else(|error| decodable_len_before(error, bytes.len()), str::len)
+}
+
+/// [`decodable_len`] for bytes that are not valid UTF-8: up to the cut-off
+/// character when the error is an unfinished character at the end, else all
+/// `length` bytes.
+fn decodable_len_before(error: Utf8Error, length: usize) -> usize {
+    let is_cut_off_at_end = error.error_len().is_none();
+
+    if is_cut_off_at_end {
+        return error.valid_up_to();
+    }
+
+    length
+}
+
+/// Result of draining complete lines from a stream buffer.
+pub(super) enum Drain {
+    /// A delta is ready to emit.
+    Delta(Delta),
+    /// The stream's end marker was seen.
     Done,
     /// No complete payload line is available yet.
     NeedMore,
 }
 
+/// Remove the first complete line from `buffer` and return it trimmed;
+/// `None` while no newline has arrived.
+pub(super) fn take_line(buffer: &mut String) -> Option<String> {
+    let newline = buffer.find('\n')?;
+    let line = buffer[..newline].trim().to_string();
+
+    buffer.drain(..=newline);
+
+    Some(line)
+}
+
 /// Consume complete lines from `buffer`, returning the first meaningful event.
-pub(super) fn drain_complete_lines(buffer: &mut String) -> LineDrain {
-    while let Some(newline_pos) = buffer.find('\n') {
-        let line = buffer[..newline_pos].trim().to_string();
-        *buffer = buffer[newline_pos + 1..].to_string();
-        if line.is_empty() {
-            continue;
-        }
-        match parse_stream_line(&line) {
-            Some(StreamLine::Content(content)) => return LineDrain::Content(content),
-            Some(StreamLine::Done) => return LineDrain::Done,
-            None => {}
-        }
-    }
-    LineDrain::NeedMore
+///
+/// Lines after that event stay in `buffer` for the next call.
+pub(super) fn drain_complete_lines(buffer: &mut String) -> Drain {
+    std::iter::from_fn(|| take_line(buffer))
+        .find_map(|line| parse_stream_line(&line))
+        .unwrap_or(Drain::NeedMore)
 }
 
 /// Parse one NDJSON line from an Ollama chat stream.
 ///
 /// Returns `None` for non-payload lines (progress, keep-alive, malformed JSON).
-fn parse_stream_line(line: &str) -> Option<StreamLine> {
+fn parse_stream_line(line: &str) -> Option<Drain> {
     let value = serde_json::from_str::<Value>(line).ok()?;
-    if let Some(content) = value
+
+    message_content(&value).or_else(|| done_marker(&value))
+}
+
+/// The reply text of a chat stream line, as a content delta.
+fn message_content(value: &Value) -> Option<Drain> {
+    value
         .pointer("/message/content")
-        .and_then(|content| content.as_str())
-    {
-        return Some(StreamLine::Content(content.to_string()));
-    }
-    if value
-        .get("done")
-        .and_then(|done| done.as_bool())
-        .unwrap_or(false)
-    {
-        return Some(StreamLine::Done);
-    }
-    None
+        .and_then(Value::as_str)
+        .map(|content| Drain::Delta(Delta::Content(content.to_string())))
+}
+
+/// [`Drain::Done`] when a chat stream line carries `"done": true`.
+fn done_marker(value: &Value) -> Option<Drain> {
+    let is_done = value.get("done").and_then(Value::as_bool).unwrap_or(false);
+
+    is_done.then_some(Drain::Done)
 }
 
 /// A meaningful event from an Ollama `/api/pull` NDJSON stream.
@@ -104,47 +127,77 @@ pub(super) enum PullLine {
 
 /// Consume complete lines from a pull stream buffer, returning the first event.
 pub(super) fn drain_pull_line(buffer: &mut String) -> Option<PullLine> {
-    while let Some(newline_pos) = buffer.find('\n') {
-        let line = buffer[..newline_pos].trim().to_string();
-        *buffer = buffer[newline_pos + 1..].to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(event) = parse_pull_line(&line) {
-            return Some(event);
-        }
-    }
-    None
+    std::iter::from_fn(|| take_line(buffer)).find_map(|line| parse_pull_line(&line))
 }
 
 /// Parse one NDJSON line from an Ollama pull stream.
 fn parse_pull_line(line: &str) -> Option<PullLine> {
     let value = serde_json::from_str::<Value>(line).ok()?;
 
-    if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
-        return Some(PullLine::Error(error.to_string()));
-    }
+    pull_error(&value).or_else(|| pull_status(&value))
+}
 
-    let status = value.get("status").and_then(|value| value.as_str())?;
+/// The server's error message on a pull stream line.
+fn pull_error(value: &Value) -> Option<PullLine> {
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(|error| PullLine::Error(error.to_string()))
+}
+
+/// The status on a pull stream line, if it has one.
+fn pull_status(value: &Value) -> Option<PullLine> {
+    value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status_line(status, value))
+}
+
+/// [`PullLine::Done`] for the `success` status, else the status with the
+/// download percentage when the line reports one.
+fn status_line(status: &str, value: &Value) -> PullLine {
     if status == "success" {
-        return Some(PullLine::Done);
+        return PullLine::Done;
     }
 
-    let progress = match (
-        value.get("completed").and_then(|value| value.as_u64()),
-        value.get("total").and_then(|value| value.as_u64()),
-    ) {
-        (Some(completed), Some(total)) if total > 0 => {
+    PullLine::Status(format!("{status}{}", progress_suffix(value)))
+}
+
+/// ` 25%` when a pull line reports `completed` and a non-zero `total`, else
+/// an empty string.
+fn progress_suffix(value: &Value) -> String {
+    let completed = value.get("completed").and_then(Value::as_u64);
+    let total = value
+        .get("total")
+        .and_then(Value::as_u64)
+        .filter(|total| *total > 0);
+
+    completed
+        .zip(total)
+        .map_or_else(String::new, |(completed, total)| {
             format!(" {:.0}%", completed as f64 * 100.0 / total as f64)
-        }
-        _ => String::new(),
-    };
-    Some(PullLine::Status(format!("{status}{progress}")))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reply text of a drained content delta, `None` for anything else.
+    fn content(drain: Drain) -> Option<String> {
+        match drain {
+            Drain::Delta(Delta::Content(text)) => Some(text),
+            Drain::Delta(_) | Drain::Done | Drain::NeedMore => None,
+        }
+    }
+
+    /// The text of a pull status line, `None` for anything else.
+    fn status(line: Option<PullLine>) -> Option<String> {
+        match line {
+            Some(PullLine::Status(text)) => Some(text),
+            Some(PullLine::Done | PullLine::Error(_)) | None => None,
+        }
+    }
 
     #[test]
     fn a_character_split_across_chunks_is_decoded_whole() {
@@ -168,16 +221,17 @@ mod tests {
     #[test]
     fn parses_content_delta_from_stream_line() {
         let line = r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#;
-        match parse_stream_line(line) {
-            Some(StreamLine::Content(content)) => assert_eq!(content, "hello"),
-            _ => panic!("expected content delta"),
-        }
+
+        let parsed = parse_stream_line(line).and_then(content);
+
+        assert_eq!(parsed.as_deref(), Some("hello"));
     }
 
     #[test]
     fn parses_done_marker_from_stream_line() {
         let line = r#"{"done":true}"#;
-        assert!(matches!(parse_stream_line(line), Some(StreamLine::Done)));
+
+        assert!(matches!(parse_stream_line(line), Some(Drain::Done)));
     }
 
     #[test]
@@ -199,73 +253,77 @@ mod tests {
 {"done":true}
 "#,
         );
-        assert!(matches!(
-            drain_complete_lines(&mut buffer),
-            LineDrain::Content(content) if content == "a"
-        ));
-        assert!(matches!(
-            drain_complete_lines(&mut buffer),
-            LineDrain::Content(content) if content == "b"
-        ));
-        assert!(matches!(drain_complete_lines(&mut buffer), LineDrain::Done));
-        assert!(matches!(
-            drain_complete_lines(&mut buffer),
-            LineDrain::NeedMore
-        ));
+
+        assert_eq!(
+            content(drain_complete_lines(&mut buffer)).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            content(drain_complete_lines(&mut buffer)).as_deref(),
+            Some("b")
+        );
+        assert!(matches!(drain_complete_lines(&mut buffer), Drain::Done));
+        assert!(matches!(drain_complete_lines(&mut buffer), Drain::NeedMore));
     }
 
     #[test]
     fn skips_blank_and_non_payload_lines() {
         let mut buffer = String::from("\n\nnot json\n{\"message\":{\"content\":\"ok\"}}\n");
-        assert!(matches!(
-            drain_complete_lines(&mut buffer),
-            LineDrain::Content(content) if content == "ok"
-        ));
+
+        assert_eq!(
+            content(drain_complete_lines(&mut buffer)).as_deref(),
+            Some("ok")
+        );
     }
 
     #[test]
     fn returns_need_more_for_partial_line() {
         let mut buffer = String::from(r#"{"message":{"content":"par"#);
-        assert!(matches!(
-            drain_complete_lines(&mut buffer),
-            LineDrain::NeedMore
-        ));
+
+        assert!(matches!(drain_complete_lines(&mut buffer), Drain::NeedMore));
+        assert_eq!(content(Drain::Done), None);
     }
 
     #[test]
     fn parses_pull_status_with_progress_percentage() {
         let line = r#"{"status":"downloading","digest":"abc","total":100,"completed":25}"#;
-        match parse_pull_line(line) {
-            Some(PullLine::Status(status)) => {
-                assert!(status.starts_with("downloading"));
-                assert!(status.contains("25%"));
-            }
-            _ => panic!("expected pull status with progress"),
-        }
+
+        assert_eq!(
+            status(parse_pull_line(line)).as_deref(),
+            Some("downloading 25%")
+        );
     }
 
     #[test]
     fn parses_pull_success_as_done() {
         let line = r#"{"status":"success"}"#;
+
         assert!(matches!(parse_pull_line(line), Some(PullLine::Done)));
     }
 
     #[test]
     fn parses_pull_error() {
         let line = r#"{"error":"model not found"}"#;
-        match parse_pull_line(line) {
-            Some(PullLine::Error(error)) => assert_eq!(error, "model not found"),
-            _ => panic!("expected pull error"),
-        }
+
+        assert!(matches!(
+            parse_pull_line(line),
+            Some(PullLine::Error(error)) if error == "model not found"
+        ));
     }
 
     #[test]
     fn parses_pull_status_without_progress_fields() {
         let line = r#"{"status":"pulling manifest"}"#;
-        match parse_pull_line(line) {
-            Some(PullLine::Status(status)) => assert_eq!(status, "pulling manifest"),
-            _ => panic!("expected pull status"),
-        }
+        let zero_total = r#"{"status":"verifying","total":0,"completed":0}"#;
+
+        assert_eq!(
+            status(parse_pull_line(line)).as_deref(),
+            Some("pulling manifest")
+        );
+        assert_eq!(
+            status(parse_pull_line(zero_total)).as_deref(),
+            Some("verifying")
+        );
     }
 
     #[test]
@@ -273,15 +331,17 @@ mod tests {
         let mut buffer = String::from(
             "not json\n{\"status\":\"pulling manifest\"}\n{\"status\":\"downloading\",\"total\":10,\"completed\":5}\n{\"status\":\"success\"}\n",
         );
-        assert!(matches!(
-            drain_pull_line(&mut buffer),
-            Some(PullLine::Status(status)) if status == "pulling manifest"
-        ));
-        assert!(matches!(
-            drain_pull_line(&mut buffer),
-            Some(PullLine::Status(status)) if status.starts_with("downloading") && status.contains("50%")
-        ));
+
+        assert_eq!(
+            status(drain_pull_line(&mut buffer)).as_deref(),
+            Some("pulling manifest")
+        );
+        assert_eq!(
+            status(drain_pull_line(&mut buffer)).as_deref(),
+            Some("downloading 50%")
+        );
         assert!(matches!(drain_pull_line(&mut buffer), Some(PullLine::Done)));
         assert!(drain_pull_line(&mut buffer).is_none());
+        assert_eq!(status(None), None);
     }
 }

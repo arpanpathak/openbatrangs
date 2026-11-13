@@ -29,15 +29,19 @@ pub(crate) fn truncate(text: String) -> String {
 /// The original string when it fits, otherwise a truncated string ending with
 /// `... (truncated, N chars omitted)`.
 pub(super) fn truncate_to(text: String, max: usize) -> String {
-    if text.len() <= max {
+    let char_count = text.chars().count();
+
+    if char_count <= max {
         return text;
     }
-    let mut result = text.chars().take(max).collect::<String>();
-    result.push_str(&format!(
+
+    let mut kept = text.chars().take(max).collect::<String>();
+    kept.push_str(&format!(
         "\n... (truncated, {} chars omitted)",
-        text.chars().count().saturating_sub(max)
+        char_count - max
     ));
-    result
+
+    kept
 }
 
 #[cfg(test)]
@@ -47,9 +51,9 @@ mod tests {
     #[test]
     fn truncate_appends_omission_note() {
         let text = "x".repeat(MAX_TOOL_OUTPUT + 100);
-        let result = truncate(text);
-        assert!(result.len() < MAX_TOOL_OUTPUT + 200);
-        assert!(result.contains("truncated"));
+        let shortened = truncate(text);
+        assert!(shortened.len() < MAX_TOOL_OUTPUT + 200);
+        assert!(shortened.contains("truncated"));
     }
 
     #[test]
@@ -61,16 +65,23 @@ mod tests {
     #[test]
     fn truncate_to_respects_custom_limit() {
         let text = "abcdefgh".to_string();
-        let result = truncate_to(text, 4);
-        assert!(result.starts_with("abcd"));
-        assert!(result.contains("truncated"));
+        let shortened = truncate_to(text, 4);
+        assert!(shortened.starts_with("abcd"));
+        assert!(shortened.contains("truncated"));
+    }
+
+    #[test]
+    fn multi_byte_text_within_the_limit_is_unchanged() {
+        let text = "😀😀".to_string();
+
+        assert_eq!(truncate_to(text, 2), "😀😀");
     }
 
     #[test]
     fn truncate_handles_unicode_char_boundaries() {
         let text = "😀😀😀😀".to_string();
-        let result = truncate_to(text, 2);
-        assert_eq!(result.chars().next(), Some('😀'));
-        assert!(result.contains("truncated"));
+        let shortened = truncate_to(text, 2);
+        assert_eq!(shortened.chars().next(), Some('😀'));
+        assert!(shortened.contains("truncated"));
     }
 }

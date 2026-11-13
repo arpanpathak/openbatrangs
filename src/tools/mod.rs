@@ -8,10 +8,13 @@
 //! - [`files`]: listing, reading, writing, grepping files.
 //! - [`command`]: running shell commands.
 //! - [`text`]: output truncation helpers.
+//! - [`web`]: web search and page reading for research.
 
 mod command;
 mod files;
 mod path;
+#[cfg(test)]
+pub(crate) mod test_server;
 mod text;
 mod web;
 
