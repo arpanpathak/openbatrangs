@@ -92,8 +92,10 @@ pub const MODEL_PICKER_HEIGHT_PERCENT: u16 = 40;
 /// Height of the live performance panel (border + three content lines).
 pub const PERF_PANEL_HEIGHT: u16 = 5;
 
-/// Maximum height of the performance panel once wrapped lines are accounted for.
-pub const PERF_MAX_PANEL_HEIGHT: u16 = 8;
+/// Maximum height of the performance panel once wrapped lines are accounted
+/// for: room for four server lines, the `this machine` heading and the three
+/// local lines.
+pub const PERF_MAX_PANEL_HEIGHT: u16 = 10;
 
 /// Minimum elapsed time before the token-rate estimate refreshes.
 pub const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;

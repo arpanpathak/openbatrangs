@@ -10,13 +10,13 @@ use super::{
 use crate::agent::{AgentEvent, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
-use crate::constants::perf::MIB_PER_GIB;
+use crate::constants::perf::{MIB_PER_GIB, THIS_MACHINE_HEADING};
 use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_CHAT_HISTORY_MESSAGES, MAX_TRANSCRIPT_BLOCKS, SPINNER,
     STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
-use crate::perf::{PerfMonitor, SystemStats};
+use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host, server_section};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -261,6 +261,9 @@ pub(super) struct App {
     pub(super) perf: PerfMonitor,
     /// Most recently sampled system and GPU statistics.
     pub(super) system_stats: SystemStats,
+    /// Stats published by a model server on another host, or `None` when the
+    /// server runs on this machine.
+    pub(super) server_feed: Option<ServerStatsFeed>,
     /// Number of characters received in the current streaming response.
     pub(super) stream_chars: u64,
     /// Timestamp of the first chunk in the current streaming response.
@@ -339,6 +342,7 @@ impl App {
             mouse_capture: true,
             perf: PerfMonitor::new(tegrastats),
             system_stats: SystemStats::default(),
+            server_feed: None,
             stream_chars: 0,
             stream_started_at: None,
             tokens_per_sec: 0.0,
@@ -1337,12 +1341,39 @@ impl App {
         self.start_task(task, resume, client, tx);
     }
 
-    /// Format the current system stats into display lines for the perf panel.
+    /// The perf panel's lines. With a model server on another host, the
+    /// server's lines come first, then the local lines under a
+    /// `this machine` heading.
+    pub(super) fn perf_lines(&self) -> Vec<String> {
+        let local_lines = self.local_perf_lines();
+
+        let Some(feed) = &self.server_feed else {
+            return local_lines;
+        };
+
+        let fallback_host =
+            server_host(&self.server_url).unwrap_or_else(|| self.server_url.clone());
+        let mut lines = server_section(feed.latest().as_ref(), &fallback_host);
+        lines.push(THIS_MACHINE_HEADING.to_string());
+        lines.extend(local_lines);
+
+        lines
+    }
+
+    /// Tell the server stats poller whether the perf panel is on screen, so
+    /// it asks the server only while someone can see the answer.
+    pub(super) fn set_perf_on_screen(&self, on_screen: bool) {
+        if let Some(feed) = &self.server_feed {
+            feed.set_panel_visible(on_screen);
+        }
+    }
+
+    /// Format this machine's stats into display lines for the perf panel.
     ///
     /// # Returns
     ///
     /// A `Vec<String>` with GPU, CPU/tokens, and RAM lines for rendering.
-    pub(super) fn perf_lines(&self) -> Vec<String> {
+    fn local_perf_lines(&self) -> Vec<String> {
         let stats = &self.system_stats;
         let cpu = stats
             .cpu_util_percent
@@ -2916,6 +2947,24 @@ mod tests {
         app.system_stats = SystemStats::default();
 
         assert_eq!(app.perf_lines()[0], "GPU n/a");
+    }
+
+    #[test]
+    fn a_server_address_without_a_host_names_the_server_by_its_address() {
+        let mut app = test_app();
+        let feed = ServerStatsFeed::default();
+        feed.store(crate::perf::ServerStats::from_bodies(
+            None,
+            Some("llamacpp:requests_processing 1\n"),
+            None,
+        ));
+        app.server_url = "thor-without-scheme".to_string();
+        app.server_feed = Some(feed);
+
+        let lines = app.perf_lines();
+
+        assert_eq!(lines[0], "server thor-without-scheme · requests 1 running");
+        assert_eq!(lines[1], "this machine");
     }
 }
 

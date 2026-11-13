@@ -141,6 +141,20 @@ impl OllamaClient {
             .with_context(|| format!("failed to parse the response from {url}"))
     }
 
+    /// The body of `GET {server root}{path}`, where the server root is the
+    /// base URL without `/v1`, sent with the bearer key, or `None` when the
+    /// server cannot be reached or answers with an error status.
+    ///
+    /// # Arguments
+    /// - `path`: a path such as `/metrics` or `/api/ps`.
+    pub async fn server_text(&self, path: &str) -> Option<String> {
+        let url = format!("{}{path}", openai::server_root(&self.base_url));
+        let response = self.authorize(self.http.get(url)).send().await.ok()?;
+        let response = require_success(response).ok()?;
+
+        response.text().await.ok()
+    }
+
     /// Check whether the Ollama server is reachable.
     ///
     /// # Returns
@@ -881,6 +895,51 @@ mod tests {
         assert!(thinking.requests_thinking());
         assert!(!not_thinking.requests_thinking());
         assert!(!ollama.requests_thinking());
+        Ok(())
+    }
+
+    /// Answer one connection on `listener` with the request it received as
+    /// the body, so a test can read the headers the client sent.
+    async fn echo_one_request(listener: tokio::net::TcpListener) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut socket, _peer) = listener.accept().await?;
+        let mut request = [0u8; 4096];
+        let read = socket.read(&mut request).await?;
+        let request = String::from_utf8_lossy(&request[..read]).to_string();
+
+        let reply = crate::tools::test_server::response("200 OK", "text/plain", &request);
+        socket.write_all(reply.as_bytes()).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_text_reads_the_server_root_with_the_key() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}/v1", listener.local_addr()?);
+        tokio::spawn(echo_one_request(listener));
+        let client = OllamaClient::openai(&base_url, Some("secret".to_string()), true)?;
+
+        let request = client.server_text("/metrics").await.unwrap_or_default();
+
+        assert!(request.starts_with("GET /metrics HTTP/1.1"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer secret")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_text_is_none_on_an_error_status_or_no_server() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| MockResponse::text("404 Not Found", "no")).await;
+        let answering = OllamaClient::new(&base_url)?;
+        let closed = OllamaClient::new("http://127.0.0.1:1")?;
+
+        assert_eq!(answering.server_text("/api/ps").await, None);
+        assert_eq!(closed.server_text("/api/ps").await, None);
         Ok(())
     }
 }

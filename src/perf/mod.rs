@@ -3,13 +3,22 @@
 //! On Jetson-class devices this reads live `tegrastats` output. On systems with
 //! discrete NVIDIA GPUs it falls back to `nvidia-smi`. CPU and RAM are always
 //! read from `/proc`.
+//!
+//! When the model server runs on another host, `server` reads the stats that
+//! server publishes and `poll` asks for them in the background.
 
 mod gpu;
+mod poll;
+mod server;
 
 use crate::constants::perf::{
     CPU_TICK_FIELDS, GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
 };
 use gpu::{GpuStats, parse_nvidia_smi, parse_tegrastats};
+pub use poll::{ServerPoller, ServerStatsFeed};
+#[cfg(test)]
+pub use server::ServerStats;
+pub use server::{server_host, server_section};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
