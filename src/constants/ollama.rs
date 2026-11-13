@@ -22,3 +22,9 @@ pub const API_SHOW_PATH: &str = "/api/show";
 pub const API_CHAT_PATH: &str = "/api/chat";
 /// API path for pulling a model from the Ollama registry (`POST /api/pull`).
 pub const API_PULL_PATH: &str = "/api/pull";
+
+/// Gemma's channel markers. Gemma wraps its reasoning in `<|channel>thought` and
+/// `<channel|>`, and some servers pass the markers through in the reply text
+/// when they do not split the reasoning out. Each marker is one token, so it
+/// always arrives whole inside a single streamed delta.
+pub const GEMMA_CHANNEL_MARKERS: [&str; 3] = ["<|channel>thought", "<|channel>", "<channel|>"];
