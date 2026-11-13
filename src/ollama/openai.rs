@@ -13,7 +13,6 @@
 
 use super::stream::{Drain, take_line};
 use super::types::{ChatMessage, ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
-use crate::constants::ollama::GEMMA_CHANNEL_MARKERS;
 use serde_json::{Value, json};
 
 /// Build the `/chat/completions` body for a chat request.
@@ -131,21 +130,13 @@ fn text_delta(delta: &Value) -> Option<Delta> {
         .or_else(|| shown_text(delta, "reasoning").map(Delta::Thinking))
 }
 
-/// The string at `key` without Gemma's channel markers; `None` when it is
-/// missing or nothing is left.
+/// The string at `key`; `None` when it is missing or empty.
 fn shown_text(delta: &Value, key: &str) -> Option<String> {
     delta
         .get(key)
         .and_then(Value::as_str)
-        .map(without_channel_markers)
         .filter(|text| !text.is_empty())
-}
-
-/// `text` with Gemma's channel markers removed.
-fn without_channel_markers(text: &str) -> String {
-    GEMMA_CHANNEL_MARKERS
-        .iter()
-        .fold(text.to_string(), |text, marker| text.replace(marker, ""))
+        .map(str::to_string)
 }
 
 /// Extract the incremental `tool_calls` array of one streamed delta.
@@ -314,24 +305,6 @@ mod tests {
 
         assert_eq!(body["temperature"], 0.5);
         assert!(body.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn removes_gemma_channel_markers_from_the_reply() {
-        let delta =
-            parse_event(r#"{"choices":[{"delta":{"content":"to verify.<channel|>I will add"}}]}"#);
-
-        assert_eq!(
-            delta,
-            Some(Delta::Content("to verify.I will add".to_string()))
-        );
-    }
-
-    #[test]
-    fn drops_a_delta_that_holds_only_a_channel_marker() {
-        let delta = parse_event(r#"{"choices":[{"delta":{"content":"<|channel>thought"}}]}"#);
-
-        assert!(delta.is_none());
     }
 
     #[test]

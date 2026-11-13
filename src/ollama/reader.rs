@@ -8,7 +8,11 @@
 //! Each reading loop asks one step at a time for a [`ControlFlow`]: `Break`
 //! carries what the loop returns, and `Continue` means one more chunk arrived
 //! and the buffer is drained again.
+//!
+//! Every delta passes through a [`ChannelFilter`], so Gemma's channel markers
+//! never reach the reply or the reasoning.
 
+use super::channel::ChannelFilter;
 use super::stream::{Drain, PullLine, TextBuffer, drain_pull_line};
 use super::types::Delta;
 use anyhow::{Result, anyhow};
@@ -56,6 +60,8 @@ struct DeltaReader {
     /// Turns complete lines of text into the next event: NDJSON lines for
     /// Ollama, server-sent events for OpenAI-compatible servers.
     drain: fn(&mut String) -> Drain,
+    /// Removes Gemma's channel markers, which can span two deltas.
+    channel: ChannelFilter,
 }
 
 impl DeltaReader {
@@ -73,9 +79,18 @@ impl DeltaReader {
     /// reading one more chunk.
     async fn step(&mut self) -> ControlFlow<Option<Result<Delta>>> {
         match (self.drain)(&mut self.text.buffer.text) {
-            Drain::Delta(delta) => ControlFlow::Break(Some(Ok(delta))),
+            Drain::Delta(delta) => self.shown(delta),
             Drain::Done => ControlFlow::Break(None),
             Drain::NeedMore => self.read().await,
+        }
+    }
+
+    /// `Break` with `delta` cleaned of channel markers; `Continue` when the
+    /// delta held nothing else.
+    fn shown(&mut self, delta: Delta) -> ControlFlow<Option<Result<Delta>>> {
+        match self.channel.shown(delta) {
+            Some(delta) => ControlFlow::Break(Some(Ok(delta))),
+            None => ControlFlow::Continue(()),
         }
     }
 
@@ -95,6 +110,7 @@ pub(super) fn delta_stream(response: Response, drain: fn(&mut String) -> Drain) 
     let reader = DeltaReader {
         text: ResponseText::new(response),
         drain,
+        channel: ChannelFilter::default(),
     };
 
     Box::pin(futures_util::stream::unfold(

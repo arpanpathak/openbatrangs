@@ -18,11 +18,13 @@
 //! - `reqwest` streaming responses: <https://docs.rs/reqwest/latest/reqwest/struct.Response.html#method.bytes_stream>
 //! - NDJSON (newline-delimited JSON): <https://ndjson.org/>
 
+mod channel;
 mod openai;
 mod reader;
 mod stream;
 mod types;
 
+pub(crate) use channel::answer_without_channels;
 pub(crate) use types::{
     ChatMessage, ChatRequest, Delta, OllamaModel, PullRequest, Role, TagsResponse, ToolCallDelta,
 };
@@ -779,6 +781,40 @@ mod tests {
             vec![
                 Delta::Thinking("hmm".to_string()),
                 Delta::Content("hi".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_chat_stream_drops_channel_markers_split_across_deltas() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| {
+            MockResponse::json(
+                "200 OK",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<|channel>\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thought\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\\nPlan\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"<channel|>\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Done\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            )
+        })
+        .await;
+        let client = OllamaClient::openai(&base_url, None, true)?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
+        assert_eq!(
+            parts,
+            vec![
+                Delta::Thinking("\nPlan".to_string()),
+                Delta::Content("Done".to_string())
             ]
         );
         Ok(())

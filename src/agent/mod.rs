@@ -33,6 +33,7 @@ mod environment;
 mod execute;
 #[cfg(test)]
 mod fakes;
+mod gemma_call;
 mod json_loop;
 mod native;
 mod quality;

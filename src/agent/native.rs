@@ -4,9 +4,9 @@
 //! Edge-LLM — accept a `tools` array and reply with structured `tool_calls`.
 //! This loop sends the schemas with `tool_choice: "required"`, streams the
 //! reply, executes every call, and feeds the `tool` results back. Served
-//! models that answer with their JSON tool call as plain text instead of the
-//! structured channel are detected and executed anyway; anything else is the
-//! answer.
+//! models that answer with their tool call as plain text instead of the
+//! structured channel, as JSON or in Gemma 4's `call:NAME{...}` syntax, are
+//! detected and executed anyway; anything else is the answer.
 //!
 //! Tool execution, confirmation, and the file-work gate are shared with the
 //! JSON loop in [`super`], so writes and commands behave the same either way.
@@ -18,6 +18,7 @@
 
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
+use super::gemma_call::{gemma_tool_call, may_be_gemma_call};
 use super::quality::{FinishGate, command_succeeded};
 use super::research::task_with_documentation;
 use super::tool::{Tool, ToolCall, strip_code_fence};
@@ -29,7 +30,7 @@ use crate::constants::agent::{
     AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
     MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, NATIVE_SYSTEM_PROMPT,
 };
-use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
+use crate::ollama::{Delta, OllamaClient, ToolCallDelta, answer_without_channels};
 use anyhow::{Context, Result};
 use futures_util::{Stream, TryStreamExt};
 use serde_json::{Value, json};
@@ -311,6 +312,9 @@ struct TurnPrinter {
     show_thinking: bool,
     /// Whether reasoning text is being printed right now.
     is_thinking: bool,
+    /// Length in bytes of the reply text printed so far. Text that may be a
+    /// Gemma tool call is held back until it is clearly not one.
+    printed_len: usize,
 }
 
 impl TurnPrinter {
@@ -320,6 +324,7 @@ impl TurnPrinter {
             turn: Turn::default(),
             show_thinking,
             is_thinking: false,
+            printed_len: 0,
         }
     }
 
@@ -355,14 +360,42 @@ impl TurnPrinter {
         self.is_thinking = false;
     }
 
-    /// Add reply text to the turn and print it.
+    /// Add reply text to the turn and print it, unless the reply so far may
+    /// be a Gemma tool call written as text.
     fn content<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
         self.end_thinking(reporter);
         self.turn.content.push_str(text);
+
+        if may_be_gemma_call(&self.turn.content) {
+            return;
+        }
+
+        self.print_held_reply(reporter);
+    }
+
+    /// Print the reply text that has not been printed yet, if there is any.
+    fn print_held_reply<R: Reporter>(&mut self, reporter: &mut R) {
+        let held = self.turn.content[self.printed_len..].to_string();
+        self.printed_len = self.turn.content.len();
+
+        if held.is_empty() {
+            return;
+        }
+
         reporter.report(AgentEvent::Text {
             kind: TextKind::Answer,
-            text: text.to_string(),
+            text: held,
         });
+    }
+
+    /// Print the held-back reply text, unless the reply is a tool call
+    /// written as text: that call is run, not shown.
+    fn print_reply_unless_call<R: Reporter>(&mut self, reporter: &mut R) {
+        if parse_text_tool_call(&self.turn.content).is_some() {
+            return;
+        }
+
+        self.print_held_reply(reporter);
     }
 
     /// Add tool-call chunks to the turn.
@@ -374,9 +407,11 @@ impl TurnPrinter {
         }
     }
 
-    /// Close any open reasoning line and return the turn.
+    /// Close any open reasoning line, print any held-back reply text that is
+    /// not a tool call, and return the turn.
     fn finish<R: Reporter>(mut self, reporter: &mut R) -> Turn {
         self.end_thinking(reporter);
+        self.print_reply_unless_call(reporter);
 
         self.turn
     }
@@ -505,15 +540,15 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// End the run with the reply text, unless the finish gate rejects it; a
     /// rejected answer stays in the conversation with the feedback after it.
     fn answer(&mut self, text: &str) -> State {
-        let answer = text.trim();
+        let answer = answer_without_channels(text);
         self.empty_retries = 0;
 
         let Some(feedback) = self.finish_feedback() else {
-            return self.report_done(answer, true);
+            return self.report_done(&answer, true);
         };
 
         self.messages.push(Message::Assistant {
-            content: answer.to_string(),
+            content: answer,
             calls: Vec::new(),
         });
         self.reject_finish(feedback)
@@ -536,10 +571,11 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         outcome.next_state()
     }
 
-    /// End the run with the `finish` summary, unless the finish gate rejects it.
+    /// End the run with the `finish` summary, without Gemma's channel
+    /// markers, unless the finish gate rejects it.
     fn finish(&mut self, summary: &str) -> State {
         let Some(feedback) = self.finish_feedback() else {
-            return self.report_done(summary, false);
+            return self.report_done(&answer_without_channels(summary), false);
         };
 
         self.reject_finish(feedback)
@@ -938,20 +974,36 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
     })
 }
 
-/// Parse a JSON tool call the model wrote as plain text instead of using the
+/// Parse a tool call the model wrote as plain text instead of using the
 /// server's structured `tool_calls` channel.
 ///
 /// Some served models put `{"name": ..., "arguments": ...}` in the reply
-/// text; when `tool_choice` does not force the structured channel
-/// the loop would otherwise treat that JSON as the final answer. Known tools
-/// are extracted and executed instead; anything else is left to the answer path.
+/// text, and Gemma 4 writes `call:NAME{...}`; when `tool_choice` does not
+/// force the structured channel the loop would otherwise treat that text as
+/// the final answer. Known tools are extracted and executed instead; anything
+/// else is left to the answer path.
 fn parse_text_tool_call(content: &str) -> Option<Invocation> {
-    let invocation = serde_json::from_str::<Value>(strip_code_fence(content))
-        .ok()
-        .and_then(|value| text_invocation(&value))?;
+    let invocation = json_text_invocation(content).or_else(|| gemma_text_invocation(content))?;
 
     let is_known_tool = parse_call(&invocation).is_ok();
     is_known_tool.then_some(invocation)
+}
+
+/// The invocation in a reply that is a `{"name": ..., "arguments": ...}`
+/// JSON object, optionally in a code fence.
+fn json_text_invocation(content: &str) -> Option<Invocation> {
+    serde_json::from_str::<Value>(strip_code_fence(content))
+        .ok()
+        .and_then(|value| text_invocation(&value))
+}
+
+/// The invocation in a reply that holds a Gemma `call:NAME{...}` tool call.
+fn gemma_text_invocation(content: &str) -> Option<Invocation> {
+    gemma_tool_call(content).map(|call| Invocation {
+        id: String::new(),
+        name: call.name,
+        arguments: call.arguments.to_string(),
+    })
 }
 
 /// The invocation in a parsed `{"name": ..., "arguments": ...}` object.
@@ -1219,7 +1271,7 @@ mod tests {
     use super::*;
     use crate::agent::fakes::{
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_replies, test_config,
-        text_delta, tool_call_delta,
+        text_delta, thinking_delta, tool_call_delta,
     };
     use std::path::{Path, PathBuf};
 
@@ -1563,6 +1615,29 @@ mod tests {
     }
 
     #[test]
+    fn gemma_text_tool_calls_become_json_arguments() -> Result<()> {
+        let reply = concat!(
+            "call:edit_file{new_string:<|\"|>    #[test]\n    fn median_even() {\n",
+            "        assert_eq!(median(&[1.0, 2.0]), Some(1.5));\n    }<|\"|>,",
+            "old_string:<|\"|>}<|\"|>,path:<|\"|>src/lib.rs<|\"|>}"
+        );
+
+        let call = parse_text_tool_call(reply).context("Gemma tool call")?;
+
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments)?,
+            json!({
+                "new_string": "    #[test]\n    fn median_even() {\n        assert_eq!(median(&[1.0, 2.0]), Some(1.5));\n    }",
+                "old_string": "}",
+                "path": "src/lib.rs",
+            })
+        );
+        assert!(parse_text_tool_call("call:summon{}").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn text_tool_calls_ignore_unknown_tools_and_plain_answers() {
         assert!(parse_text_tool_call(r#"{"name": "rm_rf", "arguments": {}}"#).is_none());
         assert!(parse_text_tool_call("the build failed because of x").is_none());
@@ -1727,6 +1802,87 @@ mod tests {
         assert!(output.contains("wrote its tool call as text"));
         assert!(output.contains("🔧 list_files → ."));
         assert!(output.contains("✅ nothing here"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_gemma_tool_call_written_as_text_runs_and_is_not_shown() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-gemma-call");
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("src/lib.rs"), "mod tests {\n}\n")?;
+        let replies = vec![
+            Reply::openai_stream(&[
+                text_delta("<|tool_call>"),
+                text_delta("call:edit_file{new_string:<|\"|>mod tests {\n    #[test]\n"),
+                text_delta("    fn works() {}<|\"|>,old_string:<|\"|>mod tests {<|\"|>,"),
+                text_delta("path:<|\"|>src/lib.rs<|\"|>}<tool_call|>"),
+            ]),
+            Reply::openai_stream(&[tool_call_delta(
+                "c2",
+                "finish",
+                &json!({"summary": "thought\n<channel|>I added a test."}),
+            )]),
+        ];
+
+        let (output, result) = run_in(&root, "add a test", 3, replies).await?;
+
+        result?;
+        assert!(output.contains("🔧 edit_file → src/lib.rs"));
+        assert!(output.contains("✅ I added a test."));
+        assert!(!output.contains("call:"));
+        assert!(!output.contains("<|"));
+        assert!(!output.contains("thought"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs"))?,
+            "mod tests {\n    #[test]\n    fn works() {}\n}\n"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_back_reply_text_is_printed_once_it_is_not_a_call() -> Result<()> {
+        let replies = vec![Reply::openai_stream(&[
+            text_delta("ca"),
+            text_delta("t says hi"),
+        ])];
+
+        let (cat, cat_result) = run_with_replies("say hi", 1, replies).await?;
+
+        cat_result?;
+        assert!(cat.contains("cat says hi"));
+
+        let unknown = vec![Reply::openai_stream(&[
+            text_delta("call:"),
+            text_delta("summon{}"),
+        ])];
+        let (summon, summon_result) = run_with_replies("summon", 1, unknown).await?;
+
+        summon_result?;
+        assert!(summon.contains("call:summon{}"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_text_answer_loses_its_channel_markers() -> Result<()> {
+        let replies = vec![Reply::openai_stream(&[
+            thinking_delta("<|channel>"),
+            thinking_delta("thought"),
+            thinking_delta("\nThe user greets me."),
+            text_delta("<|channel>"),
+            text_delta("final\nHello."),
+        ])];
+
+        let (output, result) = run_with_replies("hello", 1, replies).await?;
+
+        result?;
+        assert!(output.contains("✅ Hello."));
+        assert!(!output.contains("thought"));
+        assert!(!output.contains("final"));
+        assert!(!output.contains("<|channel>"));
 
         Ok(())
     }
