@@ -12,7 +12,7 @@ use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, CHAT_SEPARATOR_LENGTH, MAX_CHAT_HISTORY_MESSAGES,
     MAX_LIVE_CHARS, MAX_LOG_LINES, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED,
 };
-use crate::ollama::{ChatMessage, OllamaClient};
+use crate::ollama::{ChatMessage, OllamaClient, OllamaModel};
 use crate::perf::{PerfMonitor, SystemStats};
 use crossterm::event::{self, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
@@ -326,36 +326,15 @@ impl App {
     ///
     /// - `client`: Ollama client used to fetch the installed model tags.
     pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
-        let Ok(tags) = client.tags().await else {
-            return;
-        };
-        let Some(model) = tags.iter().find(|model| {
-            self.model
-                .as_ref()
-                .is_some_and(|selected| selected == &model.name)
-        }) else {
-            return;
-        };
-        let size_gb = model.size as f64 / BYTES_PER_GIGABYTE;
-        let params = model
-            .details
-            .as_ref()
-            .and_then(|details| details.parameter_size.clone())
-            .unwrap_or_else(|| "?".to_string());
-        let quant = model
-            .details
-            .as_ref()
-            .and_then(|details| details.quantization_level.clone())
-            .unwrap_or_else(|| "?".to_string());
-        let context = model
-            .details
-            .as_ref()
-            .and_then(|details| details.context_length)
-            .unwrap_or(0);
-        self.model_info = Some(format!(
-            "model: {} · {size_gb:.1} GB · {params} · {quant} · {context} ctx",
-            model.name
-        ));
+        let tags = client.tags().await.unwrap_or_default();
+        let selected = self.model.as_deref();
+
+        if let Some(model) = tags
+            .iter()
+            .find(|model| Some(model.name.as_str()) == selected)
+        {
+            self.model_info = Some(model_summary(model));
+        }
     }
 
     /// Move any in-progress streaming text from `live` into the persistent log.
@@ -1605,5 +1584,68 @@ mod tests {
             app.log.iter().any(|line| line.contains('⚠')),
             "expected an error logged to chat"
         );
+    }
+}
+
+/// The header's model line: the name, then each detail the server reported.
+///
+/// Ollama reports a size, parameter count, quantization and context length. An
+/// OpenAI-compatible server often reports none of them, so a missing detail is
+/// left out of the line in place of a placeholder.
+fn model_summary(model: &OllamaModel) -> String {
+    let details = model.details.clone().unwrap_or_default();
+    let size =
+        (model.size > 0).then(|| format!("{:.1} GB", model.size as f64 / BYTES_PER_GIGABYTE));
+    let context = details
+        .context_length
+        .filter(|length| *length > 0)
+        .map(|length| format!("{length} ctx"));
+
+    let reported = [
+        size,
+        details.parameter_size,
+        details.quantization_level,
+        context,
+    ];
+    let name = format!("model: {}", model.name);
+
+    std::iter::once(name)
+        .chain(reported.into_iter().flatten())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+#[cfg(test)]
+mod model_summary_tests {
+    use super::*;
+
+    #[test]
+    fn a_model_with_every_detail_lists_them_all() -> anyhow::Result<()> {
+        let model: OllamaModel = serde_json::from_value(serde_json::json!({
+            "name": "qwen2.5-coder:7b",
+            "size": 4_700_000_000_u64,
+            "details": {
+                "parameter_size": "7.6B",
+                "quantization_level": "Q4_K_M",
+                "context_length": 32_768
+            }
+        }))?;
+
+        let summary = model_summary(&model);
+
+        assert!(summary.starts_with("model: qwen2.5-coder:7b · "));
+        assert!(summary.ends_with(" · 7.6B · Q4_K_M · 32768 ctx"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_without_details_shows_only_its_name() -> anyhow::Result<()> {
+        let model: OllamaModel =
+            serde_json::from_value(serde_json::json!({ "name": "Gemma-4-26B-A4B-NVFP4" }))?;
+
+        assert_eq!(model_summary(&model), "model: Gemma-4-26B-A4B-NVFP4");
+
+        Ok(())
     }
 }

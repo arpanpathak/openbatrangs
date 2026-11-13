@@ -12,6 +12,7 @@
 //! - llama-server API: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
 use super::types::{ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
+use crate::constants::ollama::GEMMA_CHANNEL_MARKERS;
 use serde_json::{Value, json};
 
 /// Result of draining complete server-sent event lines from the buffer.
@@ -91,13 +92,20 @@ fn parse_event(data: &str) -> Option<Delta> {
         delta
             .get(key)
             .and_then(Value::as_str)
+            .map(without_channel_markers)
             .filter(|text| !text.is_empty())
-            .map(str::to_string)
     };
     text("content")
         .map(Delta::Content)
         .or_else(|| text("reasoning_content").map(Delta::Thinking))
         .or_else(|| text("reasoning").map(Delta::Thinking))
+}
+
+/// `text` with Gemma's channel markers removed.
+fn without_channel_markers(text: &str) -> String {
+    GEMMA_CHANNEL_MARKERS
+        .iter()
+        .fold(text.to_string(), |text, marker| text.replace(marker, ""))
 }
 
 /// Extract the incremental `tool_calls` array of one streamed delta.
@@ -228,6 +236,21 @@ mod tests {
         let body = chat_body(&request(None), false);
         assert!(body.get("response_format").is_none());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn removes_gemma_channel_markers_from_the_reply() {
+        let delta =
+            parse_event(r#"{"choices":[{"delta":{"content":"to verify.<channel|>I will add"}}]}"#);
+
+        assert!(matches!(delta, Some(Delta::Content(text)) if text == "to verify.I will add"));
+    }
+
+    #[test]
+    fn drops_a_delta_that_holds_only_a_channel_marker() {
+        let delta = parse_event(r#"{"choices":[{"delta":{"content":"<|channel>thought"}}]}"#);
+
+        assert!(delta.is_none());
     }
 
     #[test]
