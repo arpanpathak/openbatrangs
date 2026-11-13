@@ -18,16 +18,16 @@
 //! - OSC 8 hyperlinks: <https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda>
 //! - Human-in-the-loop safety: <https://en.wikipedia.org/wiki/Human-in-the-loop>
 
+use super::AgentConfig;
 use super::confirm::Confirmer;
 use super::quality::placeholder_reason;
 use super::reporter::Reporter;
 use super::tool::Tool;
-use super::AgentConfig;
 use crate::constants::agent::COMMAND_TIMEOUT_SECONDS;
 use crate::constants::ansi::{ANSI_GREEN_CHECK, ANSI_YELLOW_FILES_HEADER};
 use crate::constants::tools::{DEFAULT_LIST_DEPTH, MAX_TOOL_OUTPUT};
 use crate::tools;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::Path;
 
 /// Execute a tool call, returning its output or a formatted error message.

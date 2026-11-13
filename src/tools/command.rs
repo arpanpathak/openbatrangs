@@ -16,7 +16,7 @@
 
 use super::text::truncate;
 use crate::constants::tools::{EXIT_CODE_PREFIX, MIN_COMMAND_TIMEOUT_SECONDS};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

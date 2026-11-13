@@ -3,9 +3,9 @@
 use super::chat::ChatRenderCache;
 use super::session::SessionLog;
 use super::{
-    chat_visual_line_indices, open_in_vim, run_agent_worker, ScrollMode, UiEvent, WorkerHistory,
+    ScrollMode, UiEvent, WorkerHistory, chat_visual_line_indices, open_in_vim, run_agent_worker,
 };
-use crate::cli::{search_key, searxng_url, AgentMode, AgentRunConfig, Cli, ModelPrefs};
+use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::perf::MIB_PER_GIB;
 use crate::constants::tui::{
@@ -160,16 +160,8 @@ impl App {
     ///
     /// A fully initialized `App` ready for the event loop.
     pub(super) fn new(cli: &Cli, tegrastats: Arc<Mutex<Option<String>>>) -> Self {
-        let mut log = SessionLog::new(MAX_LOG_LINES);
-        log.push(String::new());
-        log.push(
-            "Agent mode active. Type a task to start coding, or /help for commands.".to_string(),
-        );
-        log.push(
-            "Use /mode chat for plain conversation, /mode plan for read-only planning.".to_string(),
-        );
         Self {
-            log,
+            log: SessionLog::new(MAX_LOG_LINES),
             live: String::new(),
             input: String::new(),
             cursor: 0,
@@ -781,6 +773,11 @@ impl App {
         }
     }
 
+    /// Whether the transcript has no messages yet, saved or still streaming.
+    pub(super) fn transcript_is_empty(&self) -> bool {
+        self.log.is_empty() && self.live.is_empty()
+    }
+
     /// Assemble the full visible chat text from the log and any live streaming output.
     ///
     /// # Returns
@@ -1111,9 +1108,11 @@ mod tests {
         app.input = "/h".to_string();
         let suggestions = app.suggestions();
         assert!(!suggestions.is_empty());
-        assert!(suggestions
-            .iter()
-            .all(|suggestion| suggestion.starts_with("/h")));
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.starts_with("/h"))
+        );
     }
 
     #[test]
@@ -1398,10 +1397,11 @@ mod tests {
         assert!(app.task_queue.is_empty());
         assert!(app.is_running, "queued task should start immediately");
         assert!(app.current_task.is_some());
-        assert!(app
-            .log
-            .iter()
-            .any(|line| line.contains("Starting next queued task")));
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("Starting next queued task"))
+        );
     }
 
     #[test]
@@ -1573,10 +1573,11 @@ mod tests {
         );
         assert!(!app.is_running);
         assert_eq!(app.status, "ready");
-        assert!(app
-            .log
-            .iter()
-            .any(|line| line.contains("Failed to pull model 'bad-model'")));
+        assert!(
+            app.log
+                .iter()
+                .any(|line| line.contains("Failed to pull model 'bad-model'"))
+        );
     }
 
     #[test]

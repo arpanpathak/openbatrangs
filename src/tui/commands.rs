@@ -6,7 +6,7 @@
 
 use super::app::App;
 use super::split_command;
-use super::{run_pull_worker, run_setup_worker, ScrollMode, UiEvent};
+use super::{ScrollMode, UiEvent, run_pull_worker, run_setup_worker};
 use crate::cli::AgentMode;
 use crate::ollama::{OllamaClient, OllamaModel};
 use std::path::PathBuf;
@@ -744,10 +744,11 @@ mod tests {
         let original_cwd = app.run_config.cwd.clone();
         app.log.clear();
         app.handle_cwd_command("");
-        assert!(app
-            .log
-            .text()
-            .contains(&format!("Workspace: {}", original_cwd.display())));
+        assert!(
+            app.log
+                .text()
+                .contains(&format!("Workspace: {}", original_cwd.display()))
+        );
     }
 
     #[test]
@@ -760,10 +761,11 @@ mod tests {
             app.run_config.cwd,
             std::path::PathBuf::from("/tmp/new_workspace")
         );
-        assert!(app
-            .log
-            .text()
-            .contains("Workspace set to /tmp/new_workspace"));
+        assert!(
+            app.log
+                .text()
+                .contains("Workspace set to /tmp/new_workspace")
+        );
     }
 
     #[test]

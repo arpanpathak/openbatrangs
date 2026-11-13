@@ -1,7 +1,7 @@
 //! Background agent/chat workers for the TUI.
 
 use super::text::strip_ansi;
-use crate::agent::{compact_context, max_output_tokens, AgentConfig, Confirmer, Reporter};
+use crate::agent::{AgentConfig, Confirmer, Reporter, compact_context, max_output_tokens};
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
 use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};

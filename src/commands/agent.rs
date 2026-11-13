@@ -2,10 +2,10 @@
 
 use crate::agent::{self, AgentConfig};
 use crate::banner;
-use crate::cli::{agent_run_config, model_prefs_from_cli, AgentRunConfig, Cli, ModelPrefs};
+use crate::cli::{AgentRunConfig, Cli, ModelPrefs, agent_run_config, model_prefs_from_cli};
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::ollama::OllamaClient;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Run the agent for a task, or start the TUI when the task is empty.
 pub(crate) async fn run_agent_or_tui(

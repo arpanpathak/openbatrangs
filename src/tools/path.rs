@@ -11,7 +11,7 @@
 //! - Symlink attack: <https://en.wikipedia.org/wiki/Symlink_attack>
 //! - Rust `Path`/`Component`: <https://doc.rust-lang.org/std/path/index.html>
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Component, Path, PathBuf};
 
 /// Resolve a model-supplied path safely inside `root`.

@@ -9,7 +9,7 @@ mod gpu;
 use crate::constants::perf::{
     GPU_CACHE_TTL, KIB_PER_MIB, SAMPLE_INTERVAL, TEGRASTATS_INTERVAL_MILLIS,
 };
-use gpu::{parse_nvidia_smi, parse_tegrastats, GpuStats};
+use gpu::{GpuStats, parse_nvidia_smi, parse_tegrastats};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -175,10 +175,10 @@ impl PerfMonitor {
     /// Query `nvidia-smi`, reusing the last result within `GPU_CACHE_TTL`.
     fn cached_nvidia_smi(&mut self) -> GpuStats {
         let now = Instant::now();
-        if let Some((cached_at, cached)) = &self.gpu_cache {
-            if now.duration_since(*cached_at) < GPU_CACHE_TTL {
-                return cached.clone();
-            }
+        if let Some((cached_at, cached)) = &self.gpu_cache
+            && now.duration_since(*cached_at) < GPU_CACHE_TTL
+        {
+            return cached.clone();
         }
         let fresh = parse_nvidia_smi().unwrap_or_default();
         self.gpu_cache = Some((now, fresh.clone()));

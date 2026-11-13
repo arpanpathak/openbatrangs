@@ -12,7 +12,7 @@
 //! - llama-server API: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
 use super::types::{ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Result of draining complete server-sent event lines from the buffer.
 pub(super) enum EventDrain {

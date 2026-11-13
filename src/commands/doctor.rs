@@ -114,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_lines_fetch_tags_from_server() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url = spawn_mock_server(|path| {
             assert_eq!(path, "/api/tags");
@@ -132,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_lines_propagate_tags_error() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
 
         let base_url =
             spawn_mock_server(|_| MockResponse::text("500 Internal Server Error", "boom")).await;

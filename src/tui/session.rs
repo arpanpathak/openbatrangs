@@ -216,7 +216,7 @@ impl SessionLog {
         self.memory.iter()
     }
 
-    #[cfg(test)]
+    /// Whether the log holds no lines, on disk or in memory.
     pub(super) fn is_empty(&self) -> bool {
         self.memory.is_empty() && self.prefix.is_empty()
     }
@@ -292,14 +292,16 @@ mod tests {
         // oldest ones, so the visible chat is contiguous with what was on
         // screen before scrolling.
         assert!(log.load_more(3));
-        assert!(log
-            .text()
-            .starts_with("line 5\nline 6\nline 7\nline 8\nline 9"));
+        assert!(
+            log.text()
+                .starts_with("line 5\nline 6\nline 7\nline 8\nline 9")
+        );
 
         assert!(log.load_more(3));
-        assert!(log
-            .text()
-            .starts_with("line 2\nline 3\nline 4\nline 5\nline 6\nline 7"));
+        assert!(
+            log.text()
+                .starts_with("line 2\nline 3\nline 4\nline 5\nline 6\nline 7")
+        );
 
         assert!(log.load_more(100));
         assert!(!log.has_more_history());

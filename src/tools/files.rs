@@ -15,7 +15,7 @@ use super::text::{truncate, truncate_to};
 use crate::constants::tools::{
     BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, MAX_LISTED_FILES, SKIPPED_DIRS, SKIPPED_ROOT_DIRS,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -157,10 +157,10 @@ pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<Strin
         // but a symlink in the final component would still be followed by
         // `std::fs::write`. Refuse to write through any existing symlink so the
         // agent can never modify a file outside the workspace.
-        if let Ok(metadata) = std::fs::symlink_metadata(&file) {
-            if metadata.file_type().is_symlink() {
-                bail!("refusing to write through symlink: {}", file.display());
-            }
+        if let Ok(metadata) = std::fs::symlink_metadata(&file)
+            && metadata.file_type().is_symlink()
+        {
+            bail!("refusing to write through symlink: {}", file.display());
         }
         file
     } else {
@@ -269,10 +269,10 @@ pub(crate) fn grep_files(
             continue;
         }
         // Skip obvious binary files by sniffing for NUL bytes.
-        if let Ok(data) = std::fs::read(entry.path()) {
-            if data.iter().take(BINARY_SNIFF_BYTES).any(|&byte| byte == 0) {
-                continue;
-            }
+        if let Ok(data) = std::fs::read(entry.path())
+            && data.iter().take(BINARY_SNIFF_BYTES).any(|&byte| byte == 0)
+        {
+            continue;
         }
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;

@@ -16,9 +16,9 @@
 //! - Ratatui `Paragraph::scroll`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 //! - Ratatui `Scrollbar`/`ScrollbarState`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
+use super::ScrollMode;
 use super::app::App;
 use super::text_wrapped_height;
-use super::ScrollMode;
 use crate::constants::tui::{CHAT_SCROLL_STEP, LOG_LOAD_CHUNK};
 
 impl App {

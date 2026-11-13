@@ -14,7 +14,7 @@ use crate::constants::commands::{OLLAMA_INSTALL_SCRIPT_URL, SETUP_START_POLL_ATT
 use crate::model_select::calculate_memory_budget;
 use crate::models;
 use crate::ollama::OllamaClient;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::process::Stdio;
 
 /// One-command onboarding: install/start Ollama and pull a recommended model.
@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_with_status_pulls_fallback_when_missing() {
-        use crate::test_support::{spawn_mock_server, MockResponse};
+        use crate::test_support::{MockResponse, spawn_mock_server};
         use std::sync::{Arc, Mutex};
 
         let base_url = spawn_mock_server(|path| match path {

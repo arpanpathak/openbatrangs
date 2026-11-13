@@ -18,9 +18,9 @@
 
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{execute_tool_or_report_error, print_changed_files};
-use super::quality::{command_succeeded, requires_file_work, FileWorkGate};
+use super::quality::{FileWorkGate, command_succeeded, requires_file_work};
 use super::tool::{Tool, ToolCall};
-use super::{effective_context, AgentConfig, Confirmer, HistorySink, Reporter, RunContinuation};
+use super::{AgentConfig, Confirmer, HistorySink, Reporter, RunContinuation, effective_context};
 use crate::constants::agent::{
     AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
     MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, NATIVE_SYSTEM_PROMPT,
@@ -28,7 +28,7 @@ use crate::constants::agent::{
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Whether the loop should keep going after one model turn.
 enum Progress {
@@ -1134,9 +1134,11 @@ mod tests {
         let body = request_body("m", &messages, 8192, true);
 
         assert_eq!(body["tool_choice"], json!("required"));
-        assert!(body["tools"]
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty()));
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        );
     }
 
     #[test]

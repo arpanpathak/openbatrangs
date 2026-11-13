@@ -30,7 +30,7 @@ use crate::constants::ollama::{
     API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
     HTTP_TIMEOUT_SECONDS,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Duration;
@@ -450,7 +450,7 @@ impl OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{spawn_mock_server, MockResponse};
+    use crate::test_support::{MockResponse, spawn_mock_server};
 
     #[test]
     fn client_strips_trailing_slashes_from_base_url() {
@@ -727,8 +727,10 @@ mod tests {
         };
         assert!(openai(true));
         assert!(!openai(false));
-        assert!(!OllamaClient::new("http://127.0.0.1:11434")
-            .unwrap()
-            .requests_thinking());
+        assert!(
+            !OllamaClient::new("http://127.0.0.1:11434")
+                .unwrap()
+                .requests_thinking()
+        );
     }
 }

@@ -301,10 +301,10 @@ fn unescape_json_string(raw: &str) -> String {
             Some('u') => {
                 let hex: String = chars.clone().take(4).collect();
                 if hex.len() == 4 && hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(character) = char::from_u32(code) {
-                            out.push(character);
-                        }
+                    if let Ok(code) = u32::from_str_radix(&hex, 16)
+                        && let Some(character) = char::from_u32(code)
+                    {
+                        out.push(character);
                     }
                     for _ in 0..4 {
                         let _ = chars.next();

@@ -21,7 +21,7 @@
 //! - ReAct: reasoning + acting: <https://arxiv.org/abs/2210.03629>
 
 use crate::constants::agent::{DEFAULT_GREP_MAX_RESULTS, DEFAULT_READ_CHARS};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
