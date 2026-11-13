@@ -54,13 +54,13 @@ pub(super) enum ScrollMode {
 }
 
 use crate::cli::Cli;
-use crate::constants::tui::{MAX_BACKGROUND_EVENTS_PER_FRAME, TICK_MILLIS};
+use crate::constants::tui::{KEYBOARD_FLAGS, MAX_BACKGROUND_EVENTS_PER_FRAME, TICK_MILLIS};
 use crate::ollama::OllamaClient;
 use crate::perf::TegrastatsGuard;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -122,11 +122,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
+        PushKeyboardEnhancementFlags(KEYBOARD_FLAGS)
     );
     entered?;
 
