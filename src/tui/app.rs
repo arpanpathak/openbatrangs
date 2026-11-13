@@ -1876,7 +1876,7 @@ mod tests {
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
         assert!(
-            !app.log.iter().any(|line| line.contains("Cancelled")),
+            !app.log.text().contains("Cancelled"),
             "idle Ctrl+C must not log a fake cancel"
         );
     }

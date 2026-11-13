@@ -12,7 +12,8 @@
 use anyhow::Result;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 /// One installed coding model, as `/api/tags` lists it.
@@ -98,6 +99,37 @@ fn ollama_route(path: &str) -> (u16, String) {
 /// An OpenAI-compatible server that lists one model.
 fn openai_route(_path: &str) -> (u16, String) {
     (200, r#"{"data":[{"id":"gemma"}]}"#.to_string())
+}
+
+/// The first chat reply of [`tool_call_route`]: one `run_command` call, as an
+/// OpenAI server streams it.
+const RUN_COMMAND_STREAM: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+    "\"type\":\"function\",\"function\":{\"name\":\"run_command\",",
+    "\"arguments\":\"{\\\"command\\\":\\\"echo confirmed-by-y\\\"}\"}}]}}]}\n\n",
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// Chat requests [`tool_call_route`] has answered so far.
+static TOOL_CALL_CHATS: AtomicUsize = AtomicUsize::new(0);
+
+/// An OpenAI server whose first chat reply asks to run a command and whose
+/// later chat replies fail, so the run stops after one confirmed tool call.
+fn tool_call_route(path: &str) -> (u16, String) {
+    match path {
+        "/v1/models" => (200, r#"{"data":[{"id":"gemma"}]}"#.to_string()),
+        "/v1/chat/completions" => tool_call_chat(),
+        _ => (404, "not found".to_string()),
+    }
+}
+
+/// The reply to one chat request of [`tool_call_route`].
+fn tool_call_chat() -> (u16, String) {
+    match TOOL_CALL_CHATS.fetch_add(1, Ordering::SeqCst) {
+        0 => (200, RUN_COMMAND_STREAM.to_string()),
+        _ => (500, "chat is down".to_string()),
+    }
 }
 
 /// Path of the compiled binary under test.
@@ -284,5 +316,57 @@ fn missing_key_file_is_reported() -> Result<()> {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains("cannot read the access key"));
+    Ok(())
+}
+
+/// With `--confirm`, a tool call waits for an answer on standard input, and
+/// `y` lets the command run.
+#[test]
+fn confirm_runs_the_command_after_y() -> Result<()> {
+    let server = MockServer::start(tool_call_route)?;
+    let openai_url = format!("{}/v1", server.url());
+    let workspace_arg = empty_workspace("confirm")?;
+
+    let mut child = Command::new(bin())
+        .args([
+            "--openai-url",
+            &openai_url,
+            "--confirm",
+            "--cwd",
+            &workspace_arg,
+        ])
+        .args(["--max-steps", "2", "print", "a", "word"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin pipe"))?
+        .write_all(b"y\n")?;
+    let output = child.wait_with_output()?;
+    let printed = stdout(&output);
+
+    assert!(printed.contains("[y/N]"), "stdout: {printed}");
+    assert!(printed.contains("confirmed-by-y"), "stdout: {printed}");
+    Ok(())
+}
+
+/// The TUI starts in a pseudo-terminal, quits on `/exit`, and gives the
+/// terminal back. `script` from util-linux provides the pseudo-terminal.
+#[cfg(target_os = "linux")]
+#[test]
+fn tui_starts_in_a_terminal_and_quits_on_exit() -> Result<()> {
+    let server = MockServer::start(ollama_route)?;
+    let tui_command = format!("{} --ollama-url {}", bin(), server.url());
+    let session = format!(
+        "(sleep 2; printf '/exit\\r'; sleep 2) | timeout 20 script -qec '{tui_command}' /dev/null"
+    );
+
+    let output = Command::new("sh").args(["-c", &session]).output()?;
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
     Ok(())
 }

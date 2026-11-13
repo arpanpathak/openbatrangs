@@ -112,7 +112,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
 
     let mut stdout = stdout();
-    execute!(
+    let entered = execute!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
@@ -121,7 +121,8 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
-    )?;
+    );
+    entered?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
@@ -133,13 +134,14 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
 /// Restore the terminal to its original state after the TUI exits.
 fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     terminal.show_cursor()?;
-    execute!(
+    let left = execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
-    )?;
+    );
+    left?;
     disable_raw_mode()?;
 
     println!("👋 Bye!");
