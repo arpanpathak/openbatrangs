@@ -85,12 +85,6 @@ pub(crate) struct Cli {
     #[arg(long = "searxng-url", global = true, env = "OPENBATRANGS_SEARXNG_URL")]
     pub(crate) searxng_url: Option<String>,
 
-    /// One-shot runs only: when the run ends, write the model, the tool
-    /// definitions, the whole conversation, the outcome and the step count
-    /// to this file as one JSON object.
-    #[arg(long = "transcript-out", global = true, value_name = "PATH")]
-    pub(crate) transcript_out: Option<PathBuf>,
-
     /// Do not check for a newer release when openBatarangs starts.
     /// `OPENBATRANGS_NO_UPDATE_CHECK=1` does the same; `openbatrangs update`
     /// still checks.
@@ -150,7 +144,6 @@ mod tests {
         assert!(!cli.is_read_only);
         assert!(!cli.should_confirm);
         assert!(!cli.is_auto_pull_disabled);
-        assert!(cli.transcript_out.is_none());
         assert!(cli.command.is_none());
     }
 
@@ -187,14 +180,6 @@ mod tests {
             cli.command,
             Some(Commands::Agent { task }) if task == ["write", "tests"]
         ));
-    }
-
-    #[test]
-    fn parses_the_transcript_path() {
-        let cli = Cli::parse_from(["openbatrangs", "--transcript-out", "run.json", "say", "hi"]);
-
-        assert_eq!(cli.transcript_out, Some(PathBuf::from("run.json")));
-        assert_eq!(cli.task, vec!["say", "hi"]);
     }
 
     #[test]

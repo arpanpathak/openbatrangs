@@ -220,7 +220,6 @@ async fn run_tool_agent(
         messages: prior.resume,
         earlier: earlier_turns(prior.chat),
         sink: Some(&mut history),
-        transcript: None,
     };
 
     run_agent(
