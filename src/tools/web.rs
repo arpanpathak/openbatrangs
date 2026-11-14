@@ -5,10 +5,14 @@
 //! machine than openBatarangs (e.g. next to a remote model server).
 use anyhow::{Context, Result, bail};
 use regex::Regex;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::{Action, Attempt, Policy};
-use reqwest::{Client, RequestBuilder, Response, Url};
+use reqwest::{Client, ClientBuilder, RequestBuilder, Response, Url};
 use serde_json::Value;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::error::Error;
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The most of a page that is read; a longer page is cut here, not refused.
@@ -115,7 +119,7 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 /// Read a public web page, usually one returned by search.
 pub(crate) async fn web_read(url: &str) -> Result<String> {
     let page_url = public_page_url(url)?;
-    let client = http_client(is_public_web_url)?;
+    let client = web_read_client()?;
 
     read_page(&client, page_url).await
 }
@@ -369,17 +373,66 @@ fn is_local_name(host: &str) -> bool {
     [host.is_empty(), host == "localhost", has_local_suffix].contains(&true)
 }
 
-/// HTTP client for research requests: a short timeout, and redirects followed
-/// only to URLs that `allows` accepts, which is [`is_public_web_url`] outside
-/// tests. Documentation sites often redirect (`/latest/` to a version), and
-/// refusing every redirect failed those reads.
+/// HTTP client for research requests, built by [`client_builder`].
 fn http_client(allows: fn(&Url) -> bool) -> Result<Client> {
+    Ok(client_builder(allows).build()?)
+}
+
+/// HTTP client for `web_read`: it resolves host names with
+/// [`PublicOnlyResolver`], so the page and every redirect target are fetched
+/// only from public addresses.
+fn web_read_client() -> Result<Client> {
+    Ok(client_builder(is_public_web_url)
+        .dns_resolver(Arc::new(PublicOnlyResolver))
+        .build()?)
+}
+
+/// Client settings for research requests: a short timeout, and redirects
+/// followed only to URLs that `allows` accepts, which is [`is_public_web_url`]
+/// outside tests. Documentation sites often redirect (`/latest/` to a
+/// version), and refusing every redirect failed those reads.
+fn client_builder(allows: fn(&Url) -> bool) -> ClientBuilder {
     let redirects = Policy::custom(move |attempt| redirect_action(attempt, allows));
 
-    Ok(Client::builder()
+    Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(redirects)
-        .build()?)
+}
+
+/// DNS resolver for `web_read`. It resolves a host name once and refuses it
+/// when any address is on this machine or a private network. reqwest connects
+/// only to the addresses it returns, so a second DNS answer cannot send the
+/// request somewhere else (DNS rebinding).
+struct PublicOnlyResolver;
+
+impl Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(public_addresses(name.as_str().to_string()))
+    }
+}
+
+/// The addresses of `host`, or an error when any of them is local.
+async fn public_addresses(host: String) -> Result<Addrs, Box<dyn Error + Send + Sync>> {
+    let addresses = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+    let checked = only_public(&host, addresses)?;
+
+    Ok(Box::new(checked.into_iter()))
+}
+
+/// `addresses` unchanged when none of them is local, else an error that
+/// names `host`.
+fn only_public(host: &str, addresses: Vec<SocketAddr>) -> std::io::Result<Vec<SocketAddr>> {
+    if addresses
+        .iter()
+        .any(|address| is_local_address(address.ip()))
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{host} resolves to a local address"),
+        ));
+    }
+
+    Ok(addresses)
 }
 
 /// An error after [`MAX_REDIRECTS`] redirects, else follow the redirect
@@ -643,6 +696,68 @@ mod tests {
 
         assert_eq!(followed, "arrived");
         assert_eq!(stopped, "", "a redirect to this machine is not followed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_to_this_machine_is_refused() -> Result<()> {
+        let base_url =
+            spawn_raw_server(|_path| response("200 OK", "text/plain", "private")).await?;
+        let mut page = Url::parse(&base_url)?;
+        page.set_host(Some("localhost"))?;
+
+        let outcome = read_page(&web_read_client()?, page).await;
+
+        assert!(
+            format!("{outcome:?}").contains("localhost resolves to a local address"),
+            "{outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_public_host_resolves_to_its_addresses() -> Result<()> {
+        // An address literal resolves to itself without a DNS server.
+        let resolved = public_addresses("93.184.216.34".to_string()).await;
+
+        let addresses: Vec<SocketAddr> = resolved.map_err(anyhow::Error::from_boxed)?.collect();
+
+        assert_eq!(
+            addresses,
+            vec![on_port_zero(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+        Ok(())
+    }
+
+    /// `address` on port 0, the port the resolver asks for.
+    fn on_port_zero(address: impl Into<IpAddr>) -> SocketAddr {
+        SocketAddr::new(address.into(), 0)
+    }
+
+    #[test]
+    fn resolved_addresses_are_kept_only_when_all_are_public() -> Result<()> {
+        let public_v4 = on_port_zero(Ipv4Addr::new(93, 184, 216, 34));
+        let public_v6 = on_port_zero(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111));
+        let local_sets = [
+            vec![public_v4, on_port_zero(Ipv4Addr::new(10, 0, 0, 5))],
+            vec![on_port_zero(Ipv4Addr::UNSPECIFIED)],
+            vec![on_port_zero(Ipv6Addr::LOCALHOST)],
+            vec![on_port_zero(Ipv6Addr::UNSPECIFIED)],
+            vec![on_port_zero(Ipv6Addr::new(0xfd12, 0, 0, 0, 0, 0, 0, 1))],
+            vec![on_port_zero(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))],
+            vec![on_port_zero(
+                Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped(),
+            )],
+        ];
+
+        let kept = only_public("example.com", vec![public_v4, public_v6])?;
+
+        assert_eq!(kept, vec![public_v4, public_v6]);
+        assert!(
+            local_sets
+                .into_iter()
+                .all(|addresses| only_public("example.com", addresses).is_err())
+        );
         Ok(())
     }
 
