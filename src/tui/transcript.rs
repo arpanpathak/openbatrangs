@@ -15,7 +15,7 @@
 use super::block::{Answer, Block, BlockContent, Part, Step, ToolOutcome};
 use super::session::BlockStore;
 use super::text::{spans_text, strip_ansi};
-use crate::agent::{AgentEvent, TextKind};
+use crate::agent::{AgentEvent, TextKind, step_limit_notice};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use std::collections::VecDeque;
@@ -167,6 +167,9 @@ impl Transcript {
             }),
             AgentEvent::Notice(text) => self.push_notice(notice_lines(&text)),
             AgentEvent::AskUser { question } => self.end_with(BlockContent::Question(question)),
+            AgentEvent::StepLimitReached { max_steps } => {
+                self.push_notice(notice_lines(&step_limit_notice(max_steps)))
+            }
             AgentEvent::Finished {
                 answer,
                 changed_files,

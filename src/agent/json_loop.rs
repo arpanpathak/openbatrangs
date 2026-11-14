@@ -404,10 +404,9 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
 
     /// Warn that the step budget ran out without an answer.
     fn give_up(&mut self) -> State {
-        self.reporter.notice(format!(
-            "\n⚠️  Reached max steps ({}) without a final answer.",
-            self.config.max_steps
-        ));
+        self.reporter.report(AgentEvent::StepLimitReached {
+            max_steps: self.config.max_steps,
+        });
 
         State::Done
     }

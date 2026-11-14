@@ -90,6 +90,11 @@ pub enum AgentEvent {
         /// The question to show.
         question: String,
     },
+    /// The run used every step without a final answer.
+    StepLimitReached {
+        /// Step budget of the run.
+        max_steps: usize,
+    },
     /// The run ended with an answer.
     Finished {
         /// The final answer.
@@ -133,6 +138,12 @@ impl Reporter for StdoutReporter {
     }
 }
 
+/// The warning shown when a run used all `max_steps` steps without a final
+/// answer.
+pub fn step_limit_notice(max_steps: usize) -> String {
+    format!("\n⚠️  Reached max steps ({max_steps}) without a final answer.")
+}
+
 impl StdoutReporter {
     /// The terminal text for `event`.
     pub(super) fn render(&mut self, event: AgentEvent) -> String {
@@ -151,6 +162,9 @@ impl StdoutReporter {
             AgentEvent::ToolResult { output, .. } => self.tool_result(&output),
             AgentEvent::Notice(text) => format!("{text}\n"),
             AgentEvent::AskUser { question } => format!("\n❓ {question}\n"),
+            AgentEvent::StepLimitReached { max_steps } => {
+                format!("{}\n", step_limit_notice(max_steps))
+            }
             AgentEvent::Finished {
                 answer,
                 answer_was_streamed,
