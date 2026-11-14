@@ -22,8 +22,9 @@ use super::research::task_with_documentation;
 use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
 use super::{
-    AgentConfig, AgentEvent, Confirmer, LoopKind, Reporter, RunContinuation, compact_context,
-    earlier_turns_section, effective_context, ensure_workspace_exists, max_output_tokens,
+    AgentConfig, AgentEvent, Confirmer, HistorySink, LoopKind, Reporter, RunContinuation,
+    compact_context, earlier_turns_section, effective_context, ensure_workspace_exists,
+    max_output_tokens,
 };
 use crate::constants::agent::{
     AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
@@ -119,6 +120,9 @@ struct JsonRun<'a, R, C> {
     finish_gate: FinishGate,
     /// Stops a model that repeats the same tool call.
     repeat_guard: RepeatGuard,
+    /// Receives the compacted history when the run ends. Messages removed
+    /// by compaction are not included.
+    transcript: Option<&'a mut dyn HistorySink>,
     /// Receives the run's events.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
@@ -148,7 +152,11 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
 
     let context_cap = config.max_ctx.or(client.default_context_cap());
     let num_ctx = effective_context(config.model_context, context_cap);
-    let earlier = continuation.map(|run| run.earlier).unwrap_or_default();
+    let RunContinuation {
+        earlier,
+        transcript,
+        ..
+    } = continuation.unwrap_or_default();
     let task_with_docs = task_with_documentation(task, config, reporter).await;
     let opening = Opening {
         task: &task_with_docs,
@@ -166,6 +174,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         changed_files: Vec::new(),
         finish_gate: FinishGate::default(),
         repeat_guard: RepeatGuard::default(),
+        transcript,
         reporter,
         confirmer,
     };
@@ -206,8 +215,32 @@ fn warn_when_resume_is_unsupported<R: Reporter>(
 }
 
 impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
-    /// Move from state to state until the run is over.
+    /// Runs the state machine to completion, then publishes the history to
+    /// the transcript sink. Publishes on every outcome, including errors.
     async fn run(mut self) -> Result<()> {
+        let result = self.run_states().await;
+        self.save_transcript();
+
+        result
+    }
+
+    /// Publishes the history as `role`/`content` pairs to the transcript
+    /// sink. Does nothing when no sink is attached.
+    fn save_transcript(&mut self) {
+        let Some(transcript) = &mut self.transcript else {
+            return;
+        };
+
+        let conversation = self
+            .messages
+            .iter()
+            .filter_map(|message| serde_json::to_value(message).ok())
+            .collect();
+        transcript.save(conversation);
+    }
+
+    /// Advances the state machine until it reaches a terminal state.
+    async fn run_states(&mut self) -> Result<()> {
         let mut state = State::Ask;
 
         loop {
@@ -855,6 +888,48 @@ mod tests {
         result?;
         assert!(output.contains("looked"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_transcript_gets_the_roles_and_contents_the_loop_kept() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-json-transcript");
+        let replies = vec![
+            Reply::ollama_stream(r#"{"tool":"list_files","args":{}}"#),
+            Reply::ollama_stream(r#"{"answer":"nothing here"}"#),
+        ];
+        let url = serve_replies(replies).await?;
+        let client = OllamaClient::new(&url)?;
+        let config = test_config(&root, 3);
+        let mut transcript = RecordingSink::default();
+        let continuation = RunContinuation {
+            transcript: Some(&mut transcript),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_json_agent(
+            &config,
+            &client,
+            "m",
+            "look around",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let saved = transcript.snapshots.concat();
+        let roles: Vec<&serde_json::Value> = saved.iter().map(|message| &message["role"]).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert!(
+            saved[2]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("list_files"))
+        );
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
