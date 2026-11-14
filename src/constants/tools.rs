@@ -70,6 +70,11 @@ pub const MAX_TOOL_OUTPUT: usize = 20_000;
 /// Minimum shell timeout in seconds (avoids instant timeout bugs).
 pub const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
 
+/// How long `run_command` keeps reading a pipe after the command's process
+/// group has been stopped. The pipes normally close at once; only a process
+/// that left the group, such as one started with `setsid`, keeps one open.
+pub const COMMAND_OUTPUT_GRACE_MILLISECONDS: u64 = 500;
+
 /// Prefix of the exit-status line `run_command` appends to its output; the
 /// finished line reads `[exit code 0]`, `[exit code 101]`, and so on.
 pub const EXIT_CODE_PREFIX: &str = "[exit code ";
