@@ -15,18 +15,48 @@
 //! - Unix environment variables: <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html>
 
 use super::text::truncate;
-use crate::constants::tools::{EXIT_CODE_PREFIX, MIN_COMMAND_TIMEOUT_SECONDS};
+use crate::constants::tools::{
+    COMMAND_OUTPUT_GRACE_MILLISECONDS, EXIT_CODE_PREFIX, MIN_COMMAND_TIMEOUT_SECONDS,
+};
 use anyhow::{Context, Result, anyhow};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Child;
+use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
+
+/// A pipe being read to its end on its own task.
+type PipeReader = JoinHandle<std::io::Result<Vec<u8>>>;
+
+/// What waiting for the shell under a timeout gives back.
+type WaitOutcome = Result<std::io::Result<ExitStatus>, Elapsed>;
+
+/// A started shell, the id of its process group, and the tasks reading its
+/// stdout and stderr.
+struct RunningShell {
+    /// The `bash` process, leader of its own process group.
+    shell: Child,
+    /// The process group id, which equals the shell's process id.
+    process_group: u32,
+    /// Reads the shell's stdout.
+    stdout: PipeReader,
+    /// Reads the shell's stderr.
+    stderr: PipeReader,
+}
 
 /// Run a shell command in the workspace and capture combined output.
 ///
 /// The command is confined to the workspace for convenience: `$HOME` and common
 /// tool caches are redirected under `root/.agent/` so builds and installs do not
 /// pollute the real user home directory.
+///
+/// The shell runs in its own process group. The call returns when the shell
+/// exits, even if a background job (`server &`) still holds the output pipes
+/// open, and then stops the whole group, so neither a timeout nor a
+/// background job leaves processes running.
 ///
 /// # Arguments
 /// - `root`: working directory for the command.
@@ -38,18 +68,53 @@ use std::time::Duration;
 pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
     let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
     create_sandbox_dirs(root);
-    let mut shell = sandboxed_shell(root, command);
 
-    let output = tokio::time::timeout(timeout, shell.output())
-        .await
-        .map_err(|_elapsed| anyhow!("command timed out after {timeout_secs}s"))?
-        .context("failed to spawn shell")?;
+    let mut running = start_shell(root, command)?;
+    let waited = tokio::time::timeout(timeout, running.shell.wait()).await;
+
+    // Whether the shell exited or timed out, this ends its background jobs
+    // and grandchildren and closes the pipes they hold.
+    stop_process_group(running.process_group).await;
+
+    let output = Output {
+        status: exit_status(waited, timeout_secs)?,
+        stdout: collect_output(running.stdout).await,
+        stderr: collect_output(running.stderr).await,
+    };
 
     Ok(truncate(command_report(&output)))
 }
 
+/// The shell's exit status, or an error when it timed out after
+/// `timeout_secs` or could not be waited for.
+fn exit_status(waited: WaitOutcome, timeout_secs: u64) -> Result<ExitStatus> {
+    waited
+        .map_err(|_elapsed| anyhow!("command timed out after {timeout_secs}s"))?
+        .context("failed to wait for shell")
+}
+
+/// Spawn the sandboxed shell for `command` and start reading its pipes.
+fn start_shell(root: &Path, command: &str) -> Result<RunningShell> {
+    let mut shell = sandboxed_shell(root, command)
+        .spawn()
+        .context("failed to spawn shell")?;
+
+    let pipes = shell.stdout.take().zip(shell.stderr.take());
+    let (process_group, (stdout, stderr)) = shell
+        .id()
+        .zip(pipes)
+        .context("the shell has no process id or output pipes")?;
+
+    Ok(RunningShell {
+        shell,
+        process_group,
+        stdout: read_in_background(stdout),
+        stderr: read_in_background(stderr),
+    })
+}
+
 /// A `bash -lc` process for `command`, run in `root` with the sandbox
-/// environment.
+/// environment, as the leader of a new process group.
 fn sandboxed_shell(root: &Path, command: &str) -> tokio::process::Command {
     let mut shell = tokio::process::Command::new("bash");
 
@@ -60,17 +125,64 @@ fn sandboxed_shell(root: &Path, command: &str) -> tokio::process::Command {
         // A command that reads input, such as git asking for a username, gets
         // end-of-file at once. With the TUI's stdin, it would wait for keys
         // that the TUI keeps for itself, and the agent would freeze.
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // git fails with an error in place of asking for a username or password.
         .env("GIT_TERMINAL_PROMPT", "0")
-        // If the timeout fires, the `Child` is dropped and must take the
-        // shell (and its descendants) down with it instead of leaving an
-        // orphaned command running in the background.
+        // The shell and everything it starts share one group, which
+        // `stop_process_group` ends with a single signal.
+        .process_group(0)
+        // If the agent drops the call before it finishes, the shell at least
+        // does not outlive it.
         .kill_on_drop(true)
         .envs(agent_sandbox_env(root))
         .envs(host_tool_env());
 
     shell
+}
+
+/// Read `pipe` to its end on a separate task, so a command with a lot of
+/// output never blocks on a full pipe while the shell is still running.
+fn read_in_background(mut pipe: impl AsyncRead + Unpin + Send + 'static) -> PipeReader {
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+
+        pipe.read_to_end(&mut bytes).await.map(|_byte_count| bytes)
+    })
+}
+
+/// What `reader` read, once its pipe closes or the grace period ends.
+///
+/// A pipe still open after the grace period, or one that failed, gives no
+/// output instead of holding up the call.
+async fn collect_output(reader: PipeReader) -> Vec<u8> {
+    let grace = Duration::from_millis(COMMAND_OUTPUT_GRACE_MILLISECONDS);
+
+    tokio::time::timeout(grace, reader)
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .and_then(|read| read.ok())
+        .unwrap_or_default()
+}
+
+/// Send `SIGKILL` to every process in `process_group`.
+///
+/// It runs `kill` rather than calling `killpg`, which needs `unsafe` or a
+/// new crate. A group that has already ended makes `kill` fail, which is the
+/// outcome wanted, so its status is not checked.
+async fn stop_process_group(process_group: u32) {
+    let group_target = format!("-{process_group}");
+
+    tokio::process::Command::new("kill")
+        .args(["-s", "KILL", "--", &group_target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .ok();
 }
 
 /// The text handed back to the model: stdout, then stderr under a
@@ -295,6 +407,54 @@ mod tests {
         assert!(
             !root.join("done").exists(),
             "timed-out command must not keep running after the timeout"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_stops_the_whole_process_group() -> Result<()> {
+        let root = temp_dir();
+
+        // The inner `sh` is a grandchild of the agent. Killing only `bash`
+        // leaves it running, and it touches `done` after the sleep.
+        let finished = run_command(&root, "sh -c 'sleep 2; touch done'; true", 1).await;
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        assert!(finished.is_err());
+        assert!(
+            !root.join("done").exists(),
+            "a grandchild outlived the timeout"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_background_job_does_not_hold_the_command_open() -> Result<()> {
+        let root = temp_dir();
+
+        let output = run_command(&root, "sleep 30 & echo started", 3).await?;
+
+        assert!(output.contains("started"), "{output}");
+        assert!(output.contains("[exit code 0]"), "{output}");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_background_job_ends_with_its_command() -> Result<()> {
+        let root = temp_dir();
+
+        run_command(&root, "(sleep 2; touch late) & echo started", 5).await?;
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        assert!(
+            !root.join("late").exists(),
+            "a background job outlived its command"
         );
 
         fs::remove_dir_all(root)?;
