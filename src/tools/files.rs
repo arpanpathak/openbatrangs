@@ -251,8 +251,7 @@ fn write_target(root: &Path, file: PathBuf) -> Result<PathBuf> {
 /// `file`'s name joined to the canonical form of `parent`, after creating
 /// `parent` and checking that it lies inside the workspace.
 fn target_in_parent(root: &Path, parent: &Path, file: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create parent dirs for {}", file.display()))?;
+    create_parent_inside_root(root, parent, file)?;
     let canonical_parent = ensure_canonical_within_root(root, parent)?;
 
     // Parent-directory symlinks are already rejected by canonicalization,
@@ -262,6 +261,25 @@ fn target_in_parent(root: &Path, parent: &Path, file: &Path) -> Result<PathBuf> 
     let target = canonical_parent.join(file.file_name().unwrap_or_default());
 
     refuse_symlink(target, "write")
+}
+
+/// Create `parent` and its missing ancestors for writing `file`, after
+/// checking that the part of `parent` that already exists lies inside the
+/// workspace. A symlink that leads outside is refused before any folder is
+/// made behind it.
+fn create_parent_inside_root(root: &Path, parent: &Path, file: &Path) -> Result<()> {
+    ensure_canonical_within_root(root, deepest_existing_ancestor(parent))?;
+
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent dirs for {}", file.display()))
+}
+
+/// The deepest of `path` and its ancestors that exists, a symlink counted
+/// as existing even when its target is missing; `path` itself when none do.
+fn deepest_existing_ancestor(path: &Path) -> &Path {
+    path.ancestors()
+        .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        .unwrap_or(path)
 }
 
 /// Replace a literal string inside an existing file.
@@ -290,9 +308,10 @@ pub(crate) fn edit_file(
     refuse_empty_old_string(old_string)?;
     let file = editable_file(root, path)?;
     let content = fs::read_to_string(&file).context("failed to read file (may be binary)")?;
-    let replacements = replacement_count(&content, old_string, path, replace_all)?;
+    let (old_string, new_string) = with_file_line_endings(&content, old_string, new_string);
+    let replacements = replacement_count(&content, &old_string, path, replace_all)?;
 
-    let updated = replaced_text(&content, old_string, new_string, replace_all);
+    let updated = replaced_text(&content, &old_string, &new_string, replace_all);
     fs::write(&file, updated).with_context(|| format!("failed to write {}", file.display()))?;
 
     Ok(edit_summary(path, replacements))
@@ -315,6 +334,29 @@ fn refuse_empty_old_string(old_string: &str) -> Result<()> {
     Ok(())
 }
 
+/// `old_string` and `new_string` written with CRLF line endings when
+/// `content` uses CRLF and does not contain `old_string` as given, else both
+/// unchanged. Models write `\n`, so without this a multi-line edit of a
+/// CRLF file is never found.
+fn with_file_line_endings(content: &str, old_string: &str, new_string: &str) -> (String, String) {
+    if !needs_crlf(content, old_string) {
+        return (old_string.to_string(), new_string.to_string());
+    }
+
+    (with_crlf(old_string), with_crlf(new_string))
+}
+
+/// Whether an edit tries CRLF line endings: `content` uses CRLF and does not
+/// contain `old_string` as given.
+fn needs_crlf(content: &str, old_string: &str) -> bool {
+    !content.contains(old_string) && content.contains("\r\n")
+}
+
+/// `text` with every line ending written as CRLF.
+fn with_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 /// How many places an edit replaces, or an error when `old_string` is
 /// missing, or appears more than once without `replace_all`.
 fn replacement_count(
@@ -323,18 +365,29 @@ fn replacement_count(
     path: &str,
     replace_all: bool,
 ) -> Result<usize> {
-    let occurrences = content.matches(old_string).count();
+    let occurrences = overlapping_count(content, old_string);
 
     match (occurrences, replace_all) {
         (0, _) => {
             bail!("old_string was not found in {path}; re-read the file and copy the exact text")
         }
         (1, _) => Ok(1),
-        (_, true) => Ok(occurrences),
+        // `str::replace` replaces only matches that do not overlap.
+        (_, true) => Ok(content.matches(old_string).count()),
         (_, false) => bail!(
             "old_string appears {occurrences} times in {path}; add surrounding context or pass replace_all=true"
         ),
     }
+}
+
+/// How many places in `content` start a match of `old_string`, counting
+/// matches that overlap. `"}\n}\n"` occurs twice in `"}\n}\n}\n"`, so an edit
+/// of it is ambiguous, although `str::matches` finds it only once.
+fn overlapping_count(content: &str, old_string: &str) -> usize {
+    content
+        .char_indices()
+        .filter(|(start, _character)| content[*start..].starts_with(old_string))
+        .count()
 }
 
 /// `content` with every occurrence of `old_string` replaced when
@@ -677,6 +730,70 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn edit_file_counts_overlapping_matches() -> Result<()> {
+        let root = temp_dir();
+        let content = "fn f() {\n    }\n}\n}\n";
+        fs::write(root.join("lib.rs"), content)?;
+
+        let ambiguous = edit_file(&root, "lib.rs", "}\n}\n", "", false);
+
+        assert!(format!("{ambiguous:?}").contains("appears 2 times"));
+        assert_eq!(fs::read_to_string(root.join("lib.rs"))?, content);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replace_all_reports_the_replacements_it_makes() -> Result<()> {
+        let root = temp_dir();
+        fs::write(root.join("lib.rs"), "aaa")?;
+
+        let confirmation = edit_file(&root, "lib.rs", "aa", "b", true)?;
+
+        assert_eq!(confirmation, "✅ edited lib.rs (1 replacement)");
+        assert_eq!(fs::read_to_string(root.join("lib.rs"))?, "ba");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn edit_file_edits_a_crlf_file_with_a_multi_line_old_string() -> Result<()> {
+        let root = temp_dir();
+        fs::write(root.join("lib.rs"), "fn a() {\r\n    old();\r\n}\r\n")?;
+
+        edit_file(
+            &root,
+            "lib.rs",
+            "{\n    old();\n}",
+            "{\n    new();\n}",
+            false,
+        )?;
+
+        assert_eq!(
+            fs::read_to_string(root.join("lib.rs"))?,
+            "fn a() {\r\n    new();\r\n}\r\n"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn edit_file_keeps_an_exact_match_in_a_mixed_line_ending_file() -> Result<()> {
+        let root = temp_dir();
+        fs::write(root.join("lib.rs"), "a\r\nold\nline\n")?;
+
+        edit_file(&root, "lib.rs", "old\nline", "new\nline", false)?;
+
+        assert_eq!(fs::read_to_string(root.join("lib.rs"))?, "a\r\nnew\nline\n");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn edit_file_reports_a_file_it_cannot_write() -> Result<()> {
@@ -803,6 +920,25 @@ mod tests {
         assert!(grep_files(&root, "secret", "escape", 10).is_err());
         assert!(write_file(&root, "escape/new.txt", "x").is_err());
         assert!(edit_file(&root, "escape/secret.txt", "secret", "x", false).is_err());
+
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_write_creates_no_folders_outside_the_workspace() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir();
+        let outside = temp_dir();
+        symlink(&outside, root.join("link"))?;
+
+        let written = write_file(&root, "link/made/by/agent/x.txt", "x");
+
+        assert!(format!("{written:?}").contains("escapes the workspace"));
+        assert!(!outside.join("made").exists());
 
         fs::remove_dir_all(root)?;
         fs::remove_dir_all(outside)?;

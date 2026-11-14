@@ -24,8 +24,9 @@ pub const CACHE_FOLDER_NAME: &str = "openbatrangs";
 /// File in that folder that records the time and result of the last check.
 pub const CACHE_FILE_NAME: &str = "update-check.json";
 
-/// Shell command that downloads the release installer and runs it.
-pub const INSTALLER_COMMAND: &str = "curl -fsSL https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh | sh";
+/// Address of the release installer script.
+pub const INSTALLER_SCRIPT_URL: &str =
+    "https://github.com/arpanpathak/openbatrangs/releases/latest/download/install.sh";
 
 /// Environment variable that tells the installer which folder to put the
 /// binary in.
