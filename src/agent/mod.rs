@@ -17,6 +17,7 @@
 //! Responsibilities are split into focused submodules:
 //! - `reporter`: structured agent events and the stdout reporter.
 //! - `summary`: short summaries of tool results.
+//! - `repeats`: stops a model that repeats the same tool call.
 //! - `tool`: typed tool calls, argument parsing, and JSON response parsing.
 //! - `stream`: incremental JSON field streaming.
 //! - `execute`: tool execution, confirmation, and path formatting.
@@ -36,6 +37,7 @@ mod fakes;
 mod json_loop;
 mod native;
 mod quality;
+mod repeats;
 mod reporter;
 mod research;
 mod stream;
