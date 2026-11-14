@@ -1,8 +1,24 @@
 //! Ollama HTTP API constants.
 
-/// Maximum duration (seconds) for a complete HTTP request to the Ollama server.
-/// Set high (10 min) because model generation and pull operations can be slow.
-pub const HTTP_TIMEOUT_SECONDS: u64 = 600;
+use std::time::Duration;
+
+/// Longest time (seconds) the model server may stay silent: before its
+/// response starts, or between two chunks of a streamed reply.
+///
+/// It limits silence, not the whole request, so a slow reply that keeps
+/// streaming is never cut off. It is high (10 min) because loading a large
+/// model can take minutes before the first byte.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Context window asked of an Ollama server when `--max-ctx` is not given
+/// and the model's own window is larger.
+///
+/// Ollama reserves GPU memory for the whole window it is asked for, and
+/// newer models have windows of 128K tokens or more. A window that large can
+/// push the model off a 16 GB GPU onto the CPU. 32K tokens fits a mid-size
+/// model on such a GPU and is enough for most coding tasks. OpenAI-compatible
+/// servers set their window when they start, so they get no default cap.
+pub const DEFAULT_OLLAMA_CONTEXT_CAP: u64 = 32_768;
 
 /// Maximum time (seconds) to wait for the TCP handshake with the Ollama server.
 /// A short timeout ensures the CLI fails fast when Ollama is not running.

@@ -238,7 +238,8 @@ fn invocations(value: &Value) -> Vec<Invocation> {
 /// A fully assembled tool call, ready to execute.
 #[derive(Debug, Clone, Default)]
 struct Invocation {
-    /// Call id from the server; synthesized when the server omits it.
+    /// Call id from the server; [`identified_calls`] fills it in when the
+    /// server omits it.
     id: String,
     /// Tool (function) name.
     name: String,
@@ -270,6 +271,15 @@ impl Invocation {
     /// Character size of the name and arguments.
     fn char_len(&self) -> usize {
         self.name.len() + self.arguments.len()
+    }
+
+    /// This call with `fallback` as its id when it has none.
+    fn with_id(mut self, fallback: String) -> Self {
+        if self.id.is_empty() {
+            self.id = fallback;
+        }
+
+        self
     }
 
     /// Merge one streamed chunk: a non-empty id or name replaces the stored
@@ -542,13 +552,14 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// another step.
     async fn run_tools(&mut self, turn: Turn) -> State {
         let mut outcome = CallOutcome::default();
+        let calls = identified_calls(turn.calls, self.step);
         self.empty_retries = 0;
         self.messages.push(Message::Assistant {
             content: turn.content,
-            calls: turn.calls.clone(),
+            calls: calls.clone(),
         });
 
-        for call in &turn.calls {
+        for call in &calls {
             self.execute_one(call, &mut outcome).await;
         }
 
@@ -613,7 +624,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// Run one call and append its result to the conversation; a `finish`
     /// or `ask_user` call is recorded in `outcome`.
     async fn execute_one(&mut self, call: &Invocation, outcome: &mut CallOutcome) {
-        let id = call_id(call);
+        let id = call.id.clone();
 
         match parse_call(call) {
             Ok(Tool::Finish { summary }) => {
@@ -759,7 +770,8 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
     } = continuation.unwrap_or_default();
     let think = client.requests_thinking();
     let resuming = resume.is_some();
-    let num_ctx = effective_context(config.model_context, config.max_ctx);
+    let context_cap = config.max_ctx.or(client.default_context_cap());
+    let num_ctx = effective_context(config.model_context, context_cap);
 
     let opening_task = opening_task(task, config, resuming, reporter).await;
     let opening = Opening {
@@ -932,12 +944,18 @@ fn initial_user_message(config: &AgentConfig, opening: &Opening) -> String {
     }
 }
 
-/// The id for a call: the server's, or a synthesized one when it omitted it.
-fn call_id(call: &Invocation) -> String {
-    match call.id.as_str() {
-        "" => format!("call_{}", call.name),
-        id => id.to_string(),
-    }
+/// The calls of the turn at `step`, each with an id: the server's, or
+/// `call_<step>_<position>` when the server sent none.
+///
+/// The ids are set once, before the assistant message is stored, so the
+/// message and each tool result carry the same id, and two calls to the same
+/// tool get different ids.
+fn identified_calls(calls: Vec<Invocation>, step: usize) -> Vec<Invocation> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(position, call)| call.with_id(format!("call_{step}_{position}")))
+        .collect()
 }
 
 /// Turn a streamed invocation into a typed [`Tool`].
@@ -1000,7 +1018,7 @@ fn parse_text_tool_call(content: &str) -> Option<Invocation> {
 
 /// The invocation in a parsed `{"name": ..., "arguments": ...}` object.
 ///
-/// The id is left empty on purpose: `call_id` synthesizes one for calls the
+/// The id is left empty on purpose: `identified_calls` gives one to calls the
 /// server did not identify.
 fn text_invocation(value: &Value) -> Option<Invocation> {
     let name = value.get("name").and_then(Value::as_str)?;
@@ -1843,6 +1861,55 @@ mod tests {
         assert!(output.contains("🔧 write_file → a.txt"));
         assert!(output.contains("✅ wrote it"));
         assert_eq!(std::fs::read_to_string(root.join("a.txt"))?, "hello");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calls_without_an_id_get_unique_ids() {
+        let calls = vec![read_call(""), read_call("server_id"), read_call("")];
+
+        let ids: Vec<String> = identified_calls(calls, 3)
+            .into_iter()
+            .map(|call| call.id)
+            .collect();
+
+        assert_eq!(ids, vec!["call_3_0", "server_id", "call_3_2"]);
+    }
+
+    #[tokio::test]
+    async fn a_call_without_an_id_and_its_result_share_one_id() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-ids");
+        let replies = vec![
+            Reply::openai_stream(&[text_delta(r#"{"name":"list_files","arguments":{}}"#)]),
+            Reply::openai_stream(&[text_delta("nothing here")]),
+        ];
+        let url = serve_replies(replies).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let config = test_config(&root, 3);
+        let mut sink = RecordingSink::default();
+        let continuation = RunContinuation {
+            sink: Some(&mut sink),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "look around",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let last = sink.snapshots.last().context("a saved conversation")?;
+        assert_eq!(last[2]["tool_calls"][0]["id"], "call_1_0");
+        assert_eq!(last[3]["tool_call_id"], "call_1_0");
 
         std::fs::remove_dir_all(root)?;
         Ok(())

@@ -76,6 +76,9 @@ impl DeltaReader {
             Drain::Delta(delta) => ControlFlow::Break(Some(Ok(delta))),
             Drain::Done => ControlFlow::Break(None),
             Drain::NeedMore => self.read().await,
+            Drain::Error(message) => {
+                ControlFlow::Break(Some(Err(anyhow!("model server error: {message}"))))
+            }
         }
     }
 

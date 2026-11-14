@@ -199,20 +199,21 @@ loses track of a task with many steps, so use the largest model that fits.
 | A100 | 40 GB | `gemma4:26b` | `32768` |
 | A100 or H100 | 80 GB | `gemma4:26b` | `65536` |
 
-Set the model in the notebook's `MODEL` field, and pass `--max-ctx` to every
-openbatrangs command:
+Set the model in the notebook's `MODEL` field. On a GPU with 40 GB or more,
+pass `--max-ctx` to every openbatrangs command for a longer context:
 
 ```sh
 !ollama pull gemma4:26b
 !openbatrangs --no-update-check --cwd /content/project --model gemma4:26b --max-ctx 65536 "your task"
 ```
 
-Without `--max-ctx`, openbatrangs asks Ollama for the model's whole context
-window, 256K tokens for Gemma 4. Ollama reserves memory for all of it, and on
-a smaller GPU it then moves the model partly or fully to the CPU, where a reply
-can take minutes
-([#73](https://github.com/arpanpathak/openbatrangs/issues/73)). To check where the model runs, run `!ollama ps` during
-a task. The PROCESSOR column should say `100% GPU`.
+Without `--max-ctx`, openbatrangs asks Ollama for a context window of at most
+32,768 tokens. An OpenAI-compatible server gets the model's whole window,
+because the server sets its window when it starts. Ollama reserves GPU memory for the whole window it is asked
+for. With the 256K-token window of Gemma 4, a 16 GB GPU runs out of memory,
+and Ollama moves the model partly or fully to the CPU, where a reply can take
+minutes. To check where the model runs, run `!ollama ps` during a task. The
+PROCESSOR column should say `100% GPU`.
 
 A notebook cell has no terminal, so the terminal UI can't start there. Open
 Colab's terminal from the button at the bottom left, or with the notebook's
@@ -271,7 +272,7 @@ openbatrangs update                                                      # insta
 | `--confirm` | a prompt before each file write and shell command |
 | `--read-only` | no file writes or shell commands |
 | `--max-steps <n>` | the step limit, 40 by default |
-| `--max-ctx <tokens>` | an upper limit on the context window |
+| `--max-ctx <tokens>` | an upper limit on the context window, 32768 by default on Ollama |
 | `--no-think` | thinking off, for thinking models |
 | `--searxng-url <url>` | the SearXNG instance for web search |
 | `--no-update-check` | no daily check for a newer release |
