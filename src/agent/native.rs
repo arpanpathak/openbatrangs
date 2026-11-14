@@ -20,6 +20,7 @@ use super::context::{max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
 use super::quality::{FinishGate, command_succeeded};
+use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
 use super::tool::{Tool, ToolCall, strip_code_fence};
 use super::{
@@ -432,6 +433,8 @@ struct Run<'a, R, C> {
     changed_files: Vec<String>,
     /// Gate that rejects a finish before changed files are checked.
     finish_gate: FinishGate,
+    /// Stops a model that repeats the same tool call.
+    repeat_guard: RepeatGuard,
     /// Sink receiving conversation snapshots, so an interrupted run can resume.
     sink: Option<&'a mut dyn HistorySink>,
     /// Receives the run's events.
@@ -450,7 +453,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
                 State::Ask => self.ask(),
                 State::Stream => self.stream().await?,
                 State::Reply(turn) => self.reply(turn),
-                State::RunTools(turn) => self.run_tools(turn).await,
+                State::RunTools(turn) => self.run_tools(turn).await?,
                 State::EmptyTurn => self.empty_turn(),
                 State::Answer(text) => self.answer(&text),
                 State::Finish(summary) => self.finish(&summary),
@@ -549,8 +552,8 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 
     /// Run every tool call of the turn, then finish, ask the user, or take
-    /// another step.
-    async fn run_tools(&mut self, turn: Turn) -> State {
+    /// another step; stop when the model keeps repeating one call.
+    async fn run_tools(&mut self, turn: Turn) -> Result<State> {
         let mut outcome = CallOutcome::default();
         let calls = identified_calls(turn.calls, self.step);
         self.empty_retries = 0;
@@ -563,7 +566,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             self.execute_one(call, &mut outcome).await;
         }
 
-        outcome.next_state()
+        self.repeat_guard.allow(outcome.next_state())
     }
 
     /// End the run with the `finish` summary, unless the finish gate rejects it.
@@ -687,10 +690,10 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             summary: report.summary,
             output: report.output.clone(),
         });
-        self.messages.push(Message::Tool {
-            id,
-            content: report.output,
-        });
+        let content = self
+            .repeat_guard
+            .model_result(&call.name, &call.arguments, &report.output);
+        self.messages.push(Message::Tool { id, content });
     }
 
     /// Record a rejected call so the model can retry it.
@@ -798,6 +801,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         messages,
         changed_files,
         finish_gate,
+        repeat_guard: RepeatGuard::default(),
         sink,
         reporter,
         confirmer,
@@ -2094,6 +2098,74 @@ mod tests {
         assert!(output.contains("Tool call rejected: unknown tool: rm_rf"));
         assert!(output.contains("✅ ok"));
 
+        Ok(())
+    }
+
+    /// `count` replies that each call `list_files` on the workspace root.
+    fn identical_list_calls(count: usize) -> Vec<Reply> {
+        (0..count)
+            .map(|index| {
+                let id = format!("c{index}");
+                Reply::openai_stream(&[tool_call_delta(&id, "list_files", &json!({}))])
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_fifth_identical_call_stops_the_run() -> Result<()> {
+        let replies = identical_list_calls(5);
+
+        let (output, result) = run_with_replies("look around", 10, replies).await?;
+
+        let error = result.err().map(|error| error.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("stopped: the model repeated the same tool call 5 times")
+        );
+        assert!(output.contains("step 5/10"));
+        assert!(!output.contains("step 6/10"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_third_identical_call_tells_the_model_to_change_approach() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-repeat");
+        let mut replies = identical_list_calls(3);
+        let finish = tool_call_delta("done", "finish", &json!({"summary": "looked"}));
+        replies.push(Reply::openai_stream(&[finish]));
+        let url = serve_replies(replies).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let config = test_config(&root, 10);
+        let mut sink = RecordingSink::default();
+        let continuation = RunContinuation {
+            sink: Some(&mut sink),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "look around",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let last = sink.snapshots.last().context("a saved conversation")?;
+        let tool_results: Vec<&str> = last
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert!(!tool_results[1].contains("same result"));
+        assert!(tool_results[2].contains("same result 3 times in a row"));
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

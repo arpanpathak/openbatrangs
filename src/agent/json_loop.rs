@@ -17,6 +17,7 @@
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
 use super::quality::FinishGate;
+use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
 use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
@@ -116,6 +117,8 @@ struct JsonRun<'a, R, C> {
     changed_files: Vec<String>,
     /// Gate that rejects a finish before changed files are checked.
     finish_gate: FinishGate,
+    /// Stops a model that repeats the same tool call.
+    repeat_guard: RepeatGuard,
     /// Receives the run's events.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
@@ -162,6 +165,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         messages: initial_messages(&config.cwd, &opening),
         changed_files: Vec::new(),
         finish_gate: FinishGate::default(),
+        repeat_guard: RepeatGuard::default(),
         reporter,
         confirmer,
     };
@@ -220,7 +224,7 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
                     name,
                     arguments,
                     tool,
-                } => self.run_tool(&content, name, arguments, tool).await,
+                } => self.run_tool(&content, name, arguments, tool).await?,
                 State::Reject { content, error } => self.reject_tool_call(&content, &error),
                 State::Finish {
                     summary,
@@ -330,20 +334,21 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
     }
 
     /// Push the assistant JSON, execute the tool, push its result, and
-    /// continue to the next step.
+    /// continue to the next step; stop when the model keeps repeating one
+    /// call.
     async fn run_tool(
         &mut self,
         content: &str,
         name: String,
         arguments: String,
         tool: Tool,
-    ) -> State {
+    ) -> Result<State> {
         let id = format!("call_{}", self.step);
         self.messages.push(message(Role::Assistant, content));
         self.reporter.report(AgentEvent::ToolCall {
             id: id.clone(),
-            name,
-            arguments,
+            name: name.clone(),
+            arguments: arguments.clone(),
         });
 
         let changes_before = self.changed_files.len();
@@ -360,7 +365,10 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
         self.finish_gate
             .record_tool_result(&tool, &report.output, files_changed);
 
-        let tool_result = format!("{TOOL_RESULT_PREFIX}\n{}", report.output);
+        let model_result = self
+            .repeat_guard
+            .model_result(&name, &arguments, &report.output);
+        let tool_result = format!("{TOOL_RESULT_PREFIX}\n{model_result}");
         self.reporter.report(AgentEvent::ToolResult {
             id,
             success: report.success,
@@ -370,7 +378,7 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
         self.messages.push(message(Role::User, &tool_result));
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
 
-        State::Ask
+        self.repeat_guard.allow(State::Ask)
     }
 
     /// Neither field is a model failure; surface it and stop cleanly.
@@ -809,6 +817,45 @@ mod tests {
         assert!(messages[1].content.ends_with(
             "Earlier in this conversation:\nUser: rename the parser\n\nTask:\nwhat did I ask?"
         ));
+    }
+
+    /// A JSON reply that calls `list_files` with no arguments.
+    const LIST_ROOT: &str = r#"{"tool":{"name":"list_files","arguments":{}}}"#;
+
+    /// A JSON reply that calls `list_files` on `.`, which differs from
+    /// [`LIST_ROOT`] in its arguments.
+    const LIST_DOT: &str = r#"{"tool":{"name":"list_files","arguments":{"path":"."}}}"#;
+
+    #[tokio::test]
+    async fn the_fifth_identical_call_stops_the_run() -> Result<()> {
+        let replies = [LIST_ROOT; 5];
+
+        let (output, result) = run_with_replies("look around", 10, &replies).await?;
+
+        let error = result.err().map(|error| error.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("stopped: the model repeated the same tool call 5 times")
+        );
+        assert!(output.contains("Step 5/10"));
+        assert!(!output.contains("Step 6/10"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_different_call_resets_the_repeat_count() -> Result<()> {
+        let mut replies = vec![LIST_ROOT; 4];
+        replies.push(LIST_DOT);
+        replies.extend([LIST_ROOT; 4]);
+        replies.push(r#"{"answer":"looked"}"#);
+
+        let (output, result) = run_with_replies("look around", 12, &replies).await?;
+
+        result?;
+        assert!(output.contains("looked"));
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -114,3 +114,11 @@ Behavior:
 - When the request is unclear and the workspace cannot settle it, call ask_user with one short question; the user's reply arrives as the next message.
 - Use paths relative to the workspace root. Never read build, cache, data, or generated directories.
 - End with finish. Its summary is the only text the user reads: for a question, the complete answer, with its code, quotes and URLs; for a change, what was done and what the checks reported."#;
+
+/// Number of identical tool calls in a row, each with the same result, after
+/// which the model is told to read the file again or change its approach.
+pub const REPEATED_CALL_WARNING: usize = 3;
+
+/// Number of identical tool calls in a row, each with the same result, that
+/// stops the run.
+pub const REPEATED_CALL_LIMIT: usize = 5;

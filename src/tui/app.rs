@@ -821,6 +821,7 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
+        self.keep_failed_run(&result);
         self.current_task = None;
         self.forget_conversation_unless_asked();
         self.transcript.finish_running_step();
@@ -831,6 +832,21 @@ impl App {
         self.is_running = false;
         self.last_action.clear();
         self.start_next_queued_task(client, tx);
+    }
+
+    /// Keep an agent run that ended with an error the same way as an
+    /// interrupted run, so the next message continues it with its whole
+    /// conversation, and record the error in the chat history. It runs
+    /// before the job is cleared, while the job still says it was a task.
+    fn keep_failed_run(&mut self, result: &Result<(), String>) {
+        let Err(error) = result else {
+            return;
+        };
+
+        self.remember_interrupted_task();
+
+        let note = format!("The run stopped with an error: {error}");
+        self.reply = format!("{}\n\n{note}", self.reply).trim_start().to_string();
     }
 
     /// Drop the stored conversation, unless the run asked the user a
@@ -2669,6 +2685,56 @@ mod tests {
         app.track_job(kind, tokio::spawn(std::future::pending::<()>()));
 
         app
+    }
+
+    #[tokio::test]
+    async fn a_run_that_stops_with_an_error_is_continued_by_the_next_message() -> anyhow::Result<()>
+    {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_running_job(JobKind::Task, &tx);
+        let conversation = vec![serde_json::json!({"role": "user", "content": "fix the parser"})];
+        app.current_prompt = Some("fix the parser".to_string());
+
+        app.handle_event(UiEvent::History(conversation.clone()), &client, &tx);
+        let error = "stopped: the model repeated the same tool call 5 times".to_string();
+        app.handle_event(UiEvent::Done(Err(error)), &client, &tx);
+
+        let last_turn = app.chat_history.last().map(|turn| turn.content.as_str());
+        assert_eq!(
+            last_turn,
+            Some(
+                "The run stopped with an error: stopped: the model repeated the same tool call 5 times"
+            )
+        );
+
+        let next = app.task_for_submission("what happened?".to_string());
+        assert_eq!(
+            next,
+            Some(("what happened?".to_string(), Some(conversation)))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_chat_reply_keeps_its_partial_text_and_the_error() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_running_job(JobKind::Task, &tx);
+        app.run_config.mode = AgentMode::Chat;
+        app.reply = "Here is the start".to_string();
+
+        app.handle_event(UiEvent::Done(Err("stream error".to_string())), &client, &tx);
+
+        let last_turn = app.chat_history.last().map(|turn| turn.content.as_str());
+        assert_eq!(
+            last_turn,
+            Some("Here is the start\n\nThe run stopped with an error: stream error")
+        );
+        assert!(app.interrupted_task.is_none());
+
+        Ok(())
     }
 
     /// Wrap `event` as an event of job `job_id`.
