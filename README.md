@@ -183,13 +183,73 @@ for each installed model.
 
 ### Google Colab
 
-You can try openbatrangs on a free Colab GPU without installing anything on
-your own machine. Open
+You can try openbatrangs on a Colab GPU without installing anything on your
+own machine. Open
 [`colab/openbatrangs.ipynb`](https://colab.research.google.com/github/arpanpathak/openbatrangs/blob/main/colab/openbatrangs.ipynb),
-choose a T4 GPU runtime, and run the cells in order. The notebook installs
-openbatrangs and Ollama, downloads `qwen2.5-coder:7b`, clones a repository and
-runs one task. A notebook cell has no terminal, so for the terminal UI the
-notebook opens one with `colab-xterm`.
+choose a GPU runtime under Runtime → Change runtime type, and run the cells in
+order. The notebook installs openbatrangs and Ollama, downloads a model, clones
+a repository and runs one task.
+
+Pick the model by the GPU you get. A small model writes code well but often
+loses track of a task with many steps, so use the largest model that fits.
+
+| GPU | Memory | Model | `--max-ctx` |
+| --- | --- | --- | --- |
+| T4 (free) | 16 GB | `gemma4:12b` | `32768` |
+| A100 | 40 GB | `gemma4:26b` | `32768` |
+| A100 or H100 | 80 GB | `gemma4:26b` | `65536` |
+
+Set the model in the notebook's `MODEL` field, and pass `--max-ctx` to every
+openbatrangs command:
+
+```sh
+!ollama pull gemma4:26b
+!openbatrangs --no-update-check --cwd /content/project --model gemma4:26b --max-ctx 65536 "your task"
+```
+
+Without `--max-ctx`, openbatrangs asks Ollama for the model's whole context
+window, 256K tokens for Gemma 4. Ollama reserves memory for all of it, and on
+a smaller GPU it then moves the model partly or fully to the CPU, where a reply
+can take minutes
+([#73](https://github.com/arpanpathak/openbatrangs/issues/73)). To check where the model runs, run `!ollama ps` during
+a task. The PROCESSOR column should say `100% GPU`.
+
+A notebook cell has no terminal, so the terminal UI can't start there. Open
+Colab's terminal from the button at the bottom left, or with the notebook's
+`colab-xterm` cell, and run the command without a task:
+
+```sh
+cd /content/project
+openbatrangs --model gemma4:26b --max-ctx 65536
+```
+
+On an H100, you can use vLLM instead of Ollama. The H100 runs FP8 weights
+natively, and vLLM answers faster than Ollama on one large GPU. Skip the
+notebook's Ollama cells and start the server in a cell:
+
+```python
+!pip -q install vllm
+
+import subprocess
+
+subprocess.Popen(
+    ["vllm", "serve", "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+     "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder"],
+    stdout=open("/content/vllm.log", "w"), stderr=subprocess.STDOUT,
+    start_new_session=True,
+)
+```
+
+The first start downloads about 31 GB and takes several minutes. When
+`/content/vllm.log` shows that the server is listening on port 8000, connect
+to it:
+
+```sh
+!openbatrangs --openai-url http://localhost:8000/v1 --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 --cwd /content/project "your task"
+```
+
+Installing vLLM replaces Colab's PyTorch with its own version, so use a fresh
+runtime for it.
 
 ## Usage
 
