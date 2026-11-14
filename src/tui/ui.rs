@@ -523,12 +523,23 @@ fn input_scroll_y(app: &App, area: Rect) -> u16 {
 /// Return the visual (row, column) of the text cursor within the wrapped input.
 fn input_cursor_position(app: &App, area_width: u16) -> Option<(usize, u16)> {
     let prefix = app.input.get(..app.cursor)?;
+    let inner_width = input_inner_width(area_width);
 
-    let rows = wrap_text_to_lines(prefix, input_inner_width(area_width));
+    let rows = wrap_text_to_lines(prefix, inner_width);
     let line = rows.len().saturating_sub(1);
-    let column = rows.last().map(|row| row.width() as u16).unwrap_or(0);
+    let column = rows.last().map_or(0, |row| row.width());
 
-    Some((line, column))
+    Some(cursor_inside_box(line, column, inner_width))
+}
+
+/// The cursor's (row, column), moved to the start of the next row when
+/// `column` is at or past `inner_width`: that cell is the right border.
+fn cursor_inside_box(line: usize, column: usize, inner_width: usize) -> (usize, u16) {
+    if column >= inner_width {
+        return (line + 1, 0);
+    }
+
+    (line, column as u16)
 }
 
 /// Position the terminal cursor at the user's text insertion point in the input box.
@@ -919,6 +930,20 @@ mod tests {
         let (response, _receiver) = tokio::sync::oneshot::channel();
         app.open_confirmation("write?".to_string(), response);
         assert_eq!(status_text(&app), "❓ y = confirm · n / Esc = abort");
+    }
+
+    #[test]
+    fn the_cursor_after_a_full_row_starts_the_next_row() {
+        let mut app = test_app();
+        app.input = "x".repeat(38);
+        app.cursor = app.input.len();
+
+        assert_eq!(cursor_cell(&app, Rect::new(0, 0, 40, 4)), Some((1, 2)));
+
+        app.input = "😀".to_string();
+        app.cursor = app.input.len();
+
+        assert_eq!(cursor_cell(&app, Rect::new(0, 0, 3, 4)), Some((1, 2)));
     }
 
     #[test]

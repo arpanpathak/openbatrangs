@@ -170,6 +170,16 @@ enum InputAction {
     Home,
     /// Move the cursor to the end of the input.
     End,
+    /// Move the cursor to the start of the word before it.
+    WordLeft,
+    /// Move the cursor to the end of the word after it.
+    WordRight,
+    /// Delete everything before the cursor.
+    DeleteToStart,
+    /// Delete everything from the cursor to the end.
+    DeleteToEnd,
+    /// Delete the word before the cursor.
+    DeleteWordBefore,
     /// Previous suggestion or older history entry.
     Up,
     /// Next suggestion or newer history entry.
@@ -980,6 +990,11 @@ impl App {
             InputAction::Right => self.move_right(),
             InputAction::Home => self.move_home(),
             InputAction::End => self.move_end(),
+            InputAction::WordLeft => self.move_word_left(),
+            InputAction::WordRight => self.move_word_right(),
+            InputAction::DeleteToStart => self.delete_to_start(),
+            InputAction::DeleteToEnd => self.delete_to_end(),
+            InputAction::DeleteWordBefore => self.delete_word_before(),
             InputAction::Up => self.move_up(),
             InputAction::Down => self.move_down(),
             InputAction::PageUp => self.scroll_chat_page(-1),
@@ -1567,15 +1582,47 @@ fn mode_name(mode: AgentMode) -> &'static str {
     }
 }
 
-/// What a key press does in the input line.
-fn input_action(key: &KeyEvent) -> InputAction {
-    let is_control = key.modifiers.contains(KeyModifiers::CONTROL);
+/// Which modifier keys a key press was made with, as far as the input line
+/// cares.
+#[derive(Clone, Copy)]
+enum Chord {
+    /// No modifier, Shift, or Ctrl+Alt. Windows sends AltGr characters such
+    /// as `@` and `€` as Ctrl+Alt, so those are typed as plain characters.
+    Plain,
+    /// Ctrl without Alt.
+    Control,
+    /// Alt without Ctrl.
+    Alt,
+}
 
-    match (key.code, is_control) {
-        (KeyCode::Char('c'), true) => InputAction::Cancel,
-        (KeyCode::Char('j'), true) => InputAction::Newline,
+/// The [`Chord`] of a key press with `modifiers`.
+fn chord(modifiers: KeyModifiers) -> Chord {
+    let is_control = modifiers.contains(KeyModifiers::CONTROL);
+    let is_alt = modifiers.contains(KeyModifiers::ALT);
+
+    match (is_control, is_alt) {
+        (true, false) => Chord::Control,
+        (false, true) => Chord::Alt,
+        (true, true) | (false, false) => Chord::Plain,
+    }
+}
+
+/// What a key press does in the input line. Ctrl+letter keys edit the line
+/// like a shell does, and the ones without a meaning do nothing.
+fn input_action(key: &KeyEvent) -> InputAction {
+    match (key.code, chord(key.modifiers)) {
+        (KeyCode::Char('c'), Chord::Control) => InputAction::Cancel,
+        (KeyCode::Char('j'), Chord::Control) => InputAction::Newline,
+        (KeyCode::Char('a'), Chord::Control) => InputAction::Home,
+        (KeyCode::Char('e'), Chord::Control) => InputAction::End,
+        (KeyCode::Char('u'), Chord::Control) => InputAction::DeleteToStart,
+        (KeyCode::Char('k'), Chord::Control) => InputAction::DeleteToEnd,
+        (KeyCode::Char('w'), Chord::Control) => InputAction::DeleteWordBefore,
+        (KeyCode::Char(_), Chord::Control) => InputAction::Nothing,
         (KeyCode::Char('\r'), _) => InputAction::Nothing,
         (KeyCode::Char(character), _) => InputAction::Insert(character),
+        (KeyCode::Left, Chord::Alt) => InputAction::WordLeft,
+        (KeyCode::Right, Chord::Alt) => InputAction::WordRight,
         (KeyCode::Backspace, _) => InputAction::Backspace,
         (KeyCode::Delete, _) => InputAction::Delete,
         (KeyCode::Left, _) => InputAction::Left,
@@ -1838,6 +1885,7 @@ mod tests {
     #[test]
     fn scroll_chat_never_goes_below_zero() {
         let mut app = test_app();
+        app.notice("line\n".repeat(50));
         app.scroll_chat(-100);
         assert_eq!(app.chat_scroll_offset, 0);
         app.scroll_chat(10);
@@ -1849,6 +1897,8 @@ mod tests {
         let mut app = test_app();
         // Offsets larger than u16::MAX are possible with very long wrapped
         // output; they must never be truncated to a small u16 value.
+        app.notice("line\n".repeat(u16::MAX as usize + 200));
+        app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = u16::MAX as usize + 100;
         app.scroll_chat(1);
         assert_eq!(app.chat_scroll_offset, u16::MAX as usize + 101);
@@ -1875,6 +1925,10 @@ mod tests {
             width: 40,
             height: 22,
         });
+        for index in 0..200 {
+            app.notice(format!("line {index}"));
+        }
+        app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 100;
         app.scroll_chat_page(-1);
         assert_eq!(app.chat_scroll_offset, 80);
@@ -2394,9 +2448,23 @@ mod tests {
             input_action(&ctrl(KeyCode::Char('j'))),
             InputAction::Newline
         );
+        assert_eq!(input_action(&ctrl(KeyCode::Char('a'))), InputAction::Home);
+        assert_eq!(input_action(&ctrl(KeyCode::Char('e'))), InputAction::End);
         assert_eq!(
-            input_action(&ctrl(KeyCode::Char('a'))),
-            InputAction::Insert('a')
+            input_action(&ctrl(KeyCode::Char('u'))),
+            InputAction::DeleteToStart
+        );
+        assert_eq!(
+            input_action(&ctrl(KeyCode::Char('k'))),
+            InputAction::DeleteToEnd
+        );
+        assert_eq!(
+            input_action(&ctrl(KeyCode::Char('w'))),
+            InputAction::DeleteWordBefore
+        );
+        assert_eq!(
+            input_action(&ctrl(KeyCode::Char('x'))),
+            InputAction::Nothing
         );
         assert_eq!(
             input_action(&press(KeyCode::Char('\r'))),
@@ -2405,6 +2473,43 @@ mod tests {
         assert_eq!(input_action(&press(KeyCode::Enter)), InputAction::Submit);
         assert_eq!(input_action(&shift_enter), InputAction::Newline);
         assert_eq!(input_action(&press(KeyCode::F(1))), InputAction::Nothing);
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word_and_ctrl_alt_types_its_character() {
+        let alt_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        let alt_right = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        let alt_gr_at = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+
+        assert_eq!(input_action(&alt_left), InputAction::WordLeft);
+        assert_eq!(input_action(&alt_right), InputAction::WordRight);
+        assert_eq!(input_action(&alt_gr_at), InputAction::Insert('@'));
+    }
+
+    #[tokio::test]
+    async fn line_editing_keys_reach_the_input_line() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.insert_text("fix the tests");
+
+        let keys = [
+            ctrl(KeyCode::Char('w')),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            ctrl(KeyCode::Char('a')),
+            ctrl(KeyCode::Char('k')),
+            ctrl(KeyCode::Char('e')),
+            ctrl(KeyCode::Char('u')),
+        ];
+        type_keys(&mut app, &keys, &client, &tx).await;
+
+        assert!(app.input.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -2438,6 +2543,8 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         app.history = vec!["earlier task".to_string()];
+        app.notice("line\n".repeat(50));
+        app.scroll_mode = ScrollMode::Manual;
 
         type_keys(&mut app, &[press(KeyCode::Up)], &client, &tx).await;
         assert_eq!(app.input, "earlier task");
@@ -2515,18 +2622,12 @@ mod tests {
     /// An app running a job of `kind` that never ends, numbered 1.
     fn app_running_job(kind: JobKind, tx: &mpsc::UnboundedSender<UiEvent>) -> App {
         let mut app = test_app();
-        let job_tx = app.job_sender(tx);
+        app.job_sender(tx);
 
         app.is_running = true;
-        app.track_job(kind, tokio::spawn(pending_job(job_tx)));
+        app.track_job(kind, tokio::spawn(std::future::pending::<()>()));
 
         app
-    }
-
-    /// A job that keeps its sender and never sends.
-    async fn pending_job(job_tx: mpsc::UnboundedSender<UiEvent>) {
-        std::future::pending::<()>().await;
-        drop(job_tx);
     }
 
     /// Wrap `event` as an event of job `job_id`.
@@ -2565,7 +2666,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let job_tx = app.job_sender(&tx);
-        app.track_job(JobKind::Task, tokio::spawn(pending_job(job_tx.clone())));
+        app.track_job(JobKind::Task, tokio::spawn(std::future::pending::<()>()));
 
         job_tx.send(UiEvent::Agent(answer("fresh chunk")))?;
         let event = rx.recv().await.ok_or(anyhow::anyhow!("no event"))?;
@@ -2985,14 +3086,15 @@ mod tests {
             })
         );
 
-        app.chat_scroll_offset = 10;
+        let bottom = app.max_chat_scroll();
+        app.chat_scroll_offset = bottom;
         let keys = [
             press(KeyCode::PageUp),
             press(KeyCode::PageDown),
             press(KeyCode::Char('x')),
         ];
         type_keys(&mut app, &keys, &client, &tx).await;
-        assert_eq!(app.chat_scroll_offset, 10);
+        assert_eq!(app.chat_scroll_offset, bottom);
         assert!(
             app.input.is_empty(),
             "letters do not reach the input from the transcript"
@@ -3134,6 +3236,13 @@ mod tests {
             UiEvent::Job { event, .. } => event,
             _other => event,
         }
+    }
+
+    #[test]
+    fn job_inner_passes_an_untagged_event_through() {
+        let event = UiEvent::Log("plain".to_string());
+
+        assert!(matches!(job_inner(&event), UiEvent::Log(_)));
     }
 
     /// The conversation a history event carries.

@@ -35,13 +35,14 @@ pub(super) fn chat_visible_height(area: Rect) -> usize {
 impl App {
     /// Scroll the chat by `delta` wrapped rows.
     ///
-    /// Scrolling always switches to [`ScrollMode::Manual`]. When the user
+    /// Scrolling always switches to [`ScrollMode::Manual`], starting from
+    /// the row the view shows, and never goes past the bottom. When the user
     /// scrolls up past the top of the blocks in memory, older blocks are
     /// loaded from the session file and the offset resets to the top of them.
     /// Scrolling down past the bottom loads newer blocks the same way.
     pub(super) fn scroll_chat(&mut self, delta: i32) {
-        self.scroll_mode = ScrollMode::Manual;
         self.sync_transcript_scroll();
+        self.leave_follow_mode();
 
         if self.reaches_unloaded_history(delta) {
             self.transcript.load_older(BLOCK_LOAD_CHUNK);
@@ -49,9 +50,19 @@ impl App {
             return;
         }
 
-        let next = self.chat_scroll_offset as i32 + delta;
-        self.chat_scroll_offset = next.max(0) as usize;
+        let next = (self.chat_scroll_offset as i64 + i64::from(delta)).max(0) as usize;
+        self.chat_scroll_offset = next.min(self.max_chat_scroll());
         self.load_newer_at_bottom(delta);
+    }
+
+    /// Switch to [`ScrollMode::Manual`]. In follow mode the view shows the
+    /// bottom row, so manual scrolling starts from there.
+    fn leave_follow_mode(&mut self) {
+        if self.scroll_mode == ScrollMode::Follow {
+            self.chat_scroll_offset = self.max_chat_scroll();
+        }
+
+        self.scroll_mode = ScrollMode::Manual;
     }
 
     /// Whether scrolling by `delta` passes the top while older blocks wait on disk.
@@ -75,7 +86,7 @@ impl App {
 
     /// The largest scroll offset: the transcript height minus the rows on
     /// screen. Without a measured chat area the whole height counts.
-    fn max_chat_scroll(&mut self) -> usize {
+    pub(super) fn max_chat_scroll(&mut self) -> usize {
         let area = self.last_chat_area.unwrap_or_default();
         let total_rows = self.transcript.layout(chat_text_width(area.width));
 
@@ -166,6 +177,56 @@ mod tests {
         App::new(&cli, Arc::new(Mutex::new(None)))
     }
 
+    /// An app scrolled by hand to the top of `count` notices, one row each.
+    fn app_with_notices(count: usize) -> App {
+        let mut app = test_app();
+
+        for index in 0..count {
+            app.notice(format!("line {index}"));
+        }
+
+        app.scroll_mode = ScrollMode::Manual;
+        app
+    }
+
+    /// An app with 200 notices in an 80 by 40 chat area, following the output.
+    fn app_following_200_notices() -> App {
+        let mut app = app_with_notices(200);
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 40));
+        app.scroll_mode = ScrollMode::Follow;
+
+        app
+    }
+
+    #[test]
+    fn the_first_scroll_up_moves_from_the_bottom_not_from_the_top() {
+        let mut app = app_following_200_notices();
+        let bottom = app.max_chat_scroll();
+
+        app.scroll_chat(-3);
+
+        assert!(bottom > 3);
+        assert_eq!(app.chat_scroll_offset, bottom - 3);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+    }
+
+    #[test]
+    fn scrolling_down_stops_at_the_bottom() {
+        let mut app = app_following_200_notices();
+        let bottom = app.max_chat_scroll();
+
+        app.scroll_chat(-50);
+        for _step in 0..200 {
+            app.scroll_chat(5);
+        }
+
+        assert_eq!(app.chat_scroll_offset, bottom);
+
+        app.scroll_chat(-5);
+
+        assert_eq!(app.chat_scroll_offset, bottom - 5);
+    }
+
     #[test]
     fn scroll_chat_negative_delta_does_not_go_below_zero() {
         let mut app = test_app();
@@ -177,7 +238,7 @@ mod tests {
 
     #[test]
     fn scroll_chat_positive_delta_increases_offset() {
-        let mut app = test_app();
+        let mut app = app_with_notices(50);
         app.chat_scroll_offset = 0;
         app.scroll_chat(10);
         assert_eq!(app.chat_scroll_offset, 10);
@@ -193,7 +254,7 @@ mod tests {
 
     #[test]
     fn scroll_chat_page_without_measured_area_uses_step() {
-        let mut app = test_app();
+        let mut app = app_with_notices(50);
         app.last_chat_area = None;
         app.scroll_chat_page(1);
         // Without measured area, falls back to CHAT_SCROLL_STEP
@@ -202,7 +263,7 @@ mod tests {
 
     #[test]
     fn scroll_chat_page_with_measured_area() {
-        let mut app = test_app();
+        let mut app = app_with_notices(50);
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
         app.scroll_chat_page(1);
         // Page height = 20 - 2 = 18
@@ -286,6 +347,7 @@ mod tests {
         for index in 0..5 {
             app.notice(format!("line {index}"));
         }
+        app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 3;
 
         app.scroll_chat(-3);
