@@ -68,8 +68,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value_t = DEFAULT_MIN_CONTEXT)]
     pub(crate) min_context: usize,
 
-    /// Upper limit on the context window sent to the model; by default the
-    /// model's own context length is used in full (lower uses less memory).
+    /// Upper limit on the context window sent to the model. Without it,
+    /// Ollama gets at most 32768 tokens and an OpenAI-compatible server gets
+    /// the model's whole window (lower uses less memory).
     #[arg(long = "max-ctx", global = true)]
     pub(crate) max_ctx: Option<u64>,
 

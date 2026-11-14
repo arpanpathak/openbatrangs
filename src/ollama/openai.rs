@@ -11,7 +11,7 @@
 //! - OpenAI chat completions streaming: <https://platform.openai.com/docs/api-reference/chat-streaming>
 //! - llama-server API: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
-use super::stream::{Drain, take_line};
+use super::stream::{Drain, stream_error, take_line};
 use super::types::{ChatMessage, ChatRequest, Delta, OllamaModel, Role, ToolCallDelta};
 use crate::constants::ollama::GEMMA_CHANNEL_MARKERS;
 use serde_json::{Value, json};
@@ -89,19 +89,26 @@ fn event_drain(line: &str) -> Option<Drain> {
         .and_then(data_drain)
 }
 
-/// [`Drain::Done`] for the `[DONE]` marker, else the delta in the payload.
+/// [`Drain::Done`] for the `[DONE]` marker, else the server's error or the
+/// delta in the payload.
 fn data_drain(data: &str) -> Option<Drain> {
     if data == "[DONE]" {
         return Some(Drain::Done);
     }
 
-    parse_event(data).map(Drain::Delta)
+    payload_drain(data)
 }
 
-/// Parse one `data:` payload into a content, reasoning, or tool-call delta.
-fn parse_event(data: &str) -> Option<Delta> {
+/// The server's error in a JSON `data:` payload, else its delta; `None` for
+/// malformed JSON or a payload with nothing to show.
+fn payload_drain(data: &str) -> Option<Drain> {
     let value = serde_json::from_str::<Value>(data).ok()?;
 
+    stream_error(&value).or_else(|| choice_delta(&value).map(Drain::Delta))
+}
+
+/// The content, reasoning, or tool-call delta of a parsed `data:` payload.
+fn choice_delta(value: &Value) -> Option<Delta> {
     value.pointer("/choices/0/delta").and_then(parse_delta)
 }
 
@@ -153,16 +160,23 @@ fn parse_tool_calls(delta: &Value) -> Vec<ToolCallDelta> {
     delta
         .get("tool_calls")
         .and_then(Value::as_array)
-        .map(|calls| calls.iter().map(parse_tool_call).collect())
+        .map(|calls| calls.iter().enumerate().map(parse_tool_call).collect())
         .unwrap_or_default()
 }
 
 /// Map one `tool_calls` entry to its incremental delta.
-fn parse_tool_call(call: &Value) -> ToolCallDelta {
+///
+/// Some servers leave out `index`; the call's `position` in the delta's
+/// array stands in for it, so two calls in one delta stay two calls.
+fn parse_tool_call((position, call): (usize, &Value)) -> ToolCallDelta {
     let function = call.get("function");
+    let index = call
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or(position as u64);
 
     ToolCallDelta {
-        index: call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32,
+        index: index as u32,
         id: string_at(call, "id"),
         name: function.and_then(|function| string_at(function, "name")),
         arguments: function
@@ -249,6 +263,13 @@ fn context_show(context: u64) -> Value {
 mod tests {
     use super::*;
 
+    /// The delta in one `data:` payload, `None` when it has none.
+    fn parse_event(data: &str) -> Option<Delta> {
+        serde_json::from_str::<Value>(data)
+            .ok()
+            .and_then(|value| choice_delta(&value))
+    }
+
     /// A request with a system, a tool and an assistant message, and the
     /// given response format and sampling options.
     fn request(format: Option<Value>, options: Option<Value>) -> ChatRequest {
@@ -279,7 +300,9 @@ mod tests {
     fn delta_text(drain: Drain) -> Option<String> {
         match drain {
             Drain::Delta(Delta::Content(text) | Delta::Thinking(text)) => Some(text),
-            Drain::Delta(Delta::ToolCalls(_)) | Drain::Done | Drain::NeedMore => None,
+            Drain::Delta(Delta::ToolCalls(_)) | Drain::Done | Drain::NeedMore | Drain::Error(_) => {
+                None
+            }
         }
     }
 
@@ -363,6 +386,43 @@ mod tests {
             later,
             Some(Delta::ToolCalls(vec![ToolCallDelta::default()]))
         );
+    }
+
+    #[test]
+    fn calls_without_an_index_keep_their_position() {
+        let delta = parse_event(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"function":{"name":"list_files","arguments":"{\"path\":\"a\"}"}},
+                {"function":{"name":"list_files","arguments":"{}"}}
+            ]}}]}"#,
+        );
+
+        let call = |index, arguments: &str| ToolCallDelta {
+            index,
+            id: None,
+            name: Some("list_files".to_string()),
+            arguments: arguments.to_string(),
+        };
+
+        assert_eq!(
+            delta,
+            Some(Delta::ToolCalls(vec![
+                call(0, "{\"path\":\"a\"}"),
+                call(1, "{}")
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_server_error_event_ends_the_stream_with_its_message() {
+        let mut buffer = String::from(concat!(
+            "data: {\"error\":{\"message\":\"model crashed\",\"code\":500}}\n\n",
+            "data: [DONE]\n\n",
+        ));
+
+        let drained = drain_events(&mut buffer);
+
+        assert!(matches!(drained, Drain::Error(message) if message == "model crashed"));
     }
 
     #[test]

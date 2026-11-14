@@ -29,7 +29,7 @@ pub(crate) use types::{
 
 use crate::constants::ollama::{
     API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
-    HTTP_TIMEOUT_SECONDS,
+    DEFAULT_OLLAMA_CONTEXT_CAP, READ_TIMEOUT,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use reader::DeltaStream;
@@ -72,7 +72,7 @@ impl OllamaClient {
     /// # Returns
     /// A configured client, or an error if the HTTP client could not be built.
     pub fn new(base_url: &str) -> Result<Self> {
-        let http = http_client(reqwest::Client::builder())?;
+        let http = http_client(reqwest::Client::builder(), READ_TIMEOUT)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -93,7 +93,8 @@ impl OllamaClient {
     /// connection can be closed between agent steps, and the next request
     /// would fail with "connection closed before message completed".
     pub fn openai(base_url: &str, key: Option<String>, think: bool) -> Result<Self> {
-        let http = http_client(reqwest::Client::builder().pool_max_idle_per_host(0))?;
+        let builder = reqwest::Client::builder().pool_max_idle_per_host(0);
+        let http = http_client(builder, READ_TIMEOUT)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -115,6 +116,18 @@ impl OllamaClient {
     /// toggle never changes what is sent.
     pub fn requests_thinking(&self) -> bool {
         matches!(self.api, Api::OpenAi { think: true, .. })
+    }
+
+    /// The context window to ask for when `--max-ctx` is not given.
+    ///
+    /// Ollama reserves memory for the whole window a request asks for, so it
+    /// gets [`DEFAULT_OLLAMA_CONTEXT_CAP`]. An OpenAI-compatible server sets
+    /// its window when it starts, so the model's full window is used.
+    pub fn default_context_cap(&self) -> Option<u64> {
+        match self.api {
+            Api::Ollama => Some(DEFAULT_OLLAMA_CONTEXT_CAP),
+            Api::OpenAi { .. } => None,
+        }
     }
 
     /// Attach the bearer token, if any.
@@ -391,11 +404,15 @@ impl OllamaClient {
     }
 }
 
-/// The HTTP client built from `builder` with the request and connect
-/// timeouts every model server call uses.
-fn http_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client> {
+/// The HTTP client built from `builder` with the timeouts every model server
+/// call uses.
+///
+/// There is no limit on a whole request: a streamed reply on a CPU or a small
+/// GPU can take longer than any fixed limit. `read_timeout` fails a call only
+/// when the server sends nothing for that long.
+fn http_client(builder: reqwest::ClientBuilder, read_timeout: Duration) -> Result<reqwest::Client> {
     builder
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
+        .read_timeout(read_timeout)
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECONDS))
         .build()
         .context("failed to build HTTP client")
@@ -435,6 +452,134 @@ mod tests {
     use crate::tools::test_server::{cut_short, spawn_raw_server};
     use futures_util::{StreamExt, TryStreamExt};
     use std::sync::{Mutex, PoisonError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// One reply line of a slow Ollama stream.
+    const SLOW_LINE: &str = "{\"message\":{\"content\":\"a\"}}\n";
+
+    /// An Ollama client for `base_url` that fails after `read_timeout` of
+    /// silence.
+    fn client_with_read_timeout(base_url: &str, read_timeout: Duration) -> Result<OllamaClient> {
+        Ok(OllamaClient {
+            base_url: base_url.to_string(),
+            http: http_client(reqwest::Client::builder(), read_timeout)?,
+            api: Api::Ollama,
+        })
+    }
+
+    /// Serve one connection that streams `lines` copies of [`SLOW_LINE`],
+    /// waiting `pause` before each one. Returns the base URL.
+    async fn spawn_slow_server(lines: usize, pause: Duration) -> Result<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+
+        tokio::spawn(stream_slowly(listener, lines, pause));
+
+        Ok(base_url)
+    }
+
+    /// Accept one request on `listener` and answer it one line at a time.
+    async fn stream_slowly(listener: TcpListener, lines: usize, pause: Duration) -> Result<()> {
+        let (mut socket, _peer) = listener.accept().await?;
+        read_request(&mut socket).await?;
+
+        let length = SLOW_LINE.len() * lines;
+        let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+        socket.write_all(headers.as_bytes()).await?;
+
+        write_lines_slowly(&mut socket, lines, pause).await
+    }
+
+    /// The text of the request that arrived on `socket`.
+    async fn read_request(socket: &mut TcpStream) -> std::io::Result<String> {
+        let mut request = [0u8; 8192];
+        let length = socket.read(&mut request).await?;
+
+        Ok(String::from_utf8_lossy(&request[..length]).to_string())
+    }
+
+    /// Write `lines` copies of [`SLOW_LINE`] to `socket`, waiting `pause`
+    /// before each one.
+    async fn write_lines_slowly(
+        socket: &mut TcpStream,
+        lines: usize,
+        pause: Duration,
+    ) -> Result<()> {
+        for _line in 0..lines {
+            tokio::time::sleep(pause).await;
+            socket.write_all(SLOW_LINE.as_bytes()).await?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_an_ollama_server_gets_a_default_context_cap() -> Result<()> {
+        let ollama = OllamaClient::new("http://localhost:11434")?;
+        let openai = OllamaClient::openai("http://localhost:8079/v1", None, true)?;
+
+        assert_eq!(
+            ollama.default_context_cap(),
+            Some(DEFAULT_OLLAMA_CONTEXT_CAP)
+        );
+        assert_eq!(openai.default_context_cap(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_streams_longer_than_the_read_timeout_is_not_cut_off() -> Result<()> {
+        let base_url = spawn_slow_server(6, Duration::from_millis(100)).await?;
+        let client = client_with_read_timeout(&base_url, Duration::from_millis(400))?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
+        assert_eq!(parts.len(), 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_times_out() -> Result<()> {
+        let base_url = spawn_slow_server(1, Duration::from_secs(5)).await?;
+        let client = client_with_read_timeout(&base_url, Duration::from_millis(200))?;
+
+        let stream = client.chat_stream(sample_request()).await?;
+        let parts: Result<Vec<Delta>> = stream.try_collect().await;
+
+        assert!(format!("{parts:?}").contains("stream error"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_stream_reports_a_server_error_mid_reply() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| {
+            MockResponse::json(
+                "200 OK",
+                concat!(
+                    "{\"message\":{\"content\":\"partial\"}}\n",
+                    "{\"error\":\"llama runner process has terminated\"}\n",
+                ),
+            )
+        })
+        .await;
+        let client = OllamaClient::new(&base_url)?;
+
+        let parts: Result<Vec<Delta>> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await;
+
+        assert!(
+            format!("{parts:?}")
+                .contains("model server error: llama runner process has terminated")
+        );
+        Ok(())
+    }
 
     /// A one-message chat request with no options.
     fn sample_request() -> ChatRequest {

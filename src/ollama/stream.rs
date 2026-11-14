@@ -69,6 +69,9 @@ pub(super) enum Drain {
     Done,
     /// No complete payload line is available yet.
     NeedMore,
+    /// The server reported an error in the middle of the stream, such as a
+    /// crashed model runner; the text is the server's message.
+    Error(String),
 }
 
 /// Remove the first complete line from `buffer` and return it trimmed;
@@ -97,7 +100,25 @@ pub(super) fn drain_complete_lines(buffer: &mut String) -> Drain {
 fn parse_stream_line(line: &str) -> Option<Drain> {
     let value = serde_json::from_str::<Value>(line).ok()?;
 
-    message_content(&value).or_else(|| done_marker(&value))
+    stream_error(&value)
+        .or_else(|| message_content(&value))
+        .or_else(|| done_marker(&value))
+}
+
+/// [`Drain::Error`] when a stream event carries an `error` field.
+///
+/// Ollama sends `{"error": "..."}` and OpenAI-compatible servers send
+/// `{"error": {"message": "..."}}`; any other shape is shown as JSON.
+pub(super) fn stream_error(value: &Value) -> Option<Drain> {
+    value.get("error").map(error_message).map(Drain::Error)
+}
+
+/// The text of a stream event's `error` field.
+fn error_message(error: &Value) -> String {
+    error
+        .as_str()
+        .or_else(|| error.pointer("/message").and_then(Value::as_str))
+        .map_or_else(|| error.to_string(), str::to_string)
 }
 
 /// The reply text of a chat stream line, as a content delta.
@@ -187,7 +208,7 @@ mod tests {
     fn content(drain: Drain) -> Option<String> {
         match drain {
             Drain::Delta(Delta::Content(text)) => Some(text),
-            Drain::Delta(_) | Drain::Done | Drain::NeedMore => None,
+            Drain::Delta(_) | Drain::Done | Drain::NeedMore | Drain::Error(_) => None,
         }
     }
 
@@ -232,6 +253,42 @@ mod tests {
         let line = r#"{"done":true}"#;
 
         assert!(matches!(parse_stream_line(line), Some(Drain::Done)));
+    }
+
+    /// The message of a drained server error, `None` for anything else.
+    fn server_error(drain: Option<Drain>) -> Option<String> {
+        match drain {
+            Some(Drain::Error(message)) => Some(message),
+            Some(Drain::Delta(_) | Drain::Done | Drain::NeedMore) | None => None,
+        }
+    }
+
+    #[test]
+    fn reports_a_server_error_line() {
+        let line = r#"{"error":"llama runner process has terminated"}"#;
+
+        let message = server_error(parse_stream_line(line));
+
+        assert_eq!(
+            message.as_deref(),
+            Some("llama runner process has terminated")
+        );
+        assert_eq!(server_error(parse_stream_line(r#"{"done":true}"#)), None);
+    }
+
+    #[test]
+    fn reads_the_message_of_an_error_object_or_shows_its_json() {
+        let with_message = serde_json::json!({"error": {"message": "out of memory"}});
+        let without_message = serde_json::json!({"error": {"code": 500}});
+
+        assert_eq!(
+            server_error(stream_error(&with_message)).as_deref(),
+            Some("out of memory")
+        );
+        assert_eq!(
+            server_error(stream_error(&without_message)).as_deref(),
+            Some("{\"code\":500}")
+        );
     }
 
     #[test]

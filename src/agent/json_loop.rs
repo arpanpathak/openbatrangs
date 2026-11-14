@@ -143,7 +143,8 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
     ensure_workspace_exists(&config.cwd)?;
     warn_when_resume_is_unsupported(continuation.as_ref(), reporter);
 
-    let num_ctx = effective_context(config.model_context, config.max_ctx);
+    let context_cap = config.max_ctx.or(client.default_context_cap());
+    let num_ctx = effective_context(config.model_context, context_cap);
     let earlier = continuation.map(|run| run.earlier).unwrap_or_default();
     let task_with_docs = task_with_documentation(task, config, reporter).await;
     let opening = Opening {
