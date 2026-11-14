@@ -3,7 +3,7 @@
 use super::block::BlockContent;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
 use super::transcript::{Focus, RowHit, Transcript};
-use super::worker::send_event;
+use super::worker::{forward_job_events, send_event};
 use super::{
     ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
@@ -98,6 +98,25 @@ enum KeyTarget {
     Input,
     /// The transcript, focused with Tab.
     Transcript,
+}
+
+/// What a background job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JobKind {
+    /// An agent, plan or chat task the user typed.
+    Task,
+    /// A `/pull` or `/setup` run.
+    Command,
+}
+
+/// The background job that runs now.
+pub(super) struct RunningJob {
+    /// The job's number; only its events reach the transcript.
+    pub(super) id: u64,
+    /// What the job does.
+    pub(super) kind: JobKind,
+    /// The spawned job, aborted on Ctrl+C.
+    pub(super) handle: JoinHandle<()>,
 }
 
 /// Which pane receives keys when no dialog is open.
@@ -282,8 +301,10 @@ pub(super) struct App {
     pub(super) stream_started_at: Option<Instant>,
     /// Estimated tokens per second based on streaming character rate.
     pub(super) tokens_per_sec: f64,
-    /// Handle to the currently spawned background Tokio task (agent/pull/setup).
-    pub(super) current_task: Option<JoinHandle<()>>,
+    /// The background job (agent task, pull or setup) that runs now.
+    pub(super) current_task: Option<RunningJob>,
+    /// How many jobs this session has started; the newest job's number.
+    pub(super) jobs_started: u64,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
     /// Characters accumulated in the current rate-measurement window.
@@ -361,6 +382,7 @@ impl App {
             stream_started_at: None,
             tokens_per_sec: 0.0,
             current_task: None,
+            jobs_started: 0,
             last_chat_area: None,
             rate_window_chars: 0,
             rate_window_start: None,
@@ -568,6 +590,7 @@ impl App {
             is_auto_pull_disabled: self.is_auto_pull_disabled,
             min_context: self.min_context,
         };
+        let job_tx = self.job_sender(tx);
         let worker = run_agent_worker(
             client.clone(),
             self.run_config.clone(),
@@ -575,16 +598,38 @@ impl App {
             prefs,
             task,
             prior,
-            tx.clone(),
+            job_tx.clone(),
         );
-        let done_tx = tx.clone();
 
         let handle = tokio::spawn(async move {
             let result = worker.await;
-            send_done(&done_tx, result);
+            send_done(&job_tx, result);
         });
 
-        self.current_task = Some(handle);
+        self.track_job(JobKind::Task, handle);
+    }
+
+    /// Number a new job and return the channel it sends its events on. The
+    /// events reach the event loop tagged with the job's number.
+    pub(super) fn job_sender(
+        &mut self,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> mpsc::UnboundedSender<UiEvent> {
+        self.jobs_started += 1;
+
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
+        tokio::spawn(forward_job_events(self.jobs_started, job_rx, tx.clone()));
+
+        job_tx
+    }
+
+    /// Keep `handle` as the running job, numbered by the last [`Self::job_sender`].
+    pub(super) fn track_job(&mut self, kind: JobKind, handle: JoinHandle<()>) {
+        self.current_task = Some(RunningJob {
+            id: self.jobs_started,
+            kind,
+            handle,
+        });
     }
 
     /// Zero the token-rate counters before a new task streams its reply.
@@ -621,15 +666,38 @@ impl App {
             UiEvent::Agent(agent_event) => self.on_agent_event(agent_event),
             UiEvent::History(messages) => self.agent_conversation = Some(messages),
             UiEvent::Done(result) => self.on_done(result, client, tx),
-            UiEvent::PullDone { name, result } => self.on_pull_done(&name, result),
-            UiEvent::SetupDone(result) => self.on_setup_done(result),
+            UiEvent::PullDone { name, result } => self.on_pull_done(&name, result, client, tx),
+            UiEvent::SetupDone(result) => self.on_setup_done(result, client, tx),
             UiEvent::ConfirmRequest { prompt, response } => {
                 self.on_confirm_request(prompt, response)
             }
             UiEvent::UpdateAvailable { prompt, response } => {
                 self.on_update_available(prompt, response)
             }
+            UiEvent::Job { job_id, event } => self.on_job_event(job_id, *event, client, tx),
         }
+    }
+
+    /// Handle an event of job `job_id`, unless that job is no longer the
+    /// running one: a cancelled job's late events must not reach the
+    /// transcript or end the job that runs now.
+    fn on_job_event(
+        &mut self,
+        job_id: u64,
+        event: UiEvent,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if self.running_job_id() != Some(job_id) {
+            return;
+        }
+
+        self.handle_event(event, client, tx);
+    }
+
+    /// The number of the running job, if one runs.
+    fn running_job_id(&self) -> Option<u64> {
+        self.current_task.as_ref().map(|job| job.id)
     }
 
     /// Show a worker status line.
@@ -789,9 +857,13 @@ impl App {
     }
 
     /// Finish a `/pull` and tell the user how to use the model.
-    fn on_pull_done(&mut self, name: &str, result: Result<(), String>) {
-        self.finish_background_job();
-
+    fn on_pull_done(
+        &mut self,
+        name: &str,
+        result: Result<(), String>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         let lines = match result {
             Ok(()) => vec![
                 String::new(),
@@ -802,26 +874,36 @@ impl App {
         };
 
         self.notice_lines(lines);
+        self.finish_background_job(client, tx);
     }
 
     /// Finish a `/setup` and log its result.
-    fn on_setup_done(&mut self, result: Result<(), String>) {
-        self.finish_background_job();
-
+    fn on_setup_done(
+        &mut self,
+        result: Result<(), String>,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         let lines = match result {
             Ok(()) => vec![String::new(), "✅ Setup finished.".to_string()],
             Err(error) => vec![format!("⚠️ Setup failed: {error}")],
         };
 
         self.notice_lines(lines);
+        self.finish_background_job(client, tx);
     }
 
-    /// Mark a background pull or setup as finished and the app as ready.
-    fn finish_background_job(&mut self) {
+    /// Mark a background pull or setup as finished, then start the next
+    /// queued task, or go idle when none waits.
+    fn finish_background_job(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         self.current_task = None;
-        self.is_running = false;
-        self.status = "ready".to_string();
         self.last_action.clear();
+
+        self.start_next_queued_task(client, tx);
     }
 
     /// Show the worker's yes/no question in the confirmation dialog.
@@ -1017,9 +1099,9 @@ impl App {
         client: &OllamaClient,
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
+        self.remember_interrupted_task();
         self.abort_current_task();
         self.reject_pending_confirmation();
-        self.remember_interrupted_task();
         self.forget_unanswered_question();
 
         self.last_action.clear();
@@ -1034,8 +1116,8 @@ impl App {
 
     /// Stop the background task, if one is running.
     fn abort_current_task(&mut self) {
-        if let Some(handle) = self.current_task.take() {
-            handle.abort();
+        if let Some(job) = self.current_task.take() {
+            job.handle.abort();
         }
     }
 
@@ -1054,9 +1136,17 @@ impl App {
         }
     }
 
-    /// Whether an agent or plan task is running (chat mode has no tools to resume).
+    /// Whether an agent or plan task is running (chat mode has no tools to
+    /// resume, and a pull or setup has no task).
     fn is_running_agent(&self) -> bool {
-        self.is_running && self.run_config.mode != AgentMode::Chat
+        self.is_running_task() && self.run_config.mode != AgentMode::Chat
+    }
+
+    /// Whether the running job is a task the user typed.
+    fn is_running_task(&self) -> bool {
+        self.current_task
+            .as_ref()
+            .is_some_and(|job| job.kind == JobKind::Task)
     }
 
     /// Drop a chat question whose answer was cancelled, so the history does
@@ -2415,9 +2505,108 @@ mod tests {
         assert_eq!(app.current_prompt.as_deref(), Some("write a kernel"));
 
         // The refused connection fails model selection before any log line.
-        let event = rx.recv().await;
+        let event = rx.recv().await.context("the worker must report back")?;
 
-        assert!(matches!(event, Some(UiEvent::Done(Err(_)))));
+        assert!(matches!(job_inner(&event), UiEvent::Done(Err(_))));
+
+        Ok(())
+    }
+
+    /// An app running a job of `kind` that never ends, numbered 1.
+    fn app_running_job(kind: JobKind, tx: &mpsc::UnboundedSender<UiEvent>) -> App {
+        let mut app = test_app();
+        let job_tx = app.job_sender(tx);
+
+        app.is_running = true;
+        app.track_job(kind, tokio::spawn(pending_job(job_tx)));
+
+        app
+    }
+
+    /// A job that keeps its sender and never sends.
+    async fn pending_job(job_tx: mpsc::UnboundedSender<UiEvent>) {
+        std::future::pending::<()>().await;
+        drop(job_tx);
+    }
+
+    /// Wrap `event` as an event of job `job_id`.
+    fn job_event(job_id: u64, event: UiEvent) -> UiEvent {
+        let event = Box::new(event);
+
+        UiEvent::Job { job_id, event }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_task_cannot_write_to_the_transcript_or_end_the_next_task()
+    -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_running_job(JobKind::Task, &tx);
+        app.task_queue.push_back(("next task".to_string(), None));
+
+        app.cancel_task(&client, &tx);
+        app.handle_event(
+            job_event(1, UiEvent::Agent(answer("late chunk"))),
+            &client,
+            &tx,
+        );
+        app.handle_event(job_event(1, UiEvent::Done(Ok(()))), &client, &tx);
+
+        assert!(!app.transcript.text().contains("late chunk"));
+        assert!(app.is_running);
+        assert_eq!(app.running_job_id(), Some(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_of_the_running_job_reach_the_transcript() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let job_tx = app.job_sender(&tx);
+        app.track_job(JobKind::Task, tokio::spawn(pending_job(job_tx.clone())));
+
+        job_tx.send(UiEvent::Agent(answer("fresh chunk")))?;
+        let event = rx.recv().await.ok_or(anyhow::anyhow!("no event"))?;
+        app.handle_event(event, &client, &tx);
+
+        assert!(app.transcript.text().contains("fresh chunk"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_queued_during_a_pull_starts_when_the_pull_ends() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_running_job(JobKind::Command, &tx);
+        app.task_queue.push_back(("queued task".to_string(), None));
+        let pull_done = UiEvent::PullDone {
+            name: "llama3.2:3b".to_string(),
+            result: Ok(()),
+        };
+
+        app.handle_event(job_event(1, pull_done), &client, &tx);
+
+        assert!(app.task_queue.is_empty());
+        assert!(app.is_running);
+        assert!(app.transcript.text().contains("Starting next queued task"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_during_a_pull_does_not_bring_back_an_old_prompt() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = app_running_job(JobKind::Command, &tx);
+        app.current_prompt = Some("an old finished task".to_string());
+
+        app.cancel_task(&client, &tx);
+
+        assert!(app.interrupted_task.is_none());
+        assert!(!app.is_running);
 
         Ok(())
     }
@@ -2429,7 +2618,7 @@ mod tests {
         let mut app = test_app();
         app.is_running = true;
         app.current_prompt = Some("long task".to_string());
-        app.current_task = Some(tokio::spawn(std::future::pending::<()>()));
+        app.track_job(JobKind::Task, tokio::spawn(std::future::pending::<()>()));
         app.input = "half typed".to_string();
 
         app.handle_key(ctrl(KeyCode::Char('c')), &client, &tx).await;
@@ -2930,13 +3119,21 @@ mod tests {
 
         while !is_done {
             let event = rx.recv().await.context("the worker must report back")?;
-            is_done = matches!(event, UiEvent::Done(_));
-            snapshot = history_of(&event).unwrap_or(snapshot);
+            is_done = matches!(job_inner(&event), UiEvent::Done(_));
+            snapshot = history_of(job_inner(&event)).unwrap_or(snapshot);
 
             app.handle_event(event, client, tx);
         }
 
         Ok(snapshot)
+    }
+
+    /// The event a job event carries, or the event itself.
+    fn job_inner(event: &UiEvent) -> &UiEvent {
+        match event {
+            UiEvent::Job { event, .. } => event,
+            _other => event,
+        }
     }
 
     /// The conversation a history event carries.
