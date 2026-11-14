@@ -15,6 +15,7 @@ A terminal coding agent for local language models, on any hardware.
 [![Rust 2024](https://img.shields.io/badge/Rust-2024%20edition-ce422b?style=for-the-badge&logo=rust&logoColor=white)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-fcc624?style=for-the-badge&logo=linux&logoColor=black)](#install)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20silicon%20%7C%20Intel-000000?style=for-the-badge&logo=apple&logoColor=white)](#install)
+[![Open in Colab](https://img.shields.io/badge/Open%20in-Colab-f9ab00?style=for-the-badge&logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/arpanpathak/openbatrangs/blob/main/colab/openbatrangs.ipynb)
 
 <img src="assets/demo.gif" alt="openbatrangs adding a median function and its tests to a Rust crate, with folded steps and the model server's GPU load in the panel" width="900">
 
@@ -179,6 +180,16 @@ Ollama is installed but not running, `ollama serve` is started for you. To
 install Ollama and download a coding model, run `openbatrangs setup`. With
 `openbatrangs list-models`, you see a score for agentic coding on your hardware
 for each installed model.
+
+### Google Colab
+
+You can try openbatrangs on a free Colab GPU without installing anything on
+your own machine. Open
+[`colab/openbatrangs.ipynb`](https://colab.research.google.com/github/arpanpathak/openbatrangs/blob/main/colab/openbatrangs.ipynb),
+choose a T4 GPU runtime, and run the cells in order. The notebook installs
+openbatrangs and Ollama, downloads `qwen2.5-coder:7b`, clones a repository and
+runs one task. A notebook cell has no terminal, so for the terminal UI the
+notebook opens one with `colab-xterm`.
 
 ## Usage
 
