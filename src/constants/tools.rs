@@ -81,3 +81,52 @@ pub const EXIT_CODE_PREFIX: &str = "[exit code ";
 
 /// The zero-exit marker the quality gate accepts as a verified command.
 pub const SUCCESS_EXIT_MARKER: &str = "[exit code 0]";
+
+/// The bubblewrap program that sandboxes shell commands on Linux.
+pub const BUBBLEWRAP_PROGRAM: &str = "bwrap";
+
+/// The program that sandboxes shell commands on macOS.
+pub const SEATBELT_PROGRAM: &str = "sandbox-exec";
+
+/// The Seatbelt profile for shell commands on macOS. It allows everything
+/// except file writes, then allows writes in the workspace (passed as the
+/// `WORKSPACE` parameter), the temporary folders and `/dev`.
+pub const SEATBELT_PROFILE: &str = r#"(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+    (subpath (param "WORKSPACE"))
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders")
+    (subpath "/dev"))"#;
+
+/// Command fragments that delete or overwrite files in bulk. A command that
+/// contains one, with words separated by single spaces and a space at each
+/// end, needs the user's approval even without `--confirm`.
+pub const DESTRUCTIVE_COMMAND_PATTERNS: &[&str] = &[
+    " rm ",
+    " rmdir ",
+    " unlink ",
+    " shred ",
+    " dd ",
+    " mkfs",
+    " truncate ",
+    " sudo ",
+    " chmod -R ",
+    " chown -R ",
+    " -delete ",
+    " git reset --hard",
+    " git clean ",
+    " git push --force",
+    " git push -f ",
+    " git checkout -- ",
+    " git checkout . ",
+    " git restore ",
+    " git branch -D ",
+    " git stash drop",
+    " git stash clear",
+];
+
+/// Added to the approval question when a command would run without a
+/// sandbox, so the user knows it can change files outside the project.
+pub const UNSANDBOXED_COMMAND_WARNING: &str = " without a sandbox";

@@ -37,6 +37,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
     pub(crate) should_confirm: bool,
+    /// Run shell commands in the operating-system sandbox.
+    pub(crate) use_sandbox: bool,
     /// Agent vs planning vs chat mode.
     pub(crate) mode: AgentMode,
     /// Stream the model's internal reasoning in agent mode.
@@ -65,6 +67,7 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         max_steps: cli.max_steps,
         is_read_only: cli.is_read_only,
         should_confirm: cli.should_confirm,
+        use_sandbox: !cli.is_sandbox_disabled,
         mode: AgentMode::Agent,
         show_thinking: true,
         max_ctx: cli.max_ctx,

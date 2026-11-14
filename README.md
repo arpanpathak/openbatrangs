@@ -39,9 +39,13 @@ only for the hardware or the VM time.
   with none.
 - **Safety:** a `y` or `n` prompt before each file write and shell command in
   the terminal UI, and with `--confirm` for one-shot tasks. `--read-only` for
-  no writes or commands at all. Every command runs with `$HOME` and tool caches
-  inside the project's `.agent/` folder, without keyboard input, and under a
-  timeout.
+  no writes or commands at all. Every command runs in the operating system's
+  sandbox, which lets it write only inside the project folder: bubblewrap
+  (`bwrap`) on Linux and `sandbox-exec` on macOS. Where neither works, you
+  approve each command. Commands that delete or reset files, such as `rm` or
+  `git reset --hard`, always ask first. Every command also runs with `$HOME`
+  and tool caches inside the project's `.agent/` folder, without keyboard
+  input, and under a timeout.
 - **Web search:** `web_search` and `web_read` through a
   [SearXNG](https://github.com/searxng/searxng) instance.
 - **Folded steps:** one line per step with a title, the model and the time
@@ -204,7 +208,7 @@ pass `--max-ctx` to every openbatrangs command for a longer context:
 
 ```sh
 !ollama pull gemma4:26b
-!openbatrangs --no-update-check --cwd /content/project --model gemma4:26b --max-ctx 65536 "your task"
+!openbatrangs --no-sandbox --no-update-check --cwd /content/project --model gemma4:26b --max-ctx 65536 "your task"
 ```
 
 Without `--max-ctx`, openbatrangs asks Ollama for a context window of at most
@@ -215,13 +219,18 @@ and Ollama moves the model partly or fully to the CPU, where a reply can take
 minutes. To check where the model runs, run `!ollama ps` during a task. The
 PROCESSOR column should say `100% GPU`.
 
+The commands pass `--no-sandbox` because a Colab runtime is a throwaway
+machine and usually can't run bubblewrap. Without the flag, you would approve
+every shell command the model runs. Commands that delete or reset files still
+ask first.
+
 A notebook cell has no terminal, so the terminal UI can't start there. Open
 Colab's terminal from the button at the bottom left, or with the notebook's
 `colab-xterm` cell, and run the command without a task:
 
 ```sh
 cd /content/project
-openbatrangs --model gemma4:26b --max-ctx 65536
+openbatrangs --no-sandbox --model gemma4:26b --max-ctx 65536
 ```
 
 On an H100, you can use vLLM instead of Ollama. The H100 runs FP8 weights
@@ -246,7 +255,7 @@ The first start downloads about 31 GB and takes several minutes. When
 to it:
 
 ```sh
-!openbatrangs --openai-url http://localhost:8000/v1 --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 --cwd /content/project "your task"
+!openbatrangs --no-sandbox --openai-url http://localhost:8000/v1 --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 --cwd /content/project "your task"
 ```
 
 Installing vLLM replaces Colab's PyTorch with its own version, so use a fresh
@@ -271,6 +280,7 @@ openbatrangs update                                                      # insta
 | `--cwd <path>` | the project folder, instead of the current one |
 | `--confirm` | a prompt before each file write and shell command |
 | `--read-only` | no file writes or shell commands |
+| `--no-sandbox` | shell commands without the sandbox, for a machine you can throw away |
 | `--max-steps <n>` | the step limit, 40 by default |
 | `--max-ctx <tokens>` | an upper limit on the context window, 32768 by default on Ollama |
 | `--no-think` | thinking off, for thinking models |

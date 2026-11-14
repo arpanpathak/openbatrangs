@@ -94,6 +94,10 @@ pub struct AgentConfig {
     pub is_read_only: bool,
     /// When `true`, the user must approve each write/command before execution.
     pub should_confirm: bool,
+    /// When `true`, shell commands run in the operating-system sandbox, and
+    /// the user approves each command when no sandbox works on this machine.
+    /// `--no-sandbox` turns it off.
+    pub use_sandbox: bool,
     /// When `true`, the model's reasoning/thinking text is shown to the user.
     pub show_thinking: bool,
     /// The model's own context window, in tokens, from server metadata.

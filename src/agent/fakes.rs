@@ -229,6 +229,7 @@ pub(super) fn test_config(cwd: &Path, max_steps: usize) -> AgentConfig {
         max_steps,
         is_read_only: false,
         should_confirm: false,
+        use_sandbox: false,
         show_thinking: true,
         model_context: 8_192,
         max_ctx: None,
