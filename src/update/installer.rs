@@ -64,7 +64,7 @@ impl Installer {
 /// Piping `curl` into `sh` would take the exit status from `sh`, which reads
 /// empty input after a failed download and reports success, and would run
 /// part of the script when the connection drops halfway.
-fn installer_command(script_url: &str) -> String {
+pub(crate) fn installer_command(script_url: &str) -> String {
     format!(
         "script=\"$(mktemp)\" || exit; \
          trap 'rm -f \"$script\"' EXIT; \
