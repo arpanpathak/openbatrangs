@@ -13,6 +13,7 @@
 mod command;
 mod files;
 mod path;
+pub(crate) mod sandbox;
 #[cfg(test)]
 pub(crate) mod test_server;
 mod text;

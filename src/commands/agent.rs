@@ -127,6 +127,7 @@ fn agent_config(config: &AgentRunConfig, model_context: u64) -> AgentConfig {
         max_steps: config.max_steps,
         is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
+        use_sandbox: config.use_sandbox,
         show_thinking: true,
         model_context,
         max_ctx: config.max_ctx,

@@ -29,12 +29,25 @@ pub(crate) async fn doctor(client: &OllamaClient, min_context: u64) -> Result<()
 pub(crate) async fn doctor_lines(client: &OllamaClient, min_context: u64) -> Result<Vec<String>> {
     let tags = client.tags().await?;
 
-    Ok(doctor_lines_from_tags(&client.base_url, &tags, min_context))
+    let memory_budget = calculate_memory_budget();
+
+    Ok(doctor_lines_from_tags(
+        &client.base_url,
+        &tags,
+        min_context,
+        memory_budget,
+    ))
 }
 
-/// Build the doctor report from already-fetched tags (pure, testable).
-fn doctor_lines_from_tags(base_url: &str, tags: &[OllamaModel], min_context: u64) -> Vec<String> {
-    let scored = models::score_models(tags, calculate_memory_budget(), min_context);
+/// Build the doctor report from already-fetched tags and the memory
+/// available for a model, in bytes (pure, testable).
+fn doctor_lines_from_tags(
+    base_url: &str,
+    tags: &[OllamaModel],
+    min_context: u64,
+    memory_budget: u64,
+) -> Vec<String> {
+    let scored = models::score_models(tags, memory_budget, min_context);
     let mut lines = vec![
         format!("✅ Ollama reachable at {base_url}"),
         format!("Installed models: {}", tags.len()),
@@ -92,9 +105,14 @@ mod tests {
     use super::*;
     use crate::test_support::{MockResponse, sample_model, spawn_mock_server};
 
+    /// 32 GB of memory for models, so every sample model fits on any machine
+    /// that runs the tests.
+    const TEST_MEMORY_BUDGET: u64 = 32_000_000_000;
+
     #[test]
     fn empty_tags_report_mentions_no_models() {
-        let lines = doctor_lines_from_tags("http://localhost:11434", &[], 8_192);
+        let lines =
+            doctor_lines_from_tags("http://localhost:11434", &[], 8_192, TEST_MEMORY_BUDGET);
 
         assert!(lines[0].contains("localhost"));
         assert!(lines[1].contains("0"));
@@ -108,7 +126,8 @@ mod tests {
             sample_model("best:7b", 32_768, "7.6B", "Q4_K_M", 4_700_000_000)?,
         ];
 
-        let lines = doctor_lines_from_tags("http://localhost:11434", &tags, 8_192);
+        let lines =
+            doctor_lines_from_tags("http://localhost:11434", &tags, 8_192, TEST_MEMORY_BUDGET);
 
         assert!(lines.iter().any(|line| line.contains("best:7b")));
         assert!(lines.iter().any(|line| line.contains("score")));
@@ -119,7 +138,8 @@ mod tests {
     fn all_models_below_min_context_are_reported_as_missing() -> Result<()> {
         let tags = vec![sample_model("tiny:1b", 2_048, "1B", "Q4_0", 500_000_000)?];
 
-        let lines = doctor_lines_from_tags("http://localhost:11434", &tags, 8_192);
+        let lines =
+            doctor_lines_from_tags("http://localhost:11434", &tags, 8_192, TEST_MEMORY_BUDGET);
 
         assert!(lines.iter().any(|line| line.contains("No model meets")));
         Ok(())

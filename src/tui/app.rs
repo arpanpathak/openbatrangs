@@ -372,6 +372,7 @@ impl App {
                 max_steps: cli.max_steps,
                 is_read_only: cli.is_read_only,
                 should_confirm: true,
+                use_sandbox: !cli.is_sandbox_disabled,
                 mode: AgentMode::Agent,
                 show_thinking: true,
                 max_ctx: cli.max_ctx,

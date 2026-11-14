@@ -27,8 +27,11 @@ use super::summary::result_summary;
 use super::tool::Tool;
 use crate::constants::agent::COMMAND_TIMEOUT_SECONDS;
 use crate::constants::ansi::ANSI_GREEN_CHECK;
-use crate::constants::tools::{DEFAULT_LIST_DEPTH, MAX_TOOL_OUTPUT};
+use crate::constants::tools::{
+    DEFAULT_LIST_DEPTH, DESTRUCTIVE_COMMAND_PATTERNS, MAX_TOOL_OUTPUT, UNSANDBOXED_COMMAND_WARNING,
+};
 use crate::tools;
+use crate::tools::sandbox::{Sandbox, available_sandbox};
 use anyhow::{Result, bail, ensure};
 use std::path::{Path, PathBuf};
 
@@ -191,16 +194,90 @@ async fn edit_file<C: Confirmer>(
     Ok(record_change(cwd, edit.path, &result, changed_files))
 }
 
-/// Run `command` after the read-only and confirmation checks.
+/// Run `command` in the sandbox after the read-only and approval checks.
 async fn run_command<C: Confirmer>(
     config: &AgentConfig,
     cwd: &Path,
     command: &str,
     confirmer: &mut C,
 ) -> Result<String> {
-    approve(config, confirmer, &format!("run command: {command}")).await?;
+    ensure_not_read_only(config)?;
 
-    tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS).await
+    let sandbox = command_sandbox(config);
+    approve_command(config, confirmer, command, sandbox).await?;
+
+    tools::run_command(cwd, command, COMMAND_TIMEOUT_SECONDS, sandbox).await
+}
+
+/// The sandbox commands run in: the one this machine supports, or none
+/// when `--no-sandbox` turned it off.
+fn command_sandbox(config: &AgentConfig) -> Sandbox {
+    if !config.use_sandbox {
+        return Sandbox::Off;
+    }
+
+    available_sandbox()
+}
+
+/// Ask the user about `command` when [`command_needs_approval`] says so.
+async fn approve_command<C: Confirmer>(
+    config: &AgentConfig,
+    confirmer: &mut C,
+    command: &str,
+    sandbox: Sandbox,
+) -> Result<()> {
+    if !command_needs_approval(config, command, sandbox) {
+        return Ok(());
+    }
+
+    ask_user(confirmer, &command_prompt(config, command, sandbox)).await
+}
+
+/// Whether the user must approve `command` before it runs: in confirm mode,
+/// when the sandbox is wanted but no sandbox works here, and for every
+/// command that deletes or overwrites files in bulk.
+fn command_needs_approval(config: &AgentConfig, command: &str, sandbox: Sandbox) -> bool {
+    let reasons = [
+        config.should_confirm,
+        is_missing_sandbox(config, sandbox),
+        is_destructive(command),
+    ];
+
+    reasons.contains(&true)
+}
+
+/// Whether the user wants commands sandboxed but this machine has no
+/// working sandbox.
+fn is_missing_sandbox(config: &AgentConfig, sandbox: Sandbox) -> bool {
+    config.use_sandbox && !sandbox.is_active()
+}
+
+/// The approval question for `command`, which says when the command would
+/// run without the sandbox it was meant to have.
+fn command_prompt(config: &AgentConfig, command: &str, sandbox: Sandbox) -> String {
+    let warning = if is_missing_sandbox(config, sandbox) {
+        UNSANDBOXED_COMMAND_WARNING
+    } else {
+        ""
+    };
+
+    format!("run command{warning}: {command}")
+}
+
+/// Whether `command` deletes or overwrites files in bulk, such as `rm -rf`
+/// or `git reset --hard`.
+///
+/// Shell separators become spaces first, so `cd src;rm -rf x` and
+/// `(git clean -fd)` match as well. A match only means the user is asked;
+/// the operating-system sandbox is what keeps commands inside the workspace.
+fn is_destructive(command: &str) -> bool {
+    let spaced = command.replace([';', '&', '|', '(', ')', '\n'], " ");
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let normalized = format!(" {} ", words.join(" "));
+
+    DESTRUCTIVE_COMMAND_PATTERNS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
 }
 
 /// Add `path` to the changed files and return the tool result followed by a
@@ -626,6 +703,105 @@ mod tests {
         assert_eq!(errors.matches("read-only").count(), 3);
         assert!(!root.join("a.txt").exists());
         assert!(!root.join("nope.txt").exists());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_deletes_and_resets_are_destructive() {
+        let destructive = [
+            "rm -rf target",
+            "cd src;rm -rf ../x",
+            "cargo build && rm old.txt",
+            "(git clean -fd)",
+            "git reset --hard HEAD~1",
+            "git push --force-with-lease",
+            "find . -name '*.o' -delete",
+            "sudo apt-get install zstd",
+        ];
+
+        for command in destructive {
+            assert!(is_destructive(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_are_not_destructive() {
+        let ordinary = [
+            "cargo test",
+            "git add . && git commit -m 'add parser'",
+            "echo address",
+            "ls -la",
+            "git init",
+        ];
+
+        for command in ordinary {
+            assert!(!is_destructive(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn commands_need_approval_in_confirm_mode_without_a_sandbox_or_when_destructive() {
+        let mut config = test_config(Path::new("/work"), 1);
+
+        assert!(!command_needs_approval(&config, "ls", Sandbox::Off));
+        assert!(command_needs_approval(
+            &config,
+            "rm -rf x",
+            Sandbox::Bubblewrap
+        ));
+
+        config.use_sandbox = true;
+        assert!(!command_needs_approval(&config, "ls", Sandbox::Bubblewrap));
+        assert!(command_needs_approval(&config, "ls", Sandbox::Off));
+
+        config.use_sandbox = false;
+        config.should_confirm = true;
+        assert!(command_needs_approval(&config, "ls", Sandbox::Off));
+    }
+
+    #[test]
+    fn the_prompt_says_when_a_command_runs_without_its_sandbox() {
+        let mut config = test_config(Path::new("/work"), 1);
+        config.use_sandbox = true;
+
+        assert_eq!(
+            command_prompt(&config, "ls", Sandbox::Off),
+            "run command without a sandbox: ls"
+        );
+        assert_eq!(
+            command_prompt(&config, "ls", Sandbox::Seatbelt),
+            "run command: ls"
+        );
+    }
+
+    #[test]
+    fn no_sandbox_turns_the_command_sandbox_off() {
+        let mut config = test_config(Path::new("/work"), 1);
+
+        assert_eq!(command_sandbox(&config), Sandbox::Off);
+
+        config.use_sandbox = true;
+        assert_eq!(command_sandbox(&config), available_sandbox());
+    }
+
+    #[tokio::test]
+    async fn a_destructive_command_asks_even_without_confirm_mode() -> Result<()> {
+        let root = temp_root();
+        std::fs::write(root.join("keep.txt"), "x")?;
+        let config = test_config(&root, 1);
+        let mut changed = Vec::new();
+        let mut confirmer = FixedConfirmer::new(false);
+
+        let command = Tool::RunCommand {
+            command: "rm -rf keep.txt".to_string(),
+        };
+        let ran = run(&config, command, &mut changed, &mut confirmer).await;
+
+        assert!(format!("{ran:?}").contains("aborted by user"));
+        assert_eq!(confirmer.prompts, vec!["run command: rm -rf keep.txt"]);
+        assert!(root.join("keep.txt").exists());
 
         std::fs::remove_dir_all(root)?;
         Ok(())

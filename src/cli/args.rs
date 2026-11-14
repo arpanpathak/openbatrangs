@@ -60,6 +60,12 @@ pub(crate) struct Cli {
     #[arg(long = "confirm", global = true)]
     pub(crate) should_confirm: bool,
 
+    /// Run shell commands without the operating-system sandbox, which
+    /// otherwise lets them write only inside the workspace. Use it only on a
+    /// machine you can throw away, such as a Colab runtime.
+    #[arg(long = "no-sandbox", global = true)]
+    pub(crate) is_sandbox_disabled: bool,
+
     /// Do not auto-pull a recommended model when none is suitable.
     #[arg(long = "no-auto-pull", global = true)]
     pub(crate) is_auto_pull_disabled: bool,

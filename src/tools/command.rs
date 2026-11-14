@@ -4,9 +4,10 @@
 //! and captures combined output. Commands run through `bash -lc` with a
 //! timeout so a hung process cannot freeze the agent loop.
 //!
-//! The environment is sandboxed: `$HOME` and common tool caches are redirected
-//! under `<workspace>/.agent/` so builds and installs do not pollute the real
-//! user home directory.
+//! Each command runs in the operating-system sandbox from
+//! [`super::sandbox`], which lets it write only inside the workspace. `$HOME`
+//! and common tool caches are also redirected under `<workspace>/.agent/`, so
+//! builds and installs find a writable home inside the sandbox.
 //!
 //! ## References
 //!
@@ -14,6 +15,7 @@
 //! - Tokio process + timeout: <https://docs.rs/tokio/latest/tokio/time/fn.timeout.html>
 //! - Unix environment variables: <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html>
 
+use super::sandbox::{Sandbox, wrapped_command};
 use super::text::truncate;
 use crate::constants::tools::{
     COMMAND_OUTPUT_GRACE_MILLISECONDS, EXIT_CODE_PREFIX, MIN_COMMAND_TIMEOUT_SECONDS,
@@ -62,14 +64,21 @@ struct RunningShell {
 /// - `root`: working directory for the command.
 /// - `command`: shell command line.
 /// - `timeout_secs`: maximum allowed runtime.
+/// - `sandbox`: the operating-system sandbox that limits the command's writes
+///   to `root`, or [`Sandbox::Off`].
 ///
 /// # Returns
 /// Captured stdout/stderr plus exit status, truncated to `MAX_TOOL_OUTPUT`.
-pub(crate) async fn run_command(root: &Path, command: &str, timeout_secs: u64) -> Result<String> {
+pub(crate) async fn run_command(
+    root: &Path,
+    command: &str,
+    timeout_secs: u64,
+    sandbox: Sandbox,
+) -> Result<String> {
     let timeout = Duration::from_secs(timeout_secs.max(MIN_COMMAND_TIMEOUT_SECONDS));
     create_sandbox_dirs(root);
 
-    let mut running = start_shell(root, command)?;
+    let mut running = start_shell(root, command, sandbox)?;
     let waited = tokio::time::timeout(timeout, running.shell.wait()).await;
 
     // Whether the shell exited or timed out, this ends its background jobs
@@ -94,8 +103,8 @@ fn exit_status(waited: WaitOutcome, timeout_secs: u64) -> Result<ExitStatus> {
 }
 
 /// Spawn the sandboxed shell for `command` and start reading its pipes.
-fn start_shell(root: &Path, command: &str) -> Result<RunningShell> {
-    let mut shell = sandboxed_shell(root, command)
+fn start_shell(root: &Path, command: &str, sandbox: Sandbox) -> Result<RunningShell> {
+    let mut shell = sandboxed_shell(root, command, sandbox)
         .spawn()
         .context("failed to spawn shell")?;
 
@@ -113,14 +122,14 @@ fn start_shell(root: &Path, command: &str) -> Result<RunningShell> {
     })
 }
 
-/// A `bash -lc` process for `command`, run in `root` with the sandbox
-/// environment, as the leader of a new process group.
-fn sandboxed_shell(root: &Path, command: &str) -> tokio::process::Command {
-    let mut shell = tokio::process::Command::new("bash");
+/// A `bash -lc` process for `command` inside `sandbox`, run in `root` with
+/// the sandbox environment, as the leader of a new process group.
+fn sandboxed_shell(root: &Path, command: &str, sandbox: Sandbox) -> tokio::process::Command {
+    let (program, arguments) = wrapped_command(sandbox, root, command);
+    let mut shell = tokio::process::Command::new(program);
 
     shell
-        .arg("-lc")
-        .arg(command)
+        .args(arguments)
         .current_dir(root)
         // A command that reads input, such as git asking for a username, gets
         // end-of-file at once. With the TUI's stdin, it would wait for keys
@@ -297,6 +306,7 @@ fn agent_sandbox_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::sandbox::available_sandbox;
     use std::fs;
 
     /// A new empty directory to use as the workspace of one test.
@@ -308,7 +318,7 @@ mod tests {
     async fn captures_stdout_and_exit_code() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "echo hello", 5).await?;
+        let output = run_command(&root, "echo hello", 5, available_sandbox()).await?;
 
         assert!(output.contains("hello"));
         assert!(output.contains("[exit code 0]"));
@@ -322,7 +332,7 @@ mod tests {
     async fn captures_stderr() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "echo oops >&2", 5).await?;
+        let output = run_command(&root, "echo oops >&2", 5, available_sandbox()).await?;
 
         assert!(output.contains("[stderr]"));
         assert!(output.contains("oops"));
@@ -335,7 +345,13 @@ mod tests {
     async fn input_reads_get_end_of_file() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "read -r line; echo read-exit:$?", 5).await?;
+        let output = run_command(
+            &root,
+            "read -r line; echo read-exit:$?",
+            5,
+            available_sandbox(),
+        )
+        .await?;
 
         assert!(output.contains("read-exit:1"));
 
@@ -347,7 +363,13 @@ mod tests {
     async fn git_never_prompts() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "echo prompt:$GIT_TERMINAL_PROMPT", 5).await?;
+        let output = run_command(
+            &root,
+            "echo prompt:$GIT_TERMINAL_PROMPT",
+            5,
+            available_sandbox(),
+        )
+        .await?;
 
         assert!(output.contains("prompt:0"));
 
@@ -359,7 +381,7 @@ mod tests {
     async fn reports_nonzero_exit_code() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "exit 3", 5).await?;
+        let output = run_command(&root, "exit 3", 5, available_sandbox()).await?;
 
         assert!(output.contains("[exit code 3]"));
 
@@ -371,7 +393,9 @@ mod tests {
     async fn reports_a_shell_killed_by_a_signal() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "kill -KILL $$", 5).await?;
+        // Without a sandbox, bash itself is the process that gets the signal.
+        // bubblewrap reports the same death as exit code 137 instead.
+        let output = run_command(&root, "kill -KILL $$", 5, Sandbox::Off).await?;
 
         assert!(output.contains("[exit code signal]"), "{output}");
 
@@ -383,7 +407,7 @@ mod tests {
     async fn reports_timeout() -> Result<()> {
         let root = temp_dir();
 
-        let error = run_command(&root, "sleep 5", 1)
+        let error = run_command(&root, "sleep 5", 1, available_sandbox())
             .await
             .err()
             .context("a command longer than its timeout should fail")?;
@@ -400,7 +424,7 @@ mod tests {
 
         // If the timed-out shell is not killed, it will eventually `touch done`
         // after the sleep finishes, proving the child leaked.
-        let finished = run_command(&root, "sleep 2 && touch done", 1).await;
+        let finished = run_command(&root, "sleep 2 && touch done", 1, available_sandbox()).await;
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
         assert!(finished.is_err());
@@ -419,7 +443,13 @@ mod tests {
 
         // The inner `sh` is a grandchild of the agent. Killing only `bash`
         // leaves it running, and it touches `done` after the sleep.
-        let finished = run_command(&root, "sh -c 'sleep 2; touch done'; true", 1).await;
+        let finished = run_command(
+            &root,
+            "sh -c 'sleep 2; touch done'; true",
+            1,
+            available_sandbox(),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
         assert!(finished.is_err());
@@ -436,7 +466,7 @@ mod tests {
     async fn a_background_job_does_not_hold_the_command_open() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "sleep 30 & echo started", 3).await?;
+        let output = run_command(&root, "sleep 30 & echo started", 3, available_sandbox()).await?;
 
         assert!(output.contains("started"), "{output}");
         assert!(output.contains("[exit code 0]"), "{output}");
@@ -449,7 +479,13 @@ mod tests {
     async fn a_background_job_ends_with_its_command() -> Result<()> {
         let root = temp_dir();
 
-        run_command(&root, "(sleep 2; touch late) & echo started", 5).await?;
+        run_command(
+            &root,
+            "(sleep 2; touch late) & echo started",
+            5,
+            available_sandbox(),
+        )
+        .await?;
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
         assert!(
@@ -465,7 +501,7 @@ mod tests {
     async fn runs_in_workspace_directory() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "pwd", 5).await?;
+        let output = run_command(&root, "pwd", 5, available_sandbox()).await?;
 
         assert!(output.contains(root.to_string_lossy().as_ref()));
 
@@ -477,8 +513,13 @@ mod tests {
     async fn redirects_home_and_caches_into_workspace() -> Result<()> {
         let root = temp_dir();
 
-        let output =
-            run_command(&root, "echo $HOME $XDG_CACHE_HOME $CARGO_HOME $TMPDIR", 5).await?;
+        let output = run_command(
+            &root,
+            "echo $HOME $XDG_CACHE_HOME $CARGO_HOME $TMPDIR",
+            5,
+            available_sandbox(),
+        )
+        .await?;
 
         let missing: Vec<PathBuf> = ["home", "cache", "cargo", "tmp"]
             .iter()
@@ -501,7 +542,13 @@ mod tests {
             .map(|(_variable, value)| value.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let output = run_command(&root, "echo \"rustup=$RUSTUP_HOME\"", 5).await?;
+        let output = run_command(
+            &root,
+            "echo \"rustup=$RUSTUP_HOME\"",
+            5,
+            available_sandbox(),
+        )
+        .await?;
 
         assert!(output.contains(&format!("rustup={rustup}\n")), "{output}");
 
@@ -551,7 +598,13 @@ mod tests {
     async fn cache_dirs_are_created_inside_workspace() -> Result<()> {
         let root = temp_dir();
 
-        let output = run_command(&root, "mkdir -p $HOME/.test && echo ok", 5).await?;
+        let output = run_command(
+            &root,
+            "mkdir -p $HOME/.test && echo ok",
+            5,
+            available_sandbox(),
+        )
+        .await?;
 
         assert!(output.contains("ok"));
         assert!(root.join(".agent/home/.test").is_dir());
@@ -564,7 +617,7 @@ mod tests {
     async fn sandbox_dirs_exist_before_command_runs() -> Result<()> {
         let root = temp_dir();
 
-        run_command(&root, "true", 5).await?;
+        run_command(&root, "true", 5, available_sandbox()).await?;
 
         let missing: Vec<PathBuf> = ["home", "cache", "config", "data", "tmp", "cargo"]
             .iter()
@@ -593,5 +646,38 @@ mod tests {
         let env = agent_sandbox_env(&PathBuf::from("."));
 
         assert!(env.iter().all(|(_variable, path)| path.is_absolute()));
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_command_cannot_write_outside_the_workspace() -> Result<()> {
+        // The temporary folders are writable inside the sandbox, so the
+        // workspace's parent must be a folder outside them, here under the
+        // crate's own `target` folder.
+        let sandbox = available_sandbox();
+        let parent = std::env::current_dir()?
+            .join("target")
+            .join(format!("sandbox-test-{}", std::process::id()));
+        let root = parent.join("project");
+        fs::create_dir_all(&root)?;
+
+        let output = run_command(&root, "touch inside; touch ../outside", 5, sandbox).await?;
+
+        assert!(root.join("inside").exists(), "{output}");
+        assert_eq!(parent.join("outside").exists(), !sandbox.is_active());
+
+        fs::remove_dir_all(parent)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_command_without_a_sandbox_runs_in_plain_bash() -> Result<()> {
+        let root = temp_dir();
+
+        let output = run_command(&root, "echo plain", 5, Sandbox::Off).await?;
+
+        assert!(output.contains("plain"));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
