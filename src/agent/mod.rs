@@ -83,6 +83,9 @@ pub struct RunContinuation<'a> {
     pub earlier: Vec<ChatMessage>,
     /// Sink receiving conversation snapshots; `None` in one-shot mode.
     pub sink: Option<&'a mut dyn HistorySink>,
+    /// Sink receiving the whole conversation once, when the run ends, before
+    /// any trimming for the context window; `--transcript-out` uses it.
+    pub transcript: Option<&'a mut dyn HistorySink>,
 }
 
 /// Immutable configuration for the agentic coding loop.
@@ -121,9 +124,9 @@ pub struct AgentConfig {
 /// - `client`: Ollama client for model calls.
 /// - `model`: model name to use for completions.
 /// - `task`: user's task description.
-/// - `continuation`: the interrupted run to continue and the snapshot sink;
-///   `None` in one-shot mode. Only the native tool loop consumes the
-///   conversation.
+/// - `continuation`: the interrupted run to continue, the snapshot sink and
+///   the transcript sink; one-shot mode passes only the transcript sink. Only
+///   the native tool loop consumes the conversation.
 /// - `reporter`: output sink for status and results.
 /// - `confirmer`: human-in-the-loop confirmer for writes/commands.
 ///
@@ -163,6 +166,13 @@ pub async fn run_agent<'a, R: Reporter, C: Confirmer>(
         confirmer,
     )
     .await
+}
+
+/// The tool definitions the native loop sends with every request, in OpenAI
+/// `tools` shape. The JSON loop sends none: it describes its tools in the
+/// system prompt.
+pub fn native_tool_definitions() -> Value {
+    native::tools_schema()
 }
 
 /// The context window for a request: the model's own context length, lowered

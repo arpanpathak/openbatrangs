@@ -286,6 +286,7 @@ openbatrangs update                                                      # insta
 | `--no-think` | thinking off, for thinking models |
 | `--searxng-url <url>` | the SearXNG instance for web search |
 | `--no-update-check` | no daily check for a newer release |
+| `--transcript-out <path>` | after a one-shot run, the model, tools, whole conversation, outcome and step count in one JSON file |
 
 ### Web search
 

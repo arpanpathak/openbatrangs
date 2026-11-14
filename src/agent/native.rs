@@ -427,8 +427,10 @@ struct Run<'a, R, C> {
     step: usize,
     /// Number of consecutive empty model turns answered with a nudge message.
     empty_retries: u8,
-    /// Conversation sent to the model.
+    /// Conversation sent to the model, trimmed to fit the context window.
     messages: Vec<Message>,
+    /// The same conversation without trimming, for the transcript.
+    full_conversation: Vec<Message>,
     /// Files changed by tools so far.
     changed_files: Vec<String>,
     /// Gate that rejects a finish before changed files are checked.
@@ -437,6 +439,8 @@ struct Run<'a, R, C> {
     repeat_guard: RepeatGuard,
     /// Sink receiving conversation snapshots, so an interrupted run can resume.
     sink: Option<&'a mut dyn HistorySink>,
+    /// Sink receiving the untrimmed conversation when the run ends.
+    transcript: Option<&'a mut dyn HistorySink>,
     /// Receives the run's events.
     reporter: &'a mut R,
     /// Human-in-the-loop gate for writes and commands.
@@ -444,8 +448,17 @@ struct Run<'a, R, C> {
 }
 
 impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
-    /// Move from state to state until the run is over.
+    /// Run the states to the end, then hand the whole conversation to the
+    /// transcript sink, whether the run answered, gave up or failed.
     async fn run(mut self) -> Result<()> {
+        let result = self.run_states().await;
+        self.save_transcript();
+
+        result
+    }
+
+    /// Move from state to state until the run is over.
+    async fn run_states(&mut self) -> Result<()> {
         let mut state = State::Ask;
 
         loop {
@@ -523,8 +536,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         }
 
         self.empty_retries += 1;
-        self.messages
-            .push(Message::User(EMPTY_TURN_NUDGE.to_string()));
+        self.record(Message::User(EMPTY_TURN_NUDGE.to_string()));
         self.reporter
             .notice("\n⚠️ Empty model turn; prompting it to continue with tools.".to_string());
 
@@ -539,7 +551,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
         // The answer stays in the conversation either way: a resumed run
         // needs it, and a rejected one needs it before the feedback.
-        self.messages.push(Message::Assistant {
+        self.record(Message::Assistant {
             content: answer.to_string(),
             calls: Vec::new(),
         });
@@ -557,7 +569,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         let mut outcome = CallOutcome::default();
         let calls = identified_calls(turn.calls, self.step);
         self.empty_retries = 0;
-        self.messages.push(Message::Assistant {
+        self.record(Message::Assistant {
             content: turn.content,
             calls: calls.clone(),
         });
@@ -603,7 +615,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Send the gate's feedback to the model and take another step.
     fn reject_finish(&mut self, feedback: &str) -> State {
-        self.messages.push(Message::User(feedback.to_string()));
+        self.record(Message::User(feedback.to_string()));
         self.reporter
             .notice("\n⚠️  Finish rejected: the task is not done.".to_string());
 
@@ -643,7 +655,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// Answer a `finish` call so every call has its result, and return its
     /// summary.
     fn acknowledge_finish(&mut self, id: String, summary: String) -> String {
-        self.messages.push(Message::Tool {
+        self.record(Message::Tool {
             id,
             content: "acknowledged".to_string(),
         });
@@ -654,7 +666,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// Answer an `ask_user` call so every call has its result, and return the
     /// question.
     fn acknowledge_question(&mut self, id: String, question: String) -> String {
-        self.messages.push(Message::Tool {
+        self.record(Message::Tool {
             id,
             content: QUESTION_SHOWN.to_string(),
         });
@@ -693,14 +705,14 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         let content = self
             .repeat_guard
             .model_result(&call.name, &call.arguments, &report.output);
-        self.messages.push(Message::Tool { id, content });
+        self.record(Message::Tool { id, content });
     }
 
     /// Record a rejected call so the model can retry it.
     fn reject(&mut self, id: String, error: &anyhow::Error) {
         self.reporter
             .notice(format!("\n⚠️  Tool call rejected: {error}"));
-        self.messages.push(Message::Tool {
+        self.record(Message::Tool {
             id,
             content: format!("Error: {error}. Retry with the exact argument names."),
         });
@@ -710,6 +722,28 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     /// `None` when the finish may pass.
     fn finish_feedback(&mut self) -> Option<&'static str> {
         self.finish_gate.reject_finish(self.needs_check)
+    }
+
+    /// Append `message` to the conversation sent to the model and to the
+    /// untrimmed copy kept for the transcript.
+    fn record(&mut self, message: Message) {
+        self.full_conversation.push(message.clone());
+        self.messages.push(message);
+    }
+
+    /// Send the untrimmed conversation to the transcript sink, if one is
+    /// attached.
+    fn save_transcript(&mut self) {
+        let Some(transcript) = &mut self.transcript else {
+            return;
+        };
+
+        let conversation = self
+            .full_conversation
+            .iter()
+            .map(Message::to_json)
+            .collect();
+        transcript.save(conversation);
     }
 
     /// Send the current conversation to the snapshot sink, if one is attached.
@@ -746,8 +780,8 @@ fn state_for_text(text: String) -> State {
 /// - `client`: an OpenAI-compatible client.
 /// - `model`: model name to request.
 /// - `task`: the user's task, or the correction when resuming.
-/// - `continuation`: the interrupted run to continue and the snapshot sink;
-///   `None` in one-shot mode.
+/// - `continuation`: the interrupted run to continue, the snapshot sink and
+///   the transcript sink; one-shot mode passes only the transcript sink.
 /// - `reporter`: output sink.
 /// - `confirmer`: human-in-the-loop gate for writes and commands.
 ///
@@ -769,6 +803,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         messages: resume,
         earlier,
         sink,
+        transcript,
     } = continuation.unwrap_or_default();
     let think = client.requests_thinking();
     let resuming = resume.is_some();
@@ -798,11 +833,13 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
         empty_retries: 0,
+        full_conversation: messages.clone(),
         messages,
         changed_files,
         finish_gate,
         repeat_guard: RepeatGuard::default(),
         sink,
+        transcript,
         reporter,
         confirmer,
     };
@@ -1198,7 +1235,7 @@ fn drop_orphan_results(messages: &mut Vec<Message>) {
 ///
 /// The web tools are always present: the system prompt advertises them, and a
 /// call to a tool that is not in the schema is rejected as unknown.
-fn tools_schema() -> Value {
+pub(super) fn tools_schema() -> Value {
     json!([
         {
             "type": "function",
@@ -2351,5 +2388,122 @@ mod tests {
         fit_to_budget(&mut messages, 1_000);
 
         assert_eq!(messages.len(), 2);
+    }
+
+    /// The resume sink and the transcript sink of a native run of `task` in
+    /// `root` with `max_steps` steps against a server that sends `replies`,
+    /// and the run's result.
+    async fn run_with_transcript(
+        root: &Path,
+        task: &str,
+        max_steps: usize,
+        replies: Vec<Reply>,
+    ) -> Result<(RecordingSink, RecordingSink, Result<()>)> {
+        let url = serve_replies(replies).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let config = test_config(root, max_steps);
+        let mut sink = RecordingSink::default();
+        let mut transcript = RecordingSink::default();
+        let continuation = RunContinuation {
+            sink: Some(&mut sink),
+            transcript: Some(&mut transcript),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        let result = run_native_agent(
+            &config,
+            &client,
+            "m",
+            task,
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await;
+
+        Ok((sink, transcript, result))
+    }
+
+    /// The roles of `messages`, in order.
+    fn roles(messages: &[Value]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or("none"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_transcript_keeps_what_the_context_budget_trims() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-transcript");
+        std::fs::write(root.join("big.txt"), "x".repeat(7_000))?;
+        let read = json!({"path": "big.txt"});
+        let mut replies: Vec<Reply> = (0..4)
+            .map(|index| {
+                let id = format!("c{index}");
+                Reply::openai_stream(&[tool_call_delta(&id, "read_file", &read)])
+            })
+            .collect();
+        replies.push(Reply::openai_stream(&[text_delta("big.txt is all x")]));
+
+        let (sink, transcript, result) =
+            run_with_transcript(&root, "read big.txt", 6, replies).await?;
+
+        result?;
+        let saved = transcript.snapshots.concat();
+        let resumable = sink.snapshots.last().context("a saved conversation")?;
+        let expected = vec![
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+        ];
+        assert_eq!(transcript.snapshots.len(), 1);
+        assert_eq!(roles(&saved), expected);
+        assert!(
+            saved[3]["content"]
+                .as_str()
+                .is_some_and(|text| text.len() >= 7_000)
+        );
+        assert!(roles(resumable).len() < saved.len());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_transcript_is_saved_when_a_model_call_fails() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-transcript-error");
+        let replies = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "list_files", &json!({}))]),
+            Reply::server_error("model crashed"),
+        ];
+
+        let (_sink, transcript, result) =
+            run_with_transcript(&root, "look around", 5, replies).await?;
+
+        assert!(result.is_err());
+        let saved = transcript.snapshots.concat();
+        assert_eq!(roles(&saved), vec!["system", "user", "assistant", "tool"]);
+        assert_eq!(saved[2]["tool_calls"][0]["function"]["name"], "list_files");
+        assert_eq!(saved[3]["tool_call_id"], "c1");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_shared_tool_definitions_are_the_ones_sent() {
+        let body = request_body("m", &opening(), 8_192, true);
+
+        assert_eq!(body["tools"], crate::agent::native_tool_definitions());
     }
 }
