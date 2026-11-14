@@ -59,6 +59,7 @@ use crate::ollama::OllamaClient;
 use crate::perf::{ServerPoller, TegrastatsGuard};
 use crate::update::UpdateCheck;
 use anyhow::{Context, Result};
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -74,6 +75,15 @@ use std::io::{Write, stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time::{Interval, MissedTickBehavior};
+
+/// What the event loop keeps from one frame to the next.
+struct LoopState {
+    /// Whether the terminal reports mouse events now.
+    mouse_capture: bool,
+    /// The redraw timer, made by [`redraw_ticker`].
+    ticker: Interval,
+}
 
 /// Whether the event loop keeps running.
 #[derive(Debug, PartialEq)]
@@ -111,13 +121,45 @@ pub(crate) async fn run(
     client: &OllamaClient,
     update_check: Option<UpdateCheck>,
 ) -> Result<()> {
-    let mut terminal = setup_terminal()?;
+    install_panic_hook();
+
+    let mut terminal = setup_terminal().inspect_err(|_error| restore_terminal(&mut stdout()))?;
     let mut events = event::EventStream::new();
 
     let result = run_app(&mut terminal, &mut events, cli, client, update_check).await;
 
     teardown_terminal(&mut terminal)?;
     result
+}
+
+/// Restore the terminal before a panic message is printed, so a panic does
+/// not leave the shell in raw mode on the alternate screen. The previous
+/// hook then prints the message as usual.
+fn install_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal(&mut stdout());
+        previous_hook(panic_info);
+    }));
+}
+
+/// Undo every terminal setting the TUI turns on, as far as it can. Used when
+/// the normal teardown cannot run: after a panic or a failed setup. Each
+/// step that was not set up does nothing harmful, and errors are ignored
+/// because nothing more can be done about them.
+fn restore_terminal(writer: &mut impl Write) {
+    let left = execute!(
+        writer,
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
+
+    left.ok();
+    disable_raw_mode().ok();
 }
 
 /// Configure the terminal for TUI mode: raw input, alternate screen, enhanced keys.
@@ -216,22 +258,16 @@ async fn run_loop<W: Write>(
     update_check: Option<UpdateCheck>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
-    let mut mouse_capture = false;
+    let mut state = LoopState {
+        mouse_capture: false,
+        ticker: redraw_ticker(),
+    };
     let mut outcome = Ok(LoopControl::Continue);
 
     start_update_worker(update_check, &tx);
 
     while let Ok(LoopControl::Continue) = outcome {
-        outcome = step(
-            terminal,
-            app,
-            events,
-            &mut rx,
-            client,
-            &tx,
-            &mut mouse_capture,
-        )
-        .await;
+        outcome = step(terminal, app, events, &mut rx, client, &tx, &mut state).await;
     }
 
     // `Ok(Exit)` ends the loop normally; an error ends it with that error.
@@ -253,11 +289,11 @@ async fn step<W: Write>(
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     client: &OllamaClient,
     tx: &mpsc::UnboundedSender<UiEvent>,
-    mouse_capture: &mut bool,
+    state: &mut LoopState,
 ) -> Result<LoopControl> {
-    draw_frame(terminal, app, mouse_capture)?;
+    draw_frame(terminal, app, &mut state.mouse_capture)?;
 
-    next_control(app, events, rx, client, tx).await
+    next_control(app, events, rx, &mut state.ticker, client, tx).await
 }
 
 /// Apply the mouse-capture setting and draw one frame.
@@ -277,6 +313,7 @@ async fn next_control(
     app: &mut app::App,
     events: &mut (impl Stream<Item = std::io::Result<Event>> + Unpin),
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    ticker: &mut Interval,
     client: &OllamaClient,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> Result<LoopControl> {
@@ -284,7 +321,7 @@ async fn next_control(
         return Ok(LoopControl::Exit);
     }
 
-    let input = next_input(events, rx).await;
+    let input = next_input(events, rx, ticker).await;
 
     handle_input(app, input, rx, client, tx).await
 }
@@ -298,13 +335,23 @@ async fn next_control(
 async fn next_input(
     events: &mut (impl Stream<Item = std::io::Result<Event>> + Unpin),
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    ticker: &mut Interval,
 ) -> LoopInput {
     tokio::select! {
         biased;
         event = events.next() => LoopInput::Terminal(event),
         event = rx.recv() => LoopInput::Background(event),
-        () = tokio::time::sleep(Duration::from_millis(TICK_MILLIS)) => LoopInput::Tick,
+        _instant = ticker.tick() => LoopInput::Tick,
     }
+}
+
+/// The redraw timer. One timer serves the whole loop, so a steady stream of
+/// events cannot keep restarting it and starve the spinner and the stats.
+fn redraw_ticker() -> Interval {
+    let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MILLIS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    ticker
 }
 
 /// Handle one loop input.
@@ -620,6 +667,54 @@ mod tests {
         Ok(())
     }
 
+    /// Send `count` log lines, one every `gap`.
+    async fn send_logs_every(gap: Duration, count: usize, tx: mpsc::UnboundedSender<UiEvent>) {
+        for index in 0..count {
+            tokio::time::sleep(gap).await;
+            tx.send(UiEvent::Log(format!("chunk {index}"))).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_timer_ticks_while_events_stream() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut events = futures_util::stream::pending::<std::io::Result<Event>>();
+        let mut ticker = redraw_ticker();
+        let event_count = 25;
+        tokio::spawn(send_logs_every(Duration::from_millis(40), event_count, tx));
+
+        let mut ticks = 0;
+        let mut received = 0;
+
+        while received < event_count {
+            let input = next_input(&mut events, &mut rx, &mut ticker).await;
+            let is_tick = matches!(input, LoopInput::Tick);
+            ticks += usize::from(is_tick);
+            received += usize::from(!is_tick);
+        }
+
+        assert!(ticks >= 3, "only {ticks} ticks while events streamed");
+    }
+
+    #[test]
+    fn restoring_the_terminal_leaves_every_mode_it_turned_on() {
+        let mut output = Vec::new();
+
+        restore_terminal(&mut output);
+        install_panic_hook();
+
+        let written = String::from_utf8_lossy(&output);
+        assert!(
+            written.contains("\u{1b}[?1049l"),
+            "leaves the alternate screen"
+        );
+        assert!(
+            written.contains("\u{1b}[?2004l"),
+            "turns bracketed paste off"
+        );
+        assert!(written.contains("\u{1b}[?25h"), "shows the cursor");
+    }
+
     #[tokio::test]
     async fn a_quitting_app_exits_without_waiting_for_input() -> anyhow::Result<()> {
         let client = refused_client()?;
@@ -628,7 +723,10 @@ mod tests {
         app.should_quit = true;
         let mut events = futures_util::stream::pending();
 
-        let control = next_control(&mut app, &mut events, &mut rx, &client, &tx).await?;
+        let mut ticker = redraw_ticker();
+
+        let control =
+            next_control(&mut app, &mut events, &mut rx, &mut ticker, &client, &tx).await?;
 
         assert_eq!(control, LoopControl::Exit);
 

@@ -126,6 +126,70 @@ impl App {
         self.cursor = self.input.len();
     }
 
+    /// Delete everything before the cursor (Ctrl+U).
+    pub(super) fn delete_to_start(&mut self) {
+        self.clamp_cursor_to_boundary();
+
+        self.input.replace_range(..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    /// Delete everything from the cursor to the end (Ctrl+K).
+    pub(super) fn delete_to_end(&mut self) {
+        self.clamp_cursor_to_boundary();
+
+        self.input.truncate(self.cursor);
+    }
+
+    /// Delete the word before the cursor and the spaces after it (Ctrl+W).
+    pub(super) fn delete_word_before(&mut self) {
+        self.clamp_cursor_to_boundary();
+
+        let word_start = self.previous_word_start();
+        self.input.replace_range(word_start..self.cursor, "");
+        self.cursor = word_start;
+    }
+
+    /// Move the cursor to the start of the word before it (Alt+Left).
+    pub(super) fn move_word_left(&mut self) {
+        self.clamp_cursor_to_boundary();
+
+        self.cursor = self.previous_word_start();
+    }
+
+    /// Move the cursor to the end of the word after it (Alt+Right).
+    pub(super) fn move_word_right(&mut self) {
+        self.clamp_cursor_to_boundary();
+
+        self.cursor = self.next_word_end();
+    }
+
+    /// Byte index where the word before the cursor starts, skipping the
+    /// spaces between the cursor and that word.
+    fn previous_word_start(&self) -> usize {
+        let before_word_end = self.input[..self.cursor].trim_end();
+
+        before_word_end
+            .char_indices()
+            .rev()
+            .find(|(_index, character)| character.is_whitespace())
+            .map_or(0, |(index, space)| index + space.len_utf8())
+    }
+
+    /// Byte index where the word after the cursor ends, skipping the spaces
+    /// between the cursor and that word.
+    fn next_word_end(&self) -> usize {
+        let after_cursor = &self.input[self.cursor..];
+        let word_and_rest = after_cursor.trim_start();
+        let spaces = after_cursor.len() - word_and_rest.len();
+
+        let word_length = word_and_rest
+            .find(char::is_whitespace)
+            .unwrap_or(word_and_rest.len());
+
+        self.cursor + spaces + word_length
+    }
+
     /// Byte index where the character before the cursor starts, or `None`
     /// at the start of the input.
     fn previous_char_start(&self) -> Option<usize> {
@@ -137,7 +201,7 @@ impl App {
 
     /// Navigate up: cycle suggestions or recall older history entries.
     pub(super) fn move_up(&mut self) {
-        let suggestion_count = self.suggestions().len();
+        let suggestion_count = self.browsable_suggestion_count();
 
         if suggestion_count > 0 {
             self.selected = self.selected.min(suggestion_count - 1).saturating_sub(1);
@@ -149,7 +213,7 @@ impl App {
 
     /// Navigate down: cycle suggestions or recall newer history entries.
     pub(super) fn move_down(&mut self) {
-        let suggestion_count = self.suggestions().len();
+        let suggestion_count = self.browsable_suggestion_count();
 
         if suggestion_count > 0 {
             self.selected = (self.selected + 1).min(suggestion_count - 1);
@@ -157,6 +221,24 @@ impl App {
         }
 
         self.recall_newer_history();
+    }
+
+    /// How many suggestions Up and Down move through. None while a recalled
+    /// history entry is shown unchanged: then Up and Down stay on history,
+    /// even when the entry is a slash command.
+    fn browsable_suggestion_count(&self) -> usize {
+        if self.is_showing_history_entry() {
+            return 0;
+        }
+
+        self.suggestions().len()
+    }
+
+    /// Whether the input shows a recalled history entry the user has not edited.
+    fn is_showing_history_entry(&self) -> bool {
+        self.history_idx
+            .and_then(|index| self.history.get(index))
+            .is_some_and(|entry| *entry == self.input)
     }
 
     /// Show the history entry before the one shown now, or the newest entry
@@ -350,6 +432,77 @@ mod tests {
 
         app.move_down();
         assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn up_walks_past_a_recalled_slash_command() {
+        let mut app = test_app();
+        app.history = vec!["fix the tests".to_string(), "/clear".to_string()];
+
+        app.move_up();
+        assert_eq!(app.input, "/clear");
+
+        app.move_up();
+        assert_eq!(app.input, "fix the tests");
+
+        app.move_down();
+        assert_eq!(app.input, "/clear");
+    }
+
+    #[test]
+    fn an_edited_slash_command_from_history_shows_suggestions_again() {
+        let mut app = test_app();
+        app.history = vec!["/mode".to_string()];
+
+        app.move_up();
+        app.insert_char(' ');
+        app.move_down();
+
+        assert_eq!(app.input, "/mode ");
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn line_editing_keys_delete_and_move_by_word() {
+        let mut app = test_app();
+        app.insert_text("fix  the tests");
+
+        app.move_word_left();
+        assert_eq!(app.cursor, 9);
+
+        app.move_word_left();
+        app.move_word_left();
+        assert_eq!(app.cursor, 0);
+
+        app.move_word_right();
+        assert_eq!(app.cursor, 3);
+
+        app.move_word_right();
+        assert_eq!(app.cursor, 8);
+
+        app.delete_word_before();
+        assert_eq!(app.input, "fix   tests");
+        assert_eq!(app.cursor, 5);
+
+        app.delete_to_end();
+        assert_eq!(app.input, "fix  ");
+
+        app.delete_to_start();
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn word_keys_work_on_wide_characters() {
+        let mut app = test_app();
+        app.insert_text("añb 😀x");
+
+        app.delete_word_before();
+        assert_eq!(app.input, "añb ");
+
+        app.move_home();
+        app.move_word_right();
+        assert_eq!(app.cursor, "añb".len());
     }
 
     #[test]
