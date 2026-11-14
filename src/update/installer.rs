@@ -1,6 +1,6 @@
 //! Running the release installer and passing on its output line by line.
 
-use crate::constants::update::{INSTALL_DIR_VARIABLE, INSTALLER_COMMAND};
+use crate::constants::update::{INSTALL_DIR_VARIABLE, INSTALLER_SCRIPT_URL};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -10,8 +10,8 @@ use tokio::process::{Child, ChildStdout, Command};
 /// The release installer and the folder it installs into.
 #[derive(Clone, Debug)]
 pub(crate) struct Installer {
-    /// Shell command that installs the release: [`INSTALLER_COMMAND`]
-    /// outside tests.
+    /// Shell command that installs the release: [`installer_command`] for
+    /// [`INSTALLER_SCRIPT_URL`] outside tests.
     pub(crate) command: String,
     /// Folder for the new binary, passed to the installer as
     /// `OPENBATRANGS_INSTALL_DIR`. `None` leaves the choice to the installer.
@@ -22,7 +22,7 @@ impl Installer {
     /// The release installer, set to replace the running executable.
     pub(crate) fn for_this_process() -> Self {
         Self {
-            command: INSTALLER_COMMAND.to_string(),
+            command: installer_command(INSTALLER_SCRIPT_URL),
             install_dir: executable_folder(std::env::current_exe().ok()),
         }
     }
@@ -56,6 +56,21 @@ impl Installer {
             .kill_on_drop(true)
             .spawn()
     }
+}
+
+/// Shell command that downloads the installer script at `script_url` to a
+/// temporary file and runs it only when the download succeeded.
+///
+/// Piping `curl` into `sh` would take the exit status from `sh`, which reads
+/// empty input after a failed download and reports success, and would run
+/// part of the script when the connection drops halfway.
+fn installer_command(script_url: &str) -> String {
+    format!(
+        "script=\"$(mktemp)\" || exit; \
+         trap 'rm -f \"$script\"' EXIT; \
+         curl -fsSL '{script_url}' -o \"$script\" || exit; \
+         sh \"$script\""
+    )
 }
 
 /// The folder that holds `executable`, or `None` when it is unknown.
@@ -99,7 +114,7 @@ mod tests {
         let installer = Installer::for_this_process();
         let executable = std::env::current_exe()?;
 
-        assert_eq!(installer.command, INSTALLER_COMMAND);
+        assert_eq!(installer.command, installer_command(INSTALLER_SCRIPT_URL));
         assert_eq!(installer.install_dir.as_deref(), executable.parent());
         Ok(())
     }
@@ -140,5 +155,43 @@ mod tests {
 
         assert_eq!(lines, vec!["broken".to_string()]);
         assert!(format!("{outcome:?}").contains("the installer failed"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_is_an_error() {
+        let installer = fake_installer(&installer_command("file:///nonexistent/install.sh"), None);
+        let mut lines = Vec::new();
+
+        let outcome = installer.run(|line| lines.push(line)).await;
+
+        assert!(
+            format!("{outcome:?}").contains("the installer failed"),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_downloaded_script_runs_and_is_removed() -> anyhow::Result<()> {
+        let folder = unique_temp_dir("openbatrangs-installer-script");
+        let script = folder.join("install.sh");
+        std::fs::write(&script, "echo \"running $0\"\n")?;
+        let url = format!("file://{}", script.display());
+        let mut lines = Vec::new();
+
+        fake_installer(&installer_command(&url), None)
+            .run(|line| lines.push(line))
+            .await?;
+
+        let ran_from = lines
+            .first()
+            .and_then(|line| line.strip_prefix("running "))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        assert_ne!(ran_from, script);
+        assert!(ran_from.is_absolute(), "{lines:?}");
+        assert!(!ran_from.exists(), "the downloaded script was left behind");
+
+        std::fs::remove_dir_all(folder)?;
+        Ok(())
     }
 }
