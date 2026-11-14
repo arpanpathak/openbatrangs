@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, earlier_turns_section, max_output_tokens};
+pub(crate) use native::tools_schema;
 pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind, step_limit_notice};
 pub(crate) use tool::describe_call;
 
@@ -83,6 +84,9 @@ pub struct RunContinuation<'a> {
     pub earlier: Vec<ChatMessage>,
     /// Sink receiving conversation snapshots; `None` in one-shot mode.
     pub sink: Option<&'a mut dyn HistorySink>,
+    /// Receives the untrimmed conversation once, when the run ends. Used by
+    /// `--transcript-out`.
+    pub transcript: Option<&'a mut dyn HistorySink>,
 }
 
 /// Immutable configuration for the agentic coding loop.
@@ -121,9 +125,9 @@ pub struct AgentConfig {
 /// - `client`: Ollama client for model calls.
 /// - `model`: model name to use for completions.
 /// - `task`: user's task description.
-/// - `continuation`: the interrupted run to continue and the snapshot sink;
-///   `None` in one-shot mode. Only the native tool loop consumes the
-///   conversation.
+/// - `continuation`: prior conversation, resume sink and transcript sink.
+///   One-shot mode sets only the transcript sink. Only the native loop reads
+///   the prior conversation.
 /// - `reporter`: output sink for status and results.
 /// - `confirmer`: human-in-the-loop confirmer for writes/commands.
 ///
