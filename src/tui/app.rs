@@ -731,6 +731,7 @@ impl App {
                 name, arguments, ..
             } => self.last_action = format!("🔧 {}", describe_call(name, arguments)),
             AgentEvent::AskUser { question } => self.on_question(question),
+            AgentEvent::StepLimitReached { max_steps } => self.on_step_limit(*max_steps),
             AgentEvent::Finished { answer, .. } => self.reply = answer.clone(),
             AgentEvent::StepStarted { .. }
             | AgentEvent::TextEnded(_)
@@ -753,6 +754,15 @@ impl App {
         let prompt = self.current_prompt.clone().unwrap_or_default();
 
         self.interrupted_task = Some(format!("{prompt}\n\nYou asked the user: {question}"));
+    }
+
+    /// Keep a run that used every step without an answer, the same way an
+    /// interrupted run is kept: the next message continues it with its whole
+    /// conversation. The chat history records how the run ended, so later
+    /// runs know about it too.
+    fn on_step_limit(&mut self, max_steps: usize) {
+        self.interrupted_task = self.current_prompt.clone();
+        self.reply = format!("The run stopped after {max_steps} steps without a final answer.");
     }
 
     /// Update the token rate for streamed `text`.
@@ -2026,6 +2036,36 @@ mod tests {
             .map(|turn| turn.content.as_str())
             .collect();
         assert_eq!(turns, ["rename the parser", "Renamed it to reader."]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_run_that_reaches_the_step_limit_is_continued_by_the_next_message() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://localhost:11434")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        let conversation = vec![serde_json::json!({"role": "user", "content": "build the app"})];
+        app.current_prompt = Some("build the app".to_string());
+        app.remember_chat_turn(crate::ollama::Role::User, "build the app".to_string());
+
+        app.handle_event(UiEvent::History(conversation.clone()), &client, &tx);
+        let limit = AgentEvent::StepLimitReached { max_steps: 40 };
+        app.handle_event(UiEvent::Agent(limit), &client, &tx);
+        app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
+
+        assert!(app.transcript.text().contains("Reached max steps (40)"));
+        let last_turn = app.chat_history.last().map(|turn| turn.content.as_str());
+        assert_eq!(
+            last_turn,
+            Some("The run stopped after 40 steps without a final answer.")
+        );
+
+        let next = app.task_for_submission("what happened?".to_string());
+        assert_eq!(
+            next,
+            Some(("what happened?".to_string(), Some(conversation)))
+        );
 
         Ok(())
     }

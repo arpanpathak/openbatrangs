@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, earlier_turns_section, max_output_tokens};
-pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind};
+pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind, step_limit_notice};
 pub(crate) use tool::describe_call;
 
 /// Receives snapshots of the conversation as it grows.
