@@ -4,7 +4,7 @@
 //! loop keeps `App` focused on navigation/editing while this module owns the
 //! `/command` behaviors.
 
-use super::app::App;
+use super::app::{App, JobKind};
 use super::split_command;
 use super::{ScrollMode, UiEvent, run_pull_worker, run_setup_worker};
 use crate::cli::AgentMode;
@@ -258,10 +258,10 @@ impl App {
         self.scroll_mode = ScrollMode::Follow;
 
         let client = client.clone();
-        let tx = tx.clone();
-        let handle = tokio::spawn(run_pull_worker(client, name, tx));
+        let job_tx = self.job_sender(tx);
+        let handle = tokio::spawn(run_pull_worker(client, name, job_tx));
 
-        self.current_task = Some(handle);
+        self.track_job(JobKind::Command, handle);
     }
 
     /// Toggle read-only mode on/off, preventing or allowing file writes and commands.
@@ -402,9 +402,10 @@ impl App {
         self.last_action = "setup".to_string();
         self.scroll_mode = ScrollMode::Follow;
 
-        let handle = tokio::spawn(run_setup_worker(client.clone(), tx.clone()));
+        let job_tx = self.job_sender(tx);
+        let handle = tokio::spawn(run_setup_worker(client.clone(), job_tx));
 
-        self.current_task = Some(handle);
+        self.track_job(JobKind::Command, handle);
     }
 
     /// Clear the transcript, the streamed reply, the prompt, and the

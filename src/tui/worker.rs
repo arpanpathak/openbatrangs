@@ -51,6 +51,15 @@ pub(crate) enum UiEvent {
         /// One-shot channel for the user's yes/no answer.
         response: oneshot::Sender<bool>,
     },
+    /// An event from a background job (an agent task, a pull or a setup),
+    /// tagged with the job's number so events from a cancelled job can be
+    /// told apart from those of the job that runs now.
+    Job {
+        /// The number the app gave the job when it started it.
+        job_id: u64,
+        /// The event the job sent.
+        event: Box<UiEvent>,
+    },
 }
 
 /// A stream of reply deltas from [`OllamaClient::chat_stream`].
@@ -62,6 +71,20 @@ type DeltaStream = Pin<Box<dyn Stream<Item = Result<Delta>> + Send + 'static>>;
 /// the event, so a failed send is ignored.
 pub(super) fn send_event(tx: &mpsc::UnboundedSender<UiEvent>, event: UiEvent) {
     tx.send(event).ok();
+}
+
+/// Pass every event of job `job_id` on to the event loop, tagged with
+/// the job's number. Ends when the job and all its senders are gone.
+pub(super) async fn forward_job_events(
+    job_id: u64,
+    mut job_rx: mpsc::UnboundedReceiver<UiEvent>,
+    tx: mpsc::UnboundedSender<UiEvent>,
+) {
+    while let Some(event) = job_rx.recv().await {
+        let event = Box::new(event);
+
+        send_event(&tx, UiEvent::Job { job_id, event });
+    }
 }
 
 /// A status callback that logs each message in the chat.
