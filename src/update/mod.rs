@@ -21,7 +21,7 @@ mod cache;
 mod installer;
 mod version;
 
-pub(crate) use installer::Installer;
+pub(crate) use installer::{Installer, installer_command};
 pub(crate) use version::{NewRelease, newer_release};
 
 use crate::cli::{Cli, home_directory};

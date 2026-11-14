@@ -16,6 +16,7 @@ use crate::constants::commands::{
 use crate::model_select::calculate_memory_budget;
 use crate::models;
 use crate::ollama::{OllamaClient, OllamaModel};
+use crate::update::installer_command;
 use anyhow::{Context, Result, bail};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -32,7 +33,7 @@ pub(crate) async fn setup_with_status(
     client: &OllamaClient,
     on_status: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
-    let install_command = format!("curl -fsSL {OLLAMA_INSTALL_SCRIPT_URL} | sh");
+    let install_command = installer_command(OLLAMA_INSTALL_SCRIPT_URL);
     ensure_running(client, OLLAMA_BINARY, &install_command, on_status).await?;
 
     let fallback = models::recommended_fallback_model(calculate_memory_budget());
@@ -254,6 +255,15 @@ mod tests {
     #[test]
     fn failed_installer_is_reported() {
         let outcome = install_if_missing(MISSING_BINARY, "false", &ignore_status);
+
+        assert!(format!("{outcome:?}").contains("Ollama install failed"));
+    }
+
+    #[test]
+    fn failed_installer_download_is_reported() {
+        let install_command = installer_command("file:///nonexistent/install.sh");
+
+        let outcome = install_if_missing(MISSING_BINARY, &install_command, &ignore_status);
 
         assert!(format!("{outcome:?}").contains("Ollama install failed"));
     }
