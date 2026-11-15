@@ -31,8 +31,8 @@ pub(crate) struct ModelPrefs {
 pub(crate) struct AgentRunConfig {
     /// Workspace directory for the agent.
     pub(crate) cwd: PathBuf,
-    /// Maximum agent iterations.
-    pub(crate) max_steps: usize,
+    /// Maximum agent iterations, or `None` for no limit.
+    pub(crate) max_steps: Option<usize>,
     /// Disable file writes and shell commands.
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
@@ -168,7 +168,7 @@ mod tests {
         assert!(config.show_thinking);
         assert!(config.is_read_only);
         assert!(config.should_confirm);
-        assert_eq!(config.max_steps, 4);
+        assert_eq!(config.max_steps, Some(4));
         assert_eq!(config.max_ctx, None);
     }
 

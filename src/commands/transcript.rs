@@ -151,7 +151,7 @@ mod tests {
     fn step_started(step: usize) -> AgentEvent {
         AgentEvent::StepStarted {
             step,
-            max_steps: 3,
+            max_steps: Some(3),
             model: "m".to_string(),
             loop_kind: LoopKind::Native,
         }

@@ -576,7 +576,7 @@ mod tests {
     fn step(step: usize) -> AgentEvent {
         AgentEvent::StepStarted {
             step,
-            max_steps: 5,
+            max_steps: Some(5),
             model: "m".to_string(),
             loop_kind: LoopKind::Native,
         }

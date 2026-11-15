@@ -32,7 +32,7 @@ only for the hardware or the VM time.
 - **Engines:** TensorRT Edge-LLM, TensorRT-LLM, vLLM, SGLang, llama.cpp, Ollama,
   and any server with OpenAI's chat completions API.
 - **Hardware:** Linux on x86_64 and ARM64, and macOS on Apple silicon and Intel.
-- **Agent loop:** one tool call per step, up to 40 steps. Tools for listing,
+- **Agent loop:** one tool call per step, with no step limit unless you set one. Tools for listing,
   reading, searching, writing and editing files, running shell commands, and
   searching the web.
 - **Modes:** `agent` with every tool, `plan` with read-only tools, and `chat`
@@ -281,7 +281,7 @@ openbatrangs update                                                      # insta
 | `--confirm` | a prompt before each file write and shell command |
 | `--read-only` | no file writes or shell commands |
 | `--no-sandbox` | shell commands without the sandbox, for a machine you can throw away |
-| `--max-steps <n>` | the step limit, 40 by default |
+| `--max-steps <n>` | stop after this many steps; no limit by default |
 | `--max-ctx <tokens>` | an upper limit on the context window, 32768 by default on Ollama |
 | `--no-think` | thinking off, for thinking models |
 | `--searxng-url <url>` | the SearXNG instance for web search |
@@ -311,7 +311,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/confirm` | turn the prompt before writes and commands on or off |
 | `/yolo` | turn off every prompt |
 | `/thinking on\|off` | show or hide the model's reasoning |
-| `/steps <n>` | set the step limit |
+| `/steps <n>\|off` | set or remove the step limit |
 | `/cwd <path>` | change the project folder |
 | `/perf` | show or hide the performance panel |
 | `/mouse on\|off` | use the mouse wheel and scrollbar, or the terminal's own text selection |

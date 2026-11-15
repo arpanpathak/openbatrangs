@@ -7,6 +7,7 @@
 use super::app::{App, JobKind};
 use super::split_command;
 use super::{ScrollMode, UiEvent, run_pull_worker, run_setup_worker};
+use crate::agent::step_limit;
 use crate::cli::AgentMode;
 use crate::constants::tui::HELP_LINES;
 use crate::ollama::{OllamaClient, OllamaModel};
@@ -94,7 +95,7 @@ impl App {
         let settings = vec![
             format!("  Server:     {}", self.server_url),
             format!("  Workspace:  {}", config.cwd.display()),
-            format!("  Max steps:  {}", config.max_steps),
+            format!("  Max steps:  {}", step_limit(config.max_steps)),
             format!("  Read-only:  {}", on_off(config.is_read_only)),
             format!("  Confirm:    {}", confirm_label(config.should_confirm)),
             format!("  Thinking:   {}", on_off(config.show_thinking)),
@@ -338,19 +339,25 @@ impl App {
         );
     }
 
-    /// Set the maximum number of agent iterations per task.
+    /// Set the maximum number of agent iterations per task, or remove the
+    /// limit with `off`.
     ///
     /// # Parameters
     ///
-    /// - `arg`: positive integer string, or empty/invalid to show usage.
+    /// - `arg`: a positive number or `off`; anything else shows usage.
     fn handle_steps_command(&mut self, arg: &str) {
-        let Some(steps) = positive_number(arg) else {
-            self.notice("Usage: /steps <positive number>".to_string());
+        let limit = match arg.trim() {
+            "off" => Some(None),
+            number => positive_number(number).map(Some),
+        };
+
+        let Some(limit) = limit else {
+            self.notice("Usage: /steps <positive number>|off".to_string());
             return;
         };
 
-        self.run_config.max_steps = steps;
-        self.notice(format!("Max steps set to {steps}"));
+        self.run_config.max_steps = limit;
+        self.notice(format!("Max steps: {}", step_limit(limit)));
     }
 
     /// Show or change the agent's working directory.
@@ -646,8 +653,12 @@ mod tests {
         let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
         app.transcript.clear();
         app.handle_steps_command("25");
-        assert_eq!(app.run_config.max_steps, 25);
-        assert!(app.transcript.text().contains("Max steps set to 25"));
+        assert_eq!(app.run_config.max_steps, Some(25));
+        assert!(app.transcript.text().contains("Max steps: 25"));
+
+        app.handle_steps_command("off");
+        assert_eq!(app.run_config.max_steps, None);
+        assert!(app.transcript.text().contains("Max steps: no limit"));
     }
 
     #[test]

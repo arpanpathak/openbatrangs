@@ -6,9 +6,10 @@
 //! 2. If the reply contains a tool call, execute it and feed the result back;
 //!    otherwise treat the reply as the final answer.
 //!
-//! The loop is bounded by `max_steps` so a model that never answers cannot
-//! keep it running forever. All tool calls are parsed through an exhaustive `Tool` enum and
-//! executed by the `execute` submodule.
+//! The loop runs until the model answers, the user interrupts it, or the
+//! model repeats one tool call five times in a row; `max_steps` adds a step
+//! limit when one is set. All tool calls are parsed through an exhaustive
+//! `Tool` enum and executed by the `execute` submodule.
 //!
 //! An Ollama server gets the JSON loop in `json_loop`, where the model writes
 //! each action as a strict JSON object. An OpenAI-compatible server gets the
@@ -53,7 +54,10 @@ use std::path::{Path, PathBuf};
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, earlier_turns_section, max_output_tokens};
 pub(crate) use native::tools_schema;
-pub use reporter::{AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind, step_limit_notice};
+pub use reporter::{
+    AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind, step_limit, step_limit_notice,
+    step_number,
+};
 pub(crate) use tool::describe_call;
 
 /// Receives snapshots of the conversation as it grows.
@@ -94,8 +98,9 @@ pub struct RunContinuation<'a> {
 pub struct AgentConfig {
     /// Working directory where the agent reads and writes files.
     pub cwd: PathBuf,
-    /// Maximum number of agent iterations before stopping.
-    pub max_steps: usize,
+    /// Maximum number of agent iterations before stopping, or `None` for no
+    /// limit.
+    pub max_steps: Option<usize>,
     /// When `true`, mutating tools (write, run command) are disabled.
     pub is_read_only: bool,
     /// When `true`, the user must approve each write/command before execution.

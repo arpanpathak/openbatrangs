@@ -2,7 +2,7 @@
 
 use super::print_status;
 use super::transcript::{CountingReporter, Outcome, Transcript, TranscriptSink, save_transcript};
-use crate::agent::{self, AgentConfig, RunContinuation};
+use crate::agent::{self, AgentConfig, RunContinuation, step_limit};
 use crate::banner;
 use crate::cli::{
     AgentMode, AgentRunConfig, Cli, ModelPrefs, agent_run_config, model_prefs_from_cli,
@@ -144,7 +144,7 @@ fn run_summary(model: &str, config: &AgentRunConfig, model_context: u64) -> Stri
     format!(
         "\n🚀 Agent\n   model:   {model}\n   cwd:     {}\n   steps:   {}\n   context: {model_context}",
         config.cwd.display(),
-        config.max_steps,
+        step_limit(config.max_steps),
     )
 }
 

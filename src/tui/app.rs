@@ -3115,7 +3115,7 @@ mod tests {
         let mut app = test_app();
         app.transcript.apply(AgentEvent::StepStarted {
             step: 1,
-            max_steps: 3,
+            max_steps: Some(3),
             model: "m".to_string(),
             loop_kind: crate::agent::LoopKind::Native,
         });

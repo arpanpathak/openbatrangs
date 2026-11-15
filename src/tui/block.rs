@@ -14,7 +14,7 @@
 use super::chat::{code_lines, notice_line};
 use super::markdown::markdown_lines;
 use super::text::{spans_width, wrap_spans};
-use crate::agent::describe_call;
+use crate::agent::{describe_call, step_number};
 use crate::constants::tui::CHAT_SEPARATOR_LENGTH;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -67,8 +67,8 @@ pub(super) struct ToolRun {
 pub(super) struct Step {
     /// Step number, counted from 1.
     number: usize,
-    /// Step budget of the run.
-    max_steps: usize,
+    /// Step budget of the run, or `None` for no limit.
+    max_steps: Option<usize>,
     /// Model that answered.
     model: String,
     /// Streamed reasoning.
@@ -90,7 +90,7 @@ pub(super) struct Step {
 
 impl Step {
     /// A running step, open.
-    pub(super) fn new(number: usize, max_steps: usize, model: String) -> Self {
+    pub(super) fn new(number: usize, max_steps: Option<usize>, model: String) -> Self {
         Self {
             number,
             max_steps,
@@ -737,10 +737,9 @@ fn result_mark(outcome: Option<&ToolOutcome>) -> (&'static str, Color) {
 /// The step header: arrow, number, title, model, and time taken.
 fn step_header(step: &Step) -> Vec<Span<'static>> {
     let number = format!(
-        "{} Step {}/{}",
+        "{} Step {}",
         fold_arrow(step.is_open),
-        step.number,
-        step.max_steps
+        step_number(step.number, step.max_steps)
     );
     let details = format!(" · {} · {}", step.model, step_time(step));
 
@@ -838,7 +837,7 @@ mod tests {
 
     /// A step with reasoning, a reply and two tool calls, one finished.
     fn busy_step() -> Step {
-        let mut step = Step::new(3, 10, "qwen".to_string());
+        let mut step = Step::new(3, Some(10), "qwen".to_string());
         step.reasoning = "**Checking the tests**\nI should run them.".to_string();
         step.reply = "Running `cargo test`.".to_string();
         step.add_tool(
@@ -933,7 +932,7 @@ mod tests {
 
     #[test]
     fn step_titles_fall_back_to_the_tool_or_working() {
-        let mut step = Step::new(1, 2, "m".to_string());
+        let mut step = Step::new(1, Some(2), "m".to_string());
         assert_eq!(step_title(&step), "working");
 
         step.add_tool("c1".to_string(), "list_files".to_string(), "{}".to_string());
@@ -969,7 +968,7 @@ mod tests {
 
     #[test]
     fn a_failed_tool_has_a_cross_and_bad_arguments_stay_as_text() {
-        let mut step = Step::new(1, 1, "m".to_string());
+        let mut step = Step::new(1, Some(1), "m".to_string());
         step.add_tool(
             "c1".to_string(),
             "run_command".to_string(),

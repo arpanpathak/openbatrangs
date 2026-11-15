@@ -482,7 +482,7 @@ mod tests {
     fn run_config(mode: AgentMode) -> AgentRunConfig {
         AgentRunConfig {
             cwd: std::path::PathBuf::from("/tmp/openbatrangs-tui-worker-missing-workspace"),
-            max_steps: 1,
+            max_steps: Some(1),
             is_read_only: false,
             should_confirm: true,
             use_sandbox: true,

@@ -474,7 +474,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         self.save_conversation();
         self.step += 1;
 
-        if self.step > self.config.max_steps {
+        if self.config.max_steps.is_some_and(|limit| self.step > limit) {
             return State::GiveUp;
         }
 
@@ -590,8 +590,9 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Warn that the step budget ran out without an answer.
     fn give_up(&mut self) -> State {
+        // The run gives up on the step after the last one allowed.
         self.reporter.report(AgentEvent::StepLimitReached {
-            max_steps: self.config.max_steps,
+            max_steps: self.step - 1,
         });
 
         State::Done
@@ -1840,7 +1841,7 @@ mod tests {
 
         let native_step = || AgentEvent::StepStarted {
             step: 1,
-            max_steps: 1,
+            max_steps: Some(1),
             model: "m".to_string(),
             loop_kind: LoopKind::Native,
         };
