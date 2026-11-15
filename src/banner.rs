@@ -54,6 +54,24 @@ pub fn banner_lines() -> Vec<Line<'static>> {
     lines
 }
 
+/// The batarang alone, with the gradient spread over its own width, for the
+/// corner of the TUI's stats panel.
+pub fn batarang_lines() -> Vec<Line<'static>> {
+    let width = batarang_width();
+
+    BATARANG_LEFT_HALF
+        .iter()
+        .map(|half| styled_row(&mirrored(half), width))
+        .collect()
+}
+
+/// Width of the batarang, in characters: twice its left half.
+pub fn batarang_width() -> usize {
+    BATARANG_LEFT_HALF
+        .first()
+        .map_or(0, |half| half.chars().count() * 2)
+}
+
 /// Print the startup banner to stdout.
 pub fn print_banner() {
     print!("{}", banner_text());

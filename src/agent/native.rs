@@ -1476,7 +1476,7 @@ mod tests {
         model: &str,
         task: &str,
         replies: Vec<Reply>,
-    ) -> Result<(Vec<Value>, String)> {
+    ) -> Result<(Vec<String>, String)> {
         let (url, server) = serve_and_record(replies).await?;
         let client = OllamaClient::openai(&url, None, true)?;
         let mut reporter = RecordingReporter::default();
@@ -1498,12 +1498,8 @@ mod tests {
         let bodies = tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .context("the run sent fewer requests than the server had replies")???;
-        let requests = bodies
-            .iter()
-            .map(|body| serde_json::from_str(body))
-            .collect::<serde_json::Result<Vec<Value>>>()?;
 
-        Ok((requests, reporter.output))
+        Ok((bodies, reporter.output))
     }
 
     #[tokio::test]
@@ -1545,12 +1541,14 @@ mod tests {
         let (card, _output) = requests_of_run(&config, "gemma-4-26b", "hi", answer()).await?;
         config.temperature = Some(0.3);
         let (chosen, _output) = requests_of_run(&config, "gemma-4-26b", "hi", answer()).await?;
+        let card: Value = serde_json::from_str(&card[0])?;
+        let chosen: Value = serde_json::from_str(&chosen[0])?;
 
-        assert_eq!(card[0]["temperature"], 1.0);
-        assert_eq!(card[0]["top_p"], 0.95);
-        assert_eq!(card[0]["top_k"], 64);
-        assert_eq!(chosen[0]["temperature"], 0.3);
-        assert_eq!(chosen[0]["top_k"], 64);
+        assert_eq!(card["temperature"], 1.0);
+        assert_eq!(card["top_p"], 0.95);
+        assert_eq!(card["top_k"], 64);
+        assert_eq!(chosen["temperature"], 0.3);
+        assert_eq!(chosen["top_k"], 64);
 
         std::fs::remove_dir_all(root)?;
         Ok(())

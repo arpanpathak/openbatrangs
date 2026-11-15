@@ -55,7 +55,3 @@ pub const NO_SERVER_STATS: &str = "no server stats published";
 
 /// The panel's only server line before the first poll has finished.
 pub const WAITING_FOR_SERVER_STATS: &str = "waiting for server stats";
-
-/// The heading above the local figures when the model server is on another
-/// host.
-pub const THIS_MACHINE_HEADING: &str = "this machine";

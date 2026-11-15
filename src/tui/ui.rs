@@ -17,15 +17,15 @@
 use super::app::{App, FocusArea};
 use super::scroll::{chat_text_width, chat_visible_height};
 use super::selection;
-use super::{ScrollMode, text_wrapped_height, wrap_text_to_lines};
+use super::{ScrollMode, wrap_text_to_lines};
 use crate::banner;
 use crate::cli::{AgentMode, AgentRunConfig};
 use crate::constants::tui::{
-    HEADER_HEIGHT, INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
-    MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MAX_PANEL_HEIGHT,
-    PERF_MIN_TERMINAL_HEIGHT, PERF_PANEL_HEIGHT, WELCOME_HINTS,
+    INPUT_BOX_PADDING, MAX_INPUT_LINES, MAX_SUGGESTION_ITEMS, MIN_INPUT_BOX_HEIGHT,
+    MODEL_PICKER_HEIGHT_PERCENT, MODEL_PICKER_WIDTH_PERCENT, PERF_MIN_TERMINAL_HEIGHT,
+    WELCOME_HINTS,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -34,6 +34,9 @@ use ratatui::widgets::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+/// Rows of the batarang in the panel's corner.
+const BATARANG_ROWS: u16 = 5;
 
 /// Top-level rendering function: compose and draw the full TUI frame.
 ///
@@ -44,19 +47,16 @@ use unicode_width::UnicodeWidthStr;
 /// - `frame`: the ratatui frame to render into.
 /// - `app`: mutable reference to app state (used for render caching).
 pub(super) fn ui(frame: &mut ratatui::Frame, app: &mut App) {
-    let chunks = layout_chunks(frame.area(), app);
-
-    render_header(frame, app, chunks[0]);
-    render_transcript(frame, app, chunks[1]);
-    render_status_line(frame, app, chunks[2]);
-
     let perf_on_screen = perf_visible(app, frame.area().height);
     app.set_perf_on_screen(perf_on_screen);
 
-    if perf_on_screen {
-        render_perf_panel(frame, app, chunks[3]);
-    }
+    let panel = panel_lines(app, perf_on_screen);
+    let chunks = layout_chunks(frame.area(), app, panel_height(&panel, perf_on_screen));
 
+    render_transcript(frame, app, chunks[0]);
+    render_rule(frame, app.focus_area, chunks[1]);
+    render_panel(frame, panel, perf_on_screen, chunks[2]);
+    render_status_line(frame, app, chunks[3]);
     render_suggestions(frame, app, chunks[4]);
     render_input_box(frame, app, chunks[5]);
     render_cursor(frame, app, chunks[5]);
@@ -69,14 +69,6 @@ fn perf_visible(app: &App, area_height: u16) -> bool {
     app.show_perf && area_height >= PERF_MIN_TERMINAL_HEIGHT
 }
 
-/// Height of the top header: one extra line while a task prompt is set.
-fn header_height(app: &App) -> u16 {
-    match app.prompt_line() {
-        Some(_) => HEADER_HEIGHT + 1,
-        None => HEADER_HEIGHT,
-    }
-}
-
 /// Height of the suggestion list based on the number of matching commands.
 fn suggestions_height(app: &App) -> u16 {
     let count = app.suggestions().len();
@@ -87,29 +79,18 @@ fn suggestions_height(app: &App) -> u16 {
     }
 }
 
-/// Dynamic perf panel height based on wrapped text content.
-fn perf_height(app: &App, width: u16) -> u16 {
-    let max_text_width = (width as usize).saturating_sub(2).max(1);
-    let rows = text_wrapped_height(&app.perf_lines().join("\n"), max_text_width);
-
-    (rows as u16 + 2).clamp(PERF_PANEL_HEIGHT, PERF_MAX_PANEL_HEIGHT)
-}
-
-/// Split the terminal area into vertical chunks for each UI region.
-fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
-    let perf_rows = match perf_visible(app, area.height) {
-        true => perf_height(app, area.width),
-        false => 0,
-    };
-
+/// Split the terminal into the transcript, the rule under it, the stats
+/// panel, the status line, the suggestions and the input box. The transcript
+/// takes every row the others leave.
+fn layout_chunks(area: Rect, app: &App, panel_rows: u16) -> Vec<Rect> {
     Layout::default()
         .direction(Direction::Vertical)
-        .margin(1)
+        .horizontal_margin(1)
         .constraints([
-            Constraint::Max(header_height(app)),
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Max(perf_rows),
+            Constraint::Length(panel_rows),
+            Constraint::Length(1),
             Constraint::Max(suggestions_height(app)),
             Constraint::Max(input_height(app, area.width, area.height) as u16),
         ])
@@ -117,71 +98,122 @@ fn layout_chunks(area: Rect, app: &App) -> Vec<Rect> {
         .to_vec()
 }
 
-/// Render the compact top header: identity, model, and the task prompt.
-fn render_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    if area.height == 0 {
+/// The panel's lines: the model line with the generation speed, then the
+/// stats table while the stats are on screen.
+fn panel_lines(app: &App, perf_on_screen: bool) -> Vec<Line<'static>> {
+    let model = format!(
+        "{} · speed: {:>5.1} tok/s",
+        app.model_info_line(),
+        app.tokens_per_sec
+    );
+    let table = match perf_on_screen {
+        true => app.stats_table().lines(),
+        false => Vec::new(),
+    };
+
+    std::iter::once(stat_line(&model)).chain(table).collect()
+}
+
+/// Rows the panel needs: its lines, and the batarang's height while the
+/// stats are on screen.
+fn panel_height(lines: &[Line], perf_on_screen: bool) -> u16 {
+    let logo_rows = match perf_on_screen {
+        true => BATARANG_ROWS,
+        false => 0,
+    };
+
+    (lines.len() as u16).max(logo_rows)
+}
+
+/// A thin rule under the transcript, cyan while the transcript has the keys.
+fn render_rule(frame: &mut ratatui::Frame, focus_area: FocusArea, area: Rect) {
+    let rule = "─".repeat(area.width as usize);
+    let color = pane_border_color(focus_area, FocusArea::Transcript);
+
+    frame.render_widget(Paragraph::new(rule).style(Style::default().fg(color)), area);
+}
+
+/// Draw the panel: the model line and the stats table on the left, and the
+/// batarang in the bottom right corner while the stats are on screen. The
+/// batarang is left out when the table would not fit beside it, so no stat is
+/// cut; the model line, which starts with the model's name, may run under it.
+fn render_panel(
+    frame: &mut ratatui::Frame,
+    lines: Vec<Line<'static>>,
+    perf_on_screen: bool,
+    area: Rect,
+) {
+    let widest = lines.iter().skip(1).map(Line::width).max().unwrap_or(0);
+    let logo_columns = banner::batarang_width() + 1;
+    let has_room = area.width as usize >= widest + logo_columns;
+    let logo_width = match perf_on_screen && has_room {
+        true => logo_columns as u16,
+        false => 0,
+    };
+    let [text_area, logo_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(logo_width)]).areas(area);
+
+    frame.render_widget(Paragraph::new(lines), text_area);
+    render_logo(frame, logo_area);
+}
+
+/// One panel line styled by its parts: the figures are separated by ` · `,
+/// a figure `label: value` shows its label in cyan and its value in white,
+/// and a figure without a label, such as a host name, is bold magenta.
+fn stat_line(line: &str) -> Line<'static> {
+    let separator = Span::styled(" · ", Style::default().fg(Color::DarkGray));
+    let mut spans = Vec::new();
+
+    for (index, figure) in line.split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(separator.clone());
+        }
+
+        spans.extend(figure_spans(figure));
+    }
+
+    Line::from(spans)
+}
+
+/// The spans of one figure: a cyan label and a white value, or the whole
+/// figure in bold magenta when it has no label.
+fn figure_spans(figure: &str) -> Vec<Span<'static>> {
+    let Some((label, value)) = figure.split_once(": ") else {
+        let heading = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        return vec![Span::styled(figure.to_string(), heading)];
+    };
+
+    vec![
+        Span::styled(format!("{label}: "), Style::default().fg(Color::Cyan)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ]
+}
+
+/// Draw the batarang at the bottom right of `area`; an area too small for it
+/// stays empty.
+fn render_logo(frame: &mut ratatui::Frame, area: Rect) {
+    if area.width == 0 || area.height < BATARANG_ROWS {
         return;
     }
 
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let prompt_line = app
-        .prompt_line()
-        .map(|prompt| header_prompt_line(&prompt, inner_width));
-    let lines: Vec<Line> = std::iter::once(header_model_line(app, inner_width))
-        .chain(prompt_line)
-        .collect();
+    let logo_area = Rect {
+        y: area.y + area.height - BATARANG_ROWS,
+        height: BATARANG_ROWS,
+        ..area
+    };
 
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    " openbatrangs ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        ),
-        area,
+        Paragraph::new(banner::batarang_lines()).alignment(Alignment::Right),
+        logo_area,
     );
-}
-
-/// The model, mode, and server summary line shown inside the header.
-fn header_model_line(app: &App, inner_width: usize) -> Line<'static> {
-    Line::from(Span::styled(
-        truncate_to_width(&app.model_info_line(), inner_width),
-        Style::default().fg(Color::DarkGray),
-    ))
-}
-
-/// The task prompt line shown under the model line in the header.
-fn header_prompt_line(prompt: &str, inner_width: usize) -> Line<'static> {
-    Line::from(Span::styled(
-        truncate_to_width(&format!("› {prompt}"), inner_width),
-        Style::default().fg(Color::Yellow),
-    ))
-}
-
-/// Shared frame for the transcript pane; cyan while it has the keys.
-fn transcript_block(focus_area: FocusArea) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(pane_border_color(focus_area, FocusArea::Transcript)))
-        .title(Span::styled(
-            " transcript ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
 }
 
 /// Draw the welcome banner while the transcript is empty, and the chat after that.
 fn render_transcript(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if app.transcript.is_empty() {
-        return render_welcome(frame, app.focus_area, area);
+        return render_welcome(frame, area);
     }
 
     render_chat_area(frame, app, area);
@@ -189,7 +221,7 @@ fn render_transcript(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 /// Draw the batarang banner and the starting hints in the middle of the empty
 /// transcript pane.
-fn render_welcome(frame: &mut ratatui::Frame, focus_area: FocusArea, area: Rect) {
+fn render_welcome(frame: &mut ratatui::Frame, area: Rect) {
     let hint_style = Style::default().fg(Color::DarkGray);
     let mut lines = banner::banner_lines();
     lines.push(Line::default());
@@ -202,10 +234,8 @@ fn render_welcome(frame: &mut ratatui::Frame, focus_area: FocusArea, area: Rect)
     let widest = lines.iter().map(Line::width).max().unwrap_or(0);
     let width = widest.min(u16::MAX as usize) as u16;
     let height = lines.len().min(u16::MAX as usize) as u16;
-    let inner = transcript_block(focus_area).inner(area);
 
-    frame.render_widget(transcript_block(focus_area), area);
-    frame.render_widget(Paragraph::new(lines), middle_rect(inner, width, height));
+    frame.render_widget(Paragraph::new(lines), middle_rect(area, width, height));
 }
 
 /// A rectangle of `width` by `height` cells in the middle of `area`, cut to fit.
@@ -238,10 +268,7 @@ fn render_chat_area(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .transcript
         .visible_lines(width, scroll_y, visible_height, show_focus);
 
-    frame.render_widget(
-        Paragraph::new(lines).block(transcript_block(app.focus_area)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
     render_chat_scrollbar(frame, area, content_height, scroll_y);
     render_selection(frame, app, area);
 }
@@ -254,10 +281,8 @@ fn render_selection(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let text_area = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
         width: chat_text_width(area.width) as u16,
-        height: chat_visible_height(area) as u16,
+        ..area
     };
 
     app.selected_text = selection::highlight(frame.buffer_mut(), text_area, selection);
@@ -271,14 +296,14 @@ fn follow_when_at_bottom(app: &mut App, max_scroll: usize) {
     }
 }
 
-/// Draw the scrollbar on the right border when the chat is taller than the pane.
+/// Draw the scrollbar in the last column when the chat is taller than the pane.
 fn render_chat_scrollbar(
     frame: &mut ratatui::Frame,
     area: Rect,
     content_height: usize,
     scroll_y: usize,
 ) {
-    let visible_height = area.height.saturating_sub(2) as usize;
+    let visible_height = chat_visible_height(area);
     let max_scroll = content_height.saturating_sub(visible_height);
 
     if !needs_scrollbar(max_scroll, area.width) {
@@ -286,10 +311,9 @@ fn render_chat_scrollbar(
     }
 
     let scrollbar_area = Rect {
-        x: area.x + area.width.saturating_sub(2),
-        y: area.y + 1,
+        x: area.x + area.width.saturating_sub(1),
         width: 1,
-        height: area.height.saturating_sub(2),
+        ..area
     };
     let scrollbar = Scrollbar::default()
         .orientation(ScrollbarOrientation::VerticalRight)
@@ -435,24 +459,6 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
         .collect();
 
     format!("{kept}…")
-}
-
-/// Render the GPU/CPU/RAM performance panel with live stats.
-fn render_perf_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let content = app.perf_lines().join("\n");
-
-    let panel = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" ⚡ perf "),
-        )
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(Color::Cyan));
-
-    frame.render_widget(panel, area);
 }
 
 /// Render the slash-command autocomplete suggestion list.
@@ -818,8 +824,8 @@ mod tests {
         let second = row_of("second notice", &screen).context("second row")?;
 
         app.selection = Some(Selection {
-            anchor: Position::new(area.x + 1, first),
-            cursor: Position::new(area.x + 6, second),
+            anchor: Position::new(area.x, first),
+            cursor: Position::new(area.x + 5, second),
         });
         draw(&mut app, 60, 30)?;
 
@@ -842,31 +848,76 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_task_prompt() -> anyhow::Result<()> {
+    fn the_panel_shows_the_model_the_stats_and_the_batarang() -> anyhow::Result<()> {
         let mut app = test_app();
-        app.current_prompt = Some("write a softmax kernel in CUDA Oxide please".to_string());
-        app.notice("You: write a softmax kernel".to_string());
+        app.notice("hello".to_string());
 
-        let screen = draw(&mut app, 40, 24)?;
+        let screen = draw_rows(&mut app, 140, 30)?;
+        let rows: Vec<&str> = screen.lines().collect();
+        let logo_bottom = rows
+            .iter()
+            .rposition(|row| row.contains("▀▀▀▀▀▀▀▀▀▀▀▀"))
+            .context("the batarang is drawn")?;
+        let input_top = rows
+            .iter()
+            .position(|row| row.contains('╭'))
+            .context("the input box is drawn")?;
 
-        assert!(screen.contains("› write a softmax kernel"));
-        assert!(screen.contains('…'));
+        assert!(screen.contains("mode: agent"));
+        assert!(screen.contains("RAM free"));
+        assert!(rows[logo_bottom].trim_end().ends_with('▀'));
+        assert_eq!(
+            logo_bottom + 2,
+            input_top,
+            "the status line sits between them"
+        );
 
         Ok(())
     }
 
     #[test]
-    fn a_header_without_rows_draws_nothing() -> anyhow::Result<()> {
-        let app = test_app();
-        let mut terminal = Terminal::new(TestBackend::new(20, 5))?;
+    fn stat_labels_values_and_hosts_have_their_own_colors() {
+        let line = stat_line("thor · load: 37%");
+        let styled: Vec<(&str, Option<Color>)> = line
+            .spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style.fg))
+            .collect();
 
-        terminal.draw(|frame| render_header(frame, &app, Rect::new(0, 0, 20, 0)))?;
-
-        assert!(
-            !terminal.backend().buffer().content()[0]
-                .symbol()
-                .contains('╭')
+        assert_eq!(
+            styled,
+            [
+                ("thor", Some(Color::Magenta)),
+                (" · ", Some(Color::DarkGray)),
+                ("load: ", Some(Color::Cyan)),
+                ("37%", Some(Color::White)),
+            ]
         );
+    }
+
+    #[test]
+    fn a_narrow_screen_keeps_the_stats_and_leaves_the_batarang_out() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.notice("hello".to_string());
+
+        let screen = draw_rows(&mut app, 60, 30)?;
+
+        assert!(screen.contains("mode: agent"));
+        assert!(!screen.contains("▀▀▀▀▀▀▀▀▀▀▀▀"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_input_has_a_box() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.notice("hello".to_string());
+
+        let screen = draw(&mut app, 120, 30)?;
+
+        assert_eq!(screen.matches('╭').count(), 1);
+        assert!(!screen.contains(" transcript "));
+        assert!(!screen.contains(" perf "));
 
         Ok(())
     }
@@ -934,9 +985,20 @@ mod tests {
         assert!(focused_rows > 0);
         assert!(status_text(&app).ends_with("↑↓ move · Enter fold · Tab back"));
 
-        app.transcript.clear();
-        let screen = draw(&mut app, 40, 24)?;
-        assert!(screen.contains("transcript"));
+        let rule_color = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "─")
+                .map(|cell| cell.fg)
+        };
+        assert_eq!(rule_color(&terminal), Some(Color::Cyan));
+
+        app.focus_area = FocusArea::Input;
+        terminal.draw(|frame| super::ui(frame, &mut app))?;
+        assert_eq!(rule_color(&terminal), Some(Color::DarkGray));
 
         Ok(())
     }
@@ -1096,8 +1158,8 @@ vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
         feed
     }
 
-    /// The text inside the perf panel's borders, one entry per row, drawn on
-    /// a 90 by 40 terminal.
+    /// The stats lines of the panel, one entry per row, drawn on a 90 by 40
+    /// terminal.
     fn perf_panel_text(app: &mut App) -> anyhow::Result<Vec<String>> {
         let mut terminal = Terminal::new(TestBackend::new(TERMINAL_WIDTH, 40))?;
         terminal.draw(|frame| super::ui(frame, app))?;
@@ -1113,54 +1175,72 @@ vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
         Ok(panel_rows(&rows))
     }
 
-    /// The rows between the perf panel's top and bottom borders, without the
-    /// side borders.
+    /// The stats table as drawn: the rows between the model line, which
+    /// follows the rule under the transcript, and the status line. The
+    /// batarang's block characters, the trailing spaces and the empty rows
+    /// are left out; the leading spaces stay, so the columns can be checked.
     fn panel_rows(rows: &[String]) -> Vec<String> {
         rows.iter()
-            .skip_while(|row| !row.contains(" perf "))
-            .skip(1)
-            .take_while(|row| row.trim_start().starts_with('│'))
-            .map(|row| row.trim().trim_matches('│').trim_end().to_string())
+            .skip_while(|row| !row.trim().starts_with('─'))
+            .skip(2)
+            .take_while(|row| !row.contains('▌'))
+            .map(|row| row.replace(['▄', '▀', '█'], "").trim_end().to_string())
+            .filter(|row| !row.is_empty())
             .collect()
     }
 
+    /// The column just past the end of the last `needle` in `row`.
+    fn end_of(row: &str, needle: &str) -> Option<usize> {
+        let start = row.rfind(needle)?;
+
+        Some(row[..start].chars().count() + needle.chars().count())
+    }
+
     #[test]
-    fn remote_server_with_a_system_report_comes_above_this_machine() -> anyhow::Result<()> {
+    fn each_figure_ends_under_the_end_of_its_heading() -> anyhow::Result<()> {
         let stats = ServerStats::from_bodies(Some(THOR_SYSTEM), None, None);
         let mut app = app_with_server("http://10.0.0.5:8079/v1", Some(stats));
 
         let panel = perf_panel_text(&mut app)?;
         println!("{}", panel.join("\n"));
+        let [headings, thor, thor_note, local] = [&panel[0], &panel[1], &panel[2], &panel[3]];
 
+        assert!(thor.trim_start().starts_with("thor"));
+        assert!(local.trim_start().starts_with("local"));
+        assert_eq!(end_of(headings, "load"), end_of(thor, "37%"));
+        assert_eq!(end_of(headings, "temp"), end_of(thor, "41 °C"));
+        assert_eq!(end_of(headings, "memory"), end_of(thor, "84.0/122.1 GB"));
+        assert_eq!(end_of(headings, "cores"), end_of(thor, "14"));
+        assert_eq!(end_of(headings, "cores"), end_of(local, "0"));
         assert_eq!(
-            panel[..3],
-            [
-                "server thor · NVIDIA Thor · GPU 37% · 4.4 W · 41 °C",
-                "memory 84.0/122.1 GB (shared with CPU) · CPU 12% · 14 cores",
-                "this machine",
-            ]
+            thor.find("NVIDIA Thor"),
+            headings.find("GPU"),
+            "text starts under its heading"
         );
-        assert!(panel[3].starts_with("GPU n/a"));
-        assert!(panel[5].starts_with("RAM "));
+        assert!(
+            thor_note.ends_with("memory shared with the CPU"),
+            "a note sits under its row"
+        );
         Ok(())
     }
 
     #[test]
-    fn remote_server_with_only_metrics_shows_the_engine_load() -> anyhow::Result<()> {
+    fn engine_load_is_a_note_under_the_server_address() -> anyhow::Result<()> {
         let stats = ServerStats::from_bodies(None, Some(VLLM_METRICS), None);
         let mut app = app_with_server("http://10.0.0.5:8000/v1", Some(stats));
 
         let panel = perf_panel_text(&mut app)?;
         println!("{}", panel.join("\n"));
 
-        assert_eq!(
-            panel[..2],
-            [
-                "server 10.0.0.5 · requests 3 running · 1 waiting · KV cache 34%",
-                "this machine",
-            ]
+        let note = panel
+            .iter()
+            .find(|row| row.contains("running   3"))
+            .context("the engine load is shown")?;
+        assert!(
+            note.trim_start().starts_with("10.0.0.5"),
+            "a server without a row is named on its note"
         );
-        assert_eq!(panel.len(), 5);
+        assert!(note.ends_with("running   3 · waiting   1 · KV cache  34%"));
         Ok(())
     }
 
@@ -1171,8 +1251,11 @@ vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
         let panel = perf_panel_text(&mut app)?;
         println!("{}", panel.join("\n"));
 
-        assert_eq!(panel[..2], ["no server stats published", "this machine"]);
-        assert!(panel[2].starts_with("GPU n/a"));
+        assert!(
+            panel
+                .iter()
+                .any(|row| row.ends_with("no server stats published"))
+        );
         Ok(())
     }
 
@@ -1184,22 +1267,28 @@ vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
         let panel = perf_panel_text(&mut app)?;
         println!("{}", panel.join("\n"));
 
-        assert_eq!(panel[..2], ["waiting for server stats", "this machine"]);
-        assert!(panel[2].starts_with("GPU n/a"));
+        assert!(
+            panel
+                .iter()
+                .any(|row| row.ends_with("waiting for server stats"))
+        );
         Ok(())
     }
 
     #[test]
-    fn local_server_shows_only_this_machine_without_a_heading() -> anyhow::Result<()> {
+    fn a_local_server_shows_only_the_local_row() -> anyhow::Result<()> {
         let mut app = app_with_server("http://127.0.0.1:11434", None);
 
         let panel = perf_panel_text(&mut app)?;
         println!("{}", panel.join("\n"));
 
-        assert_eq!(panel.len(), 3);
-        assert!(panel[0].starts_with("GPU n/a"));
-        assert!(panel[1].starts_with("CPU --"));
-        assert!(panel[2].starts_with("RAM "));
+        assert_eq!(panel.len(), 3, "headings, the local row and its note");
+        assert!(panel[1].trim_start().starts_with("local"));
+        assert!(
+            !panel[2].trim_start().starts_with("local"),
+            "the note continues the row"
+        );
+        assert!(panel[2].contains("RAM free"));
         Ok(())
     }
 }

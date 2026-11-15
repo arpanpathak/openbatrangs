@@ -92,14 +92,6 @@ pub const MODEL_PICKER_WIDTH_PERCENT: u16 = 60;
 /// Height of the model picker popup as a percentage of the screen.
 pub const MODEL_PICKER_HEIGHT_PERCENT: u16 = 40;
 
-/// Height of the live performance panel (border + three content lines).
-pub const PERF_PANEL_HEIGHT: u16 = 5;
-
-/// Maximum height of the performance panel once wrapped lines are accounted
-/// for: room for four server lines, the `this machine` heading and the three
-/// local lines.
-pub const PERF_MAX_PANEL_HEIGHT: u16 = 10;
-
 /// Minimum elapsed time before the token-rate estimate refreshes.
 pub const TOKEN_RATE_MIN_ELAPSED: f64 = 0.5;
 
@@ -112,9 +104,6 @@ pub const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 
 /// Number of lines scrolled per PageUp/PageDown in the chat area.
 pub const CHAT_SCROLL_STEP: usize = 5;
-
-/// Height of the compact top header (border, model line, border).
-pub const HEADER_HEIGHT: u16 = 3;
 
 /// Maximum number of suggestion rows rendered before scrolling.
 pub const MAX_SUGGESTION_ITEMS: usize = 6;
