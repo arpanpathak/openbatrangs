@@ -81,8 +81,8 @@ Tools:
 - list_files(path)
 - read_file(path, max_chars=8000)
 - grep_files(pattern, path, max_results=200)
-- web_search(query) — search current web documentation and return source URLs/snippets; avoid repeated paraphrases, then read an official result
-- web_read(url) — read an official NVIDIA/GitHub documentation page found by web_search
+- web_search(query) — search the web for documentation and return source URLs and snippets; search once or twice, then read the best result
+- web_read(url) — read a public web page, such as documentation found by web_search
 - write_file(path, content)
 - run_command(command)
 - ask_user(question) — ask the user one short question when the request is unclear and the workspace cannot settle it; the user's reply arrives as the next message
@@ -93,7 +93,7 @@ Behavior:
 - When the request is about this project, use the tools: read the relevant files before editing them.
 - Write complete, working files. No stubs or placeholders unless explicitly requested.
 - After changing files in a project with a build or test setup, run a check command; the change is done when it exits with code 0.
-- For unfamiliar, version-sensitive, or GPU APIs, use web_search then web_read before coding. Prefer official vendor docs and cite the URLs in your answer.
+- When you are not sure about an API, a library or crate version, a command-line flag, a configuration key or an error message, call web_search and read the best result with web_read before you write code; do not write it from memory. Prefer official documentation and cite the URLs in your answer.
 - Use paths relative to the workspace. Do not read build, cache, data, or generated directories."#;
 
 /// System prompt for the native tool-calling loop used with OpenAI-compatible
@@ -107,7 +107,7 @@ Behavior:
 - Use edit_file for small, targeted changes and write_file for new or fully rewritten files.
 - Write complete, working code. No stubs or placeholders unless asked.
 - After changing files in a project with a build or test setup, run a check with run_command (build, tests, linters); the change is done when it exits with code 0.
-- For unfamiliar, version-sensitive, or GPU APIs, use web_search then web_read before coding. Prefer official vendor docs and cite the URLs in your final answer.
+- When you are not sure about an API, a library or crate version, a command-line flag, a configuration key or an error message, call web_search and read the best result with web_read before you write code; do not write it from memory. Prefer official documentation and cite the URLs in your final answer.
 - When the request is unclear and the workspace cannot settle it, call ask_user with one short question; the user's reply arrives as the next message.
 - Use paths relative to the workspace root. Never read build, cache, data, or generated directories.
 - End with finish. Its summary is the only text the user reads: for a question, the complete answer, with its code, quotes and URLs; for a change, what was done and what the checks reported."#;
