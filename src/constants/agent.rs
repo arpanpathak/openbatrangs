@@ -9,8 +9,9 @@ pub const MIN_CONTEXT_TOKENS: u64 = 4_096;
 /// the model can call `list_files` on specific directories when needed.
 pub const INITIAL_LIST_DEPTH: usize = 1;
 
-/// Default number of characters read by the `read_file` tool.
-pub const DEFAULT_READ_CHARS: usize = 8_000;
+/// Default number of characters read by the `read_file` tool: as many as
+/// one tool result may hold, so a file of a few hundred lines is read whole.
+pub const DEFAULT_READ_CHARS: usize = 20_000;
 
 /// Default maximum results for the `grep_files` tool.
 pub const DEFAULT_GREP_MAX_RESULTS: usize = 200;
@@ -93,7 +94,7 @@ Respond with exactly one JSON object:
 
 Tools:
 - list_files(path)
-- read_file(path, max_chars=8000)
+- read_file(path, offset=1, limit, max_chars=20000) — whole lines from line offset; a long file is read in parts, and the result says the offset to read on from
 - grep_files(pattern, path, max_results=200)
 - web_search(query) — search the web for documentation and return source URLs and snippets; search once or twice, then read the best result
 - web_read(url) — read a public web page, such as documentation found by web_search

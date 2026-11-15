@@ -124,6 +124,7 @@ mod tests {
         };
         let read = Tool::ReadFile {
             path: "a.rs".to_string(),
+            lines: crate::tools::LineRange::default(),
             max_chars: 10,
         };
 

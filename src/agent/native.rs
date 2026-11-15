@@ -1368,12 +1368,14 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a text file, truncated to max_chars characters.",
+                "description": "Read whole lines of a text file, exactly as stored. The header gives the lines returned and the file's line count; when lines are left, the result ends with the offset to read on from. Read a long file in parts this way before you edit it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "File path relative to the workspace root." },
-                        "max_chars": { "type": "integer", "description": "Maximum characters to return; defaults to 8000." }
+                        "offset": { "type": "integer", "description": "First line to read, counting from 1; defaults to 1." },
+                        "limit": { "type": "integer", "description": "Most lines to read; defaults to the rest of the file." },
+                        "max_chars": { "type": "integer", "description": "Maximum characters to return; defaults to 20000." }
                     },
                     "required": ["path"]
                 }

@@ -101,9 +101,11 @@ pub(super) async fn execute_tool<C: Confirmer>(
 ) -> Result<String> {
     match tool {
         Tool::ListFiles { path } => tools::list_files(cwd, path, DEFAULT_LIST_DEPTH),
-        Tool::ReadFile { path, max_chars } => {
-            tools::read_file(cwd, path, (*max_chars).min(MAX_TOOL_OUTPUT))
-        }
+        Tool::ReadFile {
+            path,
+            lines,
+            max_chars,
+        } => tools::read_file(cwd, path, *lines, (*max_chars).min(MAX_TOOL_OUTPUT)),
         Tool::GrepFiles {
             pattern,
             path,
@@ -428,6 +430,7 @@ mod tests {
 
         let read = Tool::ReadFile {
             path: "src/lib.rs".to_string(),
+            lines: crate::tools::LineRange::default(),
             max_chars: 100,
         };
         let output = run(&config, read, &mut changed, &mut confirmer).await?;
@@ -552,6 +555,7 @@ mod tests {
 
         let missing = report(Tool::ReadFile {
             path: "missing.txt".to_string(),
+            lines: crate::tools::LineRange::default(),
             max_chars: 10,
         })
         .await;

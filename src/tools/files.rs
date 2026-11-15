@@ -15,7 +15,7 @@ use super::text::{truncate, truncate_to};
 use crate::constants::tools::{
     BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, MAX_LISTED_FILES, SKIPPED_DIRS, SKIPPED_ROOT_DIRS,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -197,24 +197,117 @@ fn listing_line(file: &DirEntry, root: &Path, canonical_root: &Path) -> String {
     format!("{relative} ({size} bytes)\n")
 }
 
-/// Read a text file with a size cap.
+/// The lines of a file that [`read_file`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineRange {
+    /// First line to return, counting from 1.
+    pub(crate) offset: usize,
+    /// Most lines to return; `None` reads on to the end of the file.
+    pub(crate) limit: Option<usize>,
+}
+
+impl Default for LineRange {
+    /// The whole file.
+    fn default() -> Self {
+        Self {
+            offset: 1,
+            limit: None,
+        }
+    }
+}
+
+/// Read whole lines of a text file, as many as fit in `max_chars`.
+///
+/// The text is returned exactly as stored, so it can be copied into an
+/// `old_string`. The header names the lines returned and the file's line
+/// count, and a read that stops before the end says which `offset` reads on.
 ///
 /// # Arguments
 /// - `root`: workspace root used for path safety.
 /// - `path`: relative file path.
-/// - `max_chars`: maximum characters to include.
+/// - `range`: the first line and the most lines to return.
+/// - `max_chars`: most bytes of file text to return; a first line longer
+///   than that is cut.
 ///
 /// # Returns
-/// A header line plus the (possibly truncated) file contents.
-pub(crate) fn read_file(root: &Path, path: &str, max_chars: usize) -> Result<String> {
+/// A header line, the lines, and the offset to read on from when lines are
+/// left.
+pub(crate) fn read_file(
+    root: &Path,
+    path: &str,
+    range: LineRange,
+    max_chars: usize,
+) -> Result<String> {
     let file = canonical_file(root, path)?;
     let canonical_root = canonical_root(root)?;
     let content = fs::read_to_string(&file).context("failed to read file (may be binary)")?;
+    let total = content.split_inclusive('\n').count();
+    let first = range.offset.max(1);
+
+    ensure!(
+        first <= total.max(1),
+        "offset {first} is past the end of {path}, which has {total} lines"
+    );
 
     let shown_path = relative_to_root(&file, root, &canonical_root).display();
-    let truncated = truncate_to(content, max_chars);
+    let (text, last) = whole_lines(&content, first, range.limit, max_chars);
+    let span = line_span(first, last, total);
+    let rest = continuation(&text, last, total);
 
-    Ok(format!("--- {shown_path} ---\n{truncated}"))
+    Ok(format!("--- {shown_path} ({span}) ---\n{text}{rest}"))
+}
+
+/// The whole lines of `content` from line `first` on, at most `limit` of
+/// them and at least one, while they fit in `max_chars` bytes; a first line
+/// longer than that is cut. Returns the text and the number of its last line.
+fn whole_lines(
+    content: &str,
+    first: usize,
+    limit: Option<usize>,
+    max_chars: usize,
+) -> (String, usize) {
+    let most_lines = limit.unwrap_or(usize::MAX).max(1);
+    let mut text = String::new();
+    let mut last = first - 1;
+
+    for line in content
+        .split_inclusive('\n')
+        .skip(first - 1)
+        .take(most_lines)
+    {
+        if !text.is_empty() && text.len() + line.len() > max_chars {
+            break;
+        }
+
+        text.push_str(line);
+        last += 1;
+    }
+
+    (truncate_to(text, max_chars), last)
+}
+
+/// The lines a read returned, such as `lines 1-40 of 120`.
+fn line_span(first: usize, last: usize, total: usize) -> String {
+    match total {
+        0 => "empty file".to_string(),
+        _ => format!("lines {first}-{last} of {total}"),
+    }
+}
+
+/// For a read that stops before line `total`, a line that says how many
+/// lines are left and which `offset` reads on; empty otherwise.
+fn continuation(text: &str, last: usize, total: usize) -> String {
+    if last >= total {
+        return String::new();
+    }
+
+    let separator = if text.ends_with('\n') { "" } else { "\n" };
+
+    format!(
+        "{separator}... {} more lines; read on with offset={}",
+        total - last,
+        last + 1
+    )
 }
 
 /// Write (or overwrite) a file, creating parent directories as needed.
@@ -629,11 +722,49 @@ mod tests {
     fn read_file_returns_header_and_content() -> Result<()> {
         let root = temp_dir();
         fs::write(root.join("main.rs"), "fn main() {}")?;
+        fs::write(root.join("empty.rs"), "")?;
 
-        let output = read_file(&root, "main.rs", 100)?;
+        let output = read_file(&root, "main.rs", LineRange::default(), 100)?;
+        let empty = read_file(&root, "empty.rs", LineRange::default(), 100)?;
 
-        assert!(output.contains("--- main.rs ---"));
-        assert!(output.contains("fn main() {}"));
+        assert_eq!(output, "--- main.rs (lines 1-1 of 1) ---\nfn main() {}");
+        assert_eq!(empty, "--- empty.rs (empty file) ---\n");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_file_reads_a_long_file_in_parts_with_its_exact_text() -> Result<()> {
+        let root = temp_dir();
+        let lines: String = (1..=10)
+            .map(|number| format!("line {number}\r\n"))
+            .collect();
+        fs::write(root.join("long.txt"), &lines)?;
+        let range = |offset, limit| LineRange { offset, limit };
+
+        let first = read_file(&root, "long.txt", range(1, Some(4)), 1_000)?;
+        let middle = read_file(&root, "long.txt", range(5, None), 24)?;
+        let last = read_file(&root, "long.txt", range(10, Some(0)), 1_000)?;
+
+        assert_eq!(
+            first,
+            concat!(
+                "--- long.txt (lines 1-4 of 10) ---\n",
+                "line 1\r\nline 2\r\nline 3\r\nline 4\r\n",
+                "... 6 more lines; read on with offset=5",
+            )
+        );
+        assert_eq!(
+            middle,
+            concat!(
+                "--- long.txt (lines 5-7 of 10) ---\n",
+                "line 5\r\nline 6\r\nline 7\r\n",
+                "... 3 more lines; read on with offset=8",
+            )
+        );
+        assert_eq!(last, "--- long.txt (lines 10-10 of 10) ---\nline 10\r\n");
+        assert!(read_file(&root, "long.txt", range(11, None), 1_000).is_err());
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -643,7 +774,7 @@ mod tests {
     fn read_file_rejects_missing_file() -> Result<()> {
         let root = temp_dir();
 
-        assert!(read_file(&root, "nope.rs", 100).is_err());
+        assert!(read_file(&root, "nope.rs", LineRange::default(), 100).is_err());
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -899,7 +1030,7 @@ mod tests {
     fn read_file_rejects_parent_dir_traversal() -> Result<()> {
         let root = temp_dir();
 
-        assert!(read_file(&root, "../etc/passwd", 100).is_err());
+        assert!(read_file(&root, "../etc/passwd", LineRange::default(), 100).is_err());
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -915,7 +1046,7 @@ mod tests {
         fs::write(outside.join("secret.txt"), "secret")?;
         symlink(&outside, root.join("escape"))?;
 
-        assert!(read_file(&root, "escape/secret.txt", 100).is_err());
+        assert!(read_file(&root, "escape/secret.txt", LineRange::default(), 100).is_err());
         assert!(list_files(&root, "escape", 5).is_err());
         assert!(grep_files(&root, "secret", "escape", 10).is_err());
         assert!(write_file(&root, "escape/new.txt", "x").is_err());
@@ -1093,9 +1224,9 @@ mod tests {
         // this checks that max_chars truncation works on a long file.
         fs::write(root.join("big.txt"), "x".repeat(500))?;
 
-        let output = read_file(&root, "big.txt", 50)?;
+        let output = read_file(&root, "big.txt", LineRange::default(), 50)?;
 
-        assert!(output.contains("--- big.txt ---"));
+        assert!(output.contains("--- big.txt (lines 1-1 of 1) ---"));
         assert!(output.len() < 500);
 
         fs::remove_dir_all(root)?;
@@ -1107,12 +1238,13 @@ mod tests {
         let root = temp_dir();
         fs::write(root.join("data.txt"), "line1\nline2\nline3\nline4\nline5\n")?;
 
-        let output = read_file(&root, "data.txt", 10)?;
+        let output = read_file(&root, "data.txt", LineRange::default(), 10)?;
 
-        // The header is always present; the content after it is truncated.
-        assert!(output.contains("--- data.txt ---"));
-        assert!(output.contains("truncated"));
-        assert!(!output.contains("line5"));
+        // Whole lines that fit, then where to read on.
+        assert_eq!(
+            output,
+            "--- data.txt (lines 1-1 of 5) ---\nline1\n... 4 more lines; read on with offset=2"
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())
