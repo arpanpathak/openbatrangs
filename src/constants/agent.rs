@@ -78,6 +78,11 @@ pub const BROKEN_CALL_NOTE: &str = "Your previous reply wrote a tool call as tex
      not be read, so nothing ran. Call tools only through the tool-calling interface, with one \
      complete call per reply; write a long file in parts.";
 
+/// Feedback injected when the model's reply fell into repeating one short
+/// piece of text and was stopped.
+pub const RUNAWAY_NOTE: &str = "Your previous reply kept repeating the same text, so it was \
+     stopped and dropped. Continue the task with one tool call, and do not repeat text.";
+
 /// Small safety margin left unused so prompt + output fit inside `num_ctx`.
 pub const CONTEXT_RESERVE_TOKENS: u64 = 128;
 
