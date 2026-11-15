@@ -19,6 +19,7 @@ use super::scroll::{chat_text_width, chat_visible_height};
 use super::selection;
 use super::settings;
 use super::{ScrollMode, wrap_text_to_lines};
+use crate::agent::ContextUse;
 use crate::banner;
 use crate::cli::{AgentMode, AgentRunConfig};
 use crate::constants::tui::{
@@ -35,6 +36,9 @@ use ratatui::widgets::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+/// Cells of the context bar.
+const CONTEXT_BAR_CELLS: usize = 30;
 
 /// Rows of the batarang in the panel's corner.
 const BATARANG_ROWS: u16 = 5;
@@ -103,8 +107,9 @@ fn layout_chunks(area: Rect, app: &App, panel_rows: u16) -> Vec<Rect> {
         .to_vec()
 }
 
-/// The panel's lines: the model line with the generation speed, then the
-/// stats table while the stats are on screen.
+/// The panel's lines: the model line with the generation speed, the context
+/// line once an agent step has reported it, then the stats table while the
+/// stats are on screen.
 fn panel_lines(app: &App, perf_on_screen: bool) -> Vec<Line<'static>> {
     let model = format!(
         "{} · speed: {:>5.1} tok/s",
@@ -116,7 +121,62 @@ fn panel_lines(app: &App, perf_on_screen: bool) -> Vec<Line<'static>> {
         false => Vec::new(),
     };
 
-    std::iter::once(stat_line(&model)).chain(table).collect()
+    std::iter::once(stat_line(&model))
+        .chain(app.context.map(context_line))
+        .chain(table)
+        .collect()
+}
+
+/// The context line: a bar of the window, filled up to the prompt and marked
+/// `│` where compaction starts, then the figures. The bar turns yellow once
+/// the prompt reaches nine tenths of the compaction point.
+fn context_line(context: ContextUse) -> Line<'static> {
+    let cell = |tokens: u64| {
+        let share = tokens as f64 / context.window.max(1) as f64;
+
+        ((share * CONTEXT_BAR_CELLS as f64).round() as usize).min(CONTEXT_BAR_CELLS - 1)
+    };
+    let used = cell(context.used);
+    let mark = cell(context.compact_at);
+    let bar: String = (0..CONTEXT_BAR_CELLS)
+        .map(|index| bar_cell(index, used, mark))
+        .collect();
+    let color = match context.used * 10 >= context.compact_at * 9 {
+        true => Color::Yellow,
+        false => Color::Cyan,
+    };
+
+    Line::from(vec![
+        Span::styled("context: ", Style::default().fg(Color::Cyan)),
+        Span::styled(bar, Style::default().fg(color)),
+        Span::styled(
+            format!(
+                "  {} / {} tokens",
+                thousands(context.used),
+                thousands(context.window)
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!(" · compacts at {}", thousands(context.compact_at)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// One cell of the context bar: the compaction mark, a filled cell up to the
+/// prompt's size, or an empty one.
+fn bar_cell(index: usize, used: usize, mark: usize) -> char {
+    match (index == mark, index < used) {
+        (true, _) => '│',
+        (false, true) => '━',
+        (false, false) => '─',
+    }
+}
+
+/// `tokens` in thousands, padded to a fixed width so the line does not move.
+fn thousands(tokens: u64) -> String {
+    format!("{:>6.1}k", tokens as f64 / 1000.0)
 }
 
 /// Rows the panel needs: its lines, and the batarang's height while the
@@ -881,6 +941,55 @@ mod tests {
             "the status line sits between them"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn the_context_bar_marks_the_prompt_and_the_compaction_point() {
+        let early = context_line(ContextUse {
+            used: 30_000,
+            compact_at: 90_000,
+            window: 120_000,
+        });
+        let near = context_line(ContextUse {
+            used: 85_000,
+            compact_at: 90_000,
+            window: 120_000,
+        });
+        let bar = early.spans[1].content.to_string();
+
+        assert_eq!(bar.chars().count(), CONTEXT_BAR_CELLS);
+        assert_eq!(bar.chars().filter(|cell| *cell == '━').count(), 8);
+        assert_eq!(bar.chars().position(|cell| cell == '│'), Some(23));
+        assert_eq!(early.spans[1].style.fg, Some(Color::Cyan));
+        assert_eq!(near.spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(
+            early.to_string().len(),
+            near.to_string().len(),
+            "the line keeps its width"
+        );
+        assert!(
+            early
+                .to_string()
+                .ends_with("30.0k /  120.0k tokens · compacts at   90.0k")
+        );
+    }
+
+    #[test]
+    fn the_panel_shows_the_context_after_a_step() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.notice("hello".to_string());
+        let before = draw(&mut app, 140, 30)?;
+
+        app.context = Some(ContextUse {
+            used: 1_000,
+            compact_at: 7_000,
+            window: 8_192,
+        });
+        let after = draw(&mut app, 140, 30)?;
+
+        assert!(!before.contains("context:"));
+        assert!(after.contains("context:"));
         Ok(())
     }
 

@@ -85,6 +85,9 @@ pub enum AgentEvent {
     },
     /// A status or warning line, already formatted for the terminal.
     Notice(String),
+    /// How full the context window is, reported at each step once the
+    /// conversation has been fitted to it.
+    Context(ContextUse),
     /// The model asked the user a question; the run stops for the answer.
     AskUser {
         /// The question to show.
@@ -138,6 +141,19 @@ impl Reporter for StdoutReporter {
     }
 }
 
+/// The context window and how much of it the next request uses, in tokens
+/// estimated from characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUse {
+    /// Tokens the next prompt takes, tool definitions included.
+    pub used: u64,
+    /// The prompt size at which older turns are dropped or rolled into a
+    /// note, so the reply still fits the window.
+    pub compact_at: u64,
+    /// The whole context window.
+    pub window: u64,
+}
+
 /// The step number as headers show it: `3/40` under a limit, `3` without one.
 pub fn step_number(step: usize, max_steps: Option<usize>) -> String {
     match max_steps {
@@ -174,6 +190,7 @@ impl StdoutReporter {
             } => self.tool_call(&name, &arguments),
             AgentEvent::ToolResult { output, .. } => self.tool_result(&output),
             AgentEvent::Notice(text) => format!("{text}\n"),
+            AgentEvent::Context(_) => String::new(),
             AgentEvent::AskUser { question } => format!("\n❓ {question}\n"),
             AgentEvent::StepLimitReached { max_steps } => {
                 format!("{}\n", step_limit_notice(max_steps))
