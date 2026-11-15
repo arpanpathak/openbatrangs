@@ -16,6 +16,7 @@
 //! - OpenAI function calling: <https://platform.openai.com/docs/guides/function-calling>
 //! - llama.cpp server, router mode: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
+use super::Question;
 use super::context::{context_use, max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
@@ -64,7 +65,7 @@ enum State {
     /// The model called `finish` with this summary.
     Finish(String),
     /// The model asked the user this question.
-    AskUser(String),
+    AskUser(Question),
     /// The step budget ran out before an answer.
     GiveUp,
     /// The run is over.
@@ -77,7 +78,7 @@ struct CallOutcome {
     /// Summary of the last `finish` call.
     summary: Option<String>,
     /// Question of the last `ask_user` call.
-    question: Option<String>,
+    question: Option<Question>,
 }
 
 impl CallOutcome {
@@ -613,7 +614,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 
     /// Show the question and end the run; the user's answer resumes it.
-    fn ask_user(&mut self, question: String) -> State {
+    fn ask_user(&mut self, question: Question) -> State {
         self.reporter.report(AgentEvent::AskUser { question });
 
         self.done()
@@ -688,7 +689,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Answer an `ask_user` call so every call has its result, and return the
     /// question.
-    fn acknowledge_question(&mut self, id: String, question: String) -> String {
+    fn acknowledge_question(&mut self, id: String, question: Question) -> Question {
         self.record(Message::Tool {
             id,
             content: QUESTION_SHOWN.to_string(),
@@ -1373,11 +1374,13 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "description": "Ask the user one short question when the request is unclear and the workspace cannot settle it. The run stops; the user's reply arrives as the next message.",
+                "description": "Ask the user one short question when the request is unclear and the workspace cannot settle it. When the answer is one of a few known choices, list them in options; the user picks from a dialog. The run stops; the user's reply arrives as the next message.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "question": { "type": "string", "description": "The question, in plain words." }
+                        "question": { "type": "string", "description": "The question, in plain words." },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "Answers to choose from, each a few words. Leave out for an open question." },
+                        "multiple": { "type": "boolean", "description": "true when the user may pick several options; false or absent for one." }
                     },
                     "required": ["question"]
                 }
@@ -2282,7 +2285,10 @@ mod tests {
         .await?;
 
         let question = AgentEvent::AskUser {
-            question: "Which file?".to_string(),
+            question: crate::agent::Question {
+                text: "Which file?".to_string(),
+                ..crate::agent::Question::default()
+            },
         };
         assert_eq!(reporter.events.last(), Some(&question));
         assert!(reporter.output.contains("❓ Which file?"));

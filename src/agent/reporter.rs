@@ -10,6 +10,7 @@
 //!
 //! - Rust traits as abstraction boundaries: <https://doc.rust-lang.org/book/ch10-02-traits.html>
 
+use super::Question;
 use super::execute::clickable_link;
 use super::tool::describe_call;
 use crate::constants::ansi::{
@@ -90,8 +91,8 @@ pub enum AgentEvent {
     Context(ContextUse),
     /// The model asked the user a question; the run stops for the answer.
     AskUser {
-        /// The question to show.
-        question: String,
+        /// The question to show, with any answers to choose from.
+        question: Question,
     },
     /// The run used every step without a final answer.
     StepLimitReached {
@@ -139,6 +140,24 @@ impl Reporter for StdoutReporter {
         // A failed flush only delays the text until the next newline.
         std::io::stdout().flush().ok();
     }
+}
+
+/// A question as the one-shot CLI prints it: the question, then each option
+/// numbered, then whether one or several may be chosen.
+fn question_text(question: &Question) -> String {
+    let options: String = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| format!("   {}. {option}\n", index + 1))
+        .collect();
+    let how = match (question.options.is_empty(), question.is_multiple) {
+        (true, _) => "",
+        (false, false) => "   Reply with one choice, or your own answer.\n",
+        (false, true) => "   Reply with any of the choices, or your own answer.\n",
+    };
+
+    format!("\n❓ {}\n{options}{how}", question.text)
 }
 
 /// The context window and how much of it the next request uses, in tokens
@@ -191,7 +210,7 @@ impl StdoutReporter {
             AgentEvent::ToolResult { output, .. } => self.tool_result(&output),
             AgentEvent::Notice(text) => format!("{text}\n"),
             AgentEvent::Context(_) => String::new(),
-            AgentEvent::AskUser { question } => format!("\n❓ {question}\n"),
+            AgentEvent::AskUser { question } => question_text(&question),
             AgentEvent::StepLimitReached { max_steps } => {
                 format!("{}\n", step_limit_notice(max_steps))
             }
@@ -431,7 +450,10 @@ mod tests {
         let output = printed(vec![
             AgentEvent::Notice("⚠️ careful".to_string()),
             AgentEvent::AskUser {
-                question: "Which file?".to_string(),
+                question: crate::agent::Question {
+                    text: "Which file?".to_string(),
+                    ..crate::agent::Question::default()
+                },
             },
             AgentEvent::Finished {
                 answer: "all set".to_string(),
@@ -462,5 +484,27 @@ mod tests {
         let mut reporter = StdoutReporter::default();
 
         reporter.notice("a line".to_string());
+    }
+
+    #[test]
+    fn a_question_with_options_prints_them_numbered() {
+        let one = Question {
+            text: "Which file?".to_string(),
+            options: vec!["a.rs".to_string(), "b.rs".to_string()],
+            is_multiple: false,
+        };
+        let several = Question {
+            is_multiple: true,
+            ..one.clone()
+        };
+
+        assert_eq!(
+            question_text(&one),
+            "\n❓ Which file?\n   1. a.rs\n   2. b.rs\n   Reply with one choice, or your own answer.\n"
+        );
+        assert!(
+            question_text(&several)
+                .ends_with("Reply with any of the choices, or your own answer.\n")
+        );
     }
 }

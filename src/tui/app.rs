@@ -1,6 +1,7 @@
 //! TUI application state and event handling.
 
 use super::block::BlockContent;
+use super::choice::ChoiceState;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
 use super::selection::{Selection, load_tmux_buffer};
 use super::settings::SettingsRow;
@@ -10,7 +11,7 @@ use super::worker::{forward_job_events, send_event};
 use super::{
     ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
-use crate::agent::{AgentEvent, ContextUse, TextKind, describe_call};
+use crate::agent::{AgentEvent, ContextUse, Question, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
@@ -88,6 +89,8 @@ pub(super) enum ActiveModal {
     Confirm(PendingConfirmation),
     /// The settings dialog is open on this row.
     Settings(SettingsRow),
+    /// A question from the model with answers to choose from.
+    Choice(ChoiceState),
 }
 
 /// Where a key press goes, decided by the open modal.
@@ -100,6 +103,8 @@ enum KeyTarget {
     Picker,
     /// The settings dialog.
     Settings,
+    /// The dialog of a question with answers to choose from.
+    Choice,
     /// The input line.
     Input,
     /// The transcript, focused with Tab.
@@ -777,10 +782,11 @@ impl App {
 
     /// Treat the user's next message as the answer to `question`: it
     /// continues the run, the same way a correction after Ctrl+C does.
-    fn on_question(&mut self, question: &str) {
+    fn on_question(&mut self, question: &Question) {
         let prompt = self.current_prompt.clone().unwrap_or_default();
 
-        self.interrupted_task = Some(format!("{prompt}\n\nYou asked the user: {question}"));
+        self.interrupted_task = Some(format!("{prompt}\n\nYou asked the user: {}", question.text));
+        self.open_choice(question);
     }
 
     /// Keep a run that used every step without an answer, the same way an
@@ -1001,6 +1007,7 @@ impl App {
             KeyTarget::Confirmation => self.handle_confirmation_key(key, client, tx),
             KeyTarget::Picker => self.handle_picker_key(key, client).await,
             KeyTarget::Settings => self.handle_settings_key(key),
+            KeyTarget::Choice => self.handle_choice_key(key, client, tx).await,
             KeyTarget::Input => self.handle_input_key(key, client, tx).await,
             KeyTarget::Transcript => self.handle_transcript_key(key, client, tx),
         }
@@ -1024,6 +1031,7 @@ impl App {
             (true, Some(ActiveModal::Confirm(_)), _) => KeyTarget::Confirmation,
             (true, Some(ActiveModal::Picker(_)), _) => KeyTarget::Picker,
             (true, Some(ActiveModal::Settings(_)), _) => KeyTarget::Settings,
+            (true, Some(ActiveModal::Choice(_)), _) => KeyTarget::Choice,
             (true, None, FocusArea::Input) => KeyTarget::Input,
             (true, None, FocusArea::Transcript) => KeyTarget::Transcript,
         }
@@ -1492,7 +1500,11 @@ impl App {
     ///
     /// - `client`: Ollama client for network-dependent commands and tasks.
     /// - `tx`: channel for background task events.
-    async fn submit_input(&mut self, client: &OllamaClient, tx: &mpsc::UnboundedSender<UiEvent>) {
+    pub(super) async fn submit_input(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         let submitted = self.take_input();
 
         let Some((task, resume)) = self.task_for_submission(submitted) else {
@@ -3605,6 +3617,26 @@ mod tests {
 
         assert_eq!(table.notes[0].name, "thor-without-scheme");
         assert_eq!(table.notes[0].text, "running   1");
+    }
+
+    #[test]
+    fn a_question_with_options_opens_the_dialog_and_keeps_the_task() {
+        let mut app = test_app();
+        app.current_prompt = Some("add logging".to_string());
+
+        app.on_agent_event(AgentEvent::AskUser {
+            question: Question {
+                text: "Which crate?".to_string(),
+                options: vec!["log".to_string(), "tracing".to_string()],
+                is_multiple: false,
+            },
+        });
+
+        assert!(matches!(app.modal, Some(ActiveModal::Choice(_))));
+        assert_eq!(
+            app.interrupted_task.as_deref(),
+            Some("add logging\n\nYou asked the user: Which crate?")
+        );
     }
 }
 
