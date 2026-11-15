@@ -17,7 +17,7 @@ A terminal coding agent for local language models, on any hardware.
 [![macOS](https://img.shields.io/badge/macOS-Apple%20silicon%20%7C%20Intel-000000?style=for-the-badge&logo=apple&logoColor=white)](#install)
 [![Open in Colab](https://img.shields.io/badge/Open%20in-Colab-f9ab00?style=for-the-badge&logo=googlecolab&logoColor=white)](https://colab.research.google.com/github/arpanpathak/openbatrangs/blob/main/colab/openbatrangs.ipynb)
 
-<img src="assets/demo.gif" alt="openbatrangs adding a median function and its tests to a Rust crate, with folded steps and the model server's GPU load in the panel" width="900">
+<img src="assets/demo.gif" alt="openbatrangs running Gemma 4 31B: the completion gates (lizard, clippy, tests, regression, readability, a human check) block the model's code until every gate passes and the change is merged" width="600">
 
 </div>
 

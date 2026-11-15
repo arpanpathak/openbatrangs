@@ -41,9 +41,6 @@ use unicode_width::UnicodeWidthStr;
 /// Cells of the context bar.
 const CONTEXT_BAR_CELLS: usize = 30;
 
-/// Rows of the batarang in the panel's corner.
-const BATARANG_ROWS: u16 = 5;
-
 /// The keys shown on the input box's top border.
 const INPUT_KEYS_HINT: &str = " Enter send · Alt+Enter or \\ Enter new line ";
 
@@ -194,7 +191,7 @@ fn thousands(tokens: u64) -> String {
 /// stats are on screen.
 fn panel_height(lines: &[Line], perf_on_screen: bool) -> u16 {
     let logo_rows = match perf_on_screen {
-        true => BATARANG_ROWS,
+        true => banner::batarang_height() as u16,
         false => 0,
     };
 
@@ -270,13 +267,15 @@ fn figure_spans(figure: &str) -> Vec<Span<'static>> {
 /// Draw the batarang at the bottom right of `area`; an area too small for it
 /// stays empty.
 fn render_logo(frame: &mut ratatui::Frame, area: Rect) {
-    if area.width == 0 || area.height < BATARANG_ROWS {
+    let logo_rows = banner::batarang_height() as u16;
+
+    if area.width == 0 || area.height < logo_rows {
         return;
     }
 
     let logo_area = Rect {
-        y: area.y + area.height - BATARANG_ROWS,
-        height: BATARANG_ROWS,
+        y: area.y + area.height - logo_rows,
+        height: logo_rows,
         ..area
     };
 
@@ -959,7 +958,7 @@ mod tests {
         let rows: Vec<&str> = screen.lines().collect();
         let logo_bottom = rows
             .iter()
-            .rposition(|row| row.contains("▀▀▀▀▀▀▀▀▀▀▀▀"))
+            .rposition(|row| row.contains(SMALL_LOGO_BOTTOM))
             .context("the batarang is drawn")?;
         let input_top = rows
             .iter()
@@ -968,7 +967,6 @@ mod tests {
 
         assert!(screen.contains("mode: agent"));
         assert!(screen.contains("RAM free"));
-        assert!(rows[logo_bottom].trim_end().ends_with('▀'));
         assert_eq!(
             logo_bottom + 2,
             input_top,
@@ -1055,7 +1053,7 @@ mod tests {
         let screen = draw_rows(&mut app, 60, 30)?;
 
         assert!(screen.contains("mode: agent"));
-        assert!(!screen.contains("▀▀▀▀▀▀▀▀▀▀▀▀"));
+        assert!(!screen.contains(SMALL_LOGO_BOTTOM));
 
         Ok(())
     }
@@ -1339,17 +1337,27 @@ vllm:kv_cache_usage_perc{engine=\"0\"} 0.34
     }
 
     /// The stats table as drawn: the rows between the model line, which
-    /// follows the rule under the transcript, and the status line. The
-    /// batarang's block characters, the trailing spaces and the empty rows
-    /// are left out; the leading spaces stay, so the columns can be checked.
+    /// follows the rule under the transcript, and the status line, which
+    /// starts with `▌`. The batarang's block characters, the trailing spaces
+    /// and the empty rows are left out; the leading spaces stay, so the
+    /// columns can be checked.
     fn panel_rows(rows: &[String]) -> Vec<String> {
         rows.iter()
             .skip_while(|row| !row.trim().starts_with('─'))
             .skip(2)
-            .take_while(|row| !row.contains('▌'))
-            .map(|row| row.replace(['▄', '▀', '█'], "").trim_end().to_string())
+            .take_while(|row| !row.trim_start().starts_with('▌'))
+            .map(|row| row.replace(is_block_character, "").trim_end().to_string())
             .filter(|row| !row.is_empty())
             .collect()
+    }
+
+    /// The bottom row of the panel's batarang, without its padding.
+    const SMALL_LOGO_BOTTOM: &str = "▀ ▀▛▀▀█▛";
+
+    /// Whether `character` is one of the block elements the batarang is
+    /// drawn with, `U+2580` to `U+259F`.
+    fn is_block_character(character: char) -> bool {
+        ('\u{2580}'..='\u{259f}').contains(&character)
     }
 
     /// The column just past the end of the last `needle` in `row`.

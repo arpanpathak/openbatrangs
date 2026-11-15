@@ -1,80 +1,107 @@
-//! Startup banner: a batarang over the wordmark, colored with a gradient from
+//! Startup banner: the logo over the wordmark, colored with a gradient from
 //! cyan through violet to pink.
 //!
-//! [`banner_rows`] lays the art out once. The command line prints it with
-//! 24-bit ANSI colors through [`banner_text`], and the TUI draws the same rows
-//! as styled ratatui lines through [`banner_lines`]. Both color a character by
-//! its column, so the gradient runs straight down through the batarang and the
-//! wordmark.
+//! The logo is `assets/logo.svg` drawn in quarter-block characters (see
+//! [`LogoArt`]). Each of its columns takes the color the SVG's gradient has at
+//! that column of the canvas, so the drawing shows the logo's own colors. The
+//! wordmark spreads the same gradient over its own width.
+//!
+//! The command line prints the banner with 24-bit ANSI colors through
+//! [`banner_text`], and the TUI draws it as styled ratatui lines through
+//! [`banner_lines`]. The TUI's stats panel shows a smaller drawing of the logo
+//! through [`batarang_lines`].
 
 use crate::constants::ansi::{COLOR_DIM, COLOR_RESET};
-use crate::constants::banner::{BATARANG_LEFT_HALF, GRADIENT_STOPS, TAGLINE, WORDMARK};
+use crate::constants::banner::{GRADIENT_STOPS, LOGO, LogoArt, SMALL_LOGO, TAGLINE, WORDMARK};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// The art rows: the batarang centered over the wordmark, with a blank row between.
-pub fn banner_rows() -> Vec<String> {
-    let width = art_width();
-    let mut rows: Vec<String> = BATARANG_LEFT_HALF
-        .iter()
-        .map(|half| centered(&mirrored(half), width))
-        .collect();
-
-    rows.push(String::new());
-    rows.extend(WORDMARK.iter().map(|row| row.to_string()));
-
-    rows
-}
-
 /// The banner with 24-bit ANSI colors, for printing to a terminal.
 pub fn banner_text() -> String {
-    let width = art_width();
-    let mut text: String = banner_rows()
+    let padding = " ".repeat(logo_padding());
+    let wordmark_width = art_width();
+    let logo_column_color = |column| logo_color(&LOGO, column);
+    let wordmark_column_color = |column| gradient_color(column, wordmark_width);
+
+    let logo: String = LOGO
+        .rows
         .iter()
-        .map(|row| format!("{}\n", ansi_row(row, width)))
+        .map(|row| format!("{padding}{}\n", ansi_row(row, logo_column_color)))
         .collect();
+    let wordmark: String = WORDMARK
+        .iter()
+        .map(|row| format!("{}\n", ansi_row(row, wordmark_column_color)))
+        .collect();
+    let tagline = tagline();
 
-    text.push_str(&format!("\n {COLOR_DIM}{}{COLOR_RESET}\n", tagline()));
-
-    text
+    format!("{logo}\n{wordmark}\n {COLOR_DIM}{tagline}{COLOR_RESET}\n")
 }
 
 /// The banner as styled lines, for drawing inside the TUI.
 pub fn banner_lines() -> Vec<Line<'static>> {
-    let width = art_width();
-    let mut lines: Vec<Line<'static>> = banner_rows()
-        .iter()
-        .map(|row| styled_row(row, width))
-        .collect();
-
+    let padding = logo_padding();
+    let wordmark_width = art_width();
     let dim = Style::default().add_modifier(Modifier::DIM);
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(format!(" {}", tagline()), dim)));
 
-    lines
-}
-
-/// The batarang alone, with the gradient spread over its own width, for the
-/// corner of the TUI's stats panel.
-pub fn batarang_lines() -> Vec<Line<'static>> {
-    let width = batarang_width();
-
-    BATARANG_LEFT_HALF
+    let logo = LOGO
+        .rows
         .iter()
-        .map(|half| styled_row(&mirrored(half), width))
+        .map(|row| padded(styled_row(row, |column| logo_color(&LOGO, column)), padding));
+    let wordmark = WORDMARK
+        .iter()
+        .map(|row| styled_row(row, |column| gradient_color(column, wordmark_width)));
+    let tagline = Line::from(Span::styled(format!(" {}", tagline()), dim));
+
+    logo.chain([Line::default()])
+        .chain(wordmark)
+        .chain([Line::default(), tagline])
         .collect()
 }
 
-/// Width of the batarang, in characters: twice its left half.
+/// The small logo, for the corner of the TUI's stats panel.
+pub fn batarang_lines() -> Vec<Line<'static>> {
+    SMALL_LOGO
+        .rows
+        .iter()
+        .map(|row| styled_row(row, |column| logo_color(&SMALL_LOGO, column)))
+        .collect()
+}
+
+/// Width of the small logo, in columns.
 pub fn batarang_width() -> usize {
-    BATARANG_LEFT_HALF
-        .first()
-        .map_or(0, |half| half.chars().count() * 2)
+    logo_width(&SMALL_LOGO)
+}
+
+/// Height of the small logo, in rows.
+pub fn batarang_height() -> usize {
+    SMALL_LOGO.rows.len()
 }
 
 /// Print the startup banner to stdout.
 pub fn print_banner() {
     print!("{}", banner_text());
+}
+
+/// Width of `art`, in columns.
+fn logo_width(art: &LogoArt) -> usize {
+    art.rows.first().map_or(0, |row| row.chars().count())
+}
+
+/// Spaces in front of the large logo that center it over the wordmark.
+fn logo_padding() -> usize {
+    art_width().saturating_sub(logo_width(&LOGO)) / 2
+}
+
+/// The color the SVG's gradient has at `column` of `art`.
+fn logo_color(art: &LogoArt, column: usize) -> [u8; 3] {
+    gradient_color(art.first_column + column, art.canvas_columns)
+}
+
+/// `line` with `padding` spaces in front.
+fn padded(mut line: Line<'static>, padding: usize) -> Line<'static> {
+    line.spans.insert(0, Span::raw(" ".repeat(padding)));
+
+    line
 }
 
 /// The gradient color at `column` of art that is `width` columns wide.
@@ -102,20 +129,6 @@ fn blend(start: u8, end: u8, fraction: f32) -> u8 {
     value.round().clamp(0.0, 255.0) as u8
 }
 
-/// A row followed by its mirror image.
-fn mirrored(half: &str) -> String {
-    let right_half: String = half.chars().rev().collect();
-
-    format!("{half}{right_half}")
-}
-
-/// `row` with enough leading spaces to center it in `width` columns.
-fn centered(row: &str, width: usize) -> String {
-    let padding = width.saturating_sub(row.chars().count()) / 2;
-
-    format!("{}{row}", " ".repeat(padding))
-}
-
 /// Width of the widest wordmark row, in characters.
 pub fn art_width() -> usize {
     WORDMARK
@@ -130,24 +143,26 @@ fn tagline() -> String {
     format!("{TAGLINE} · v{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// One row with each character in its gradient color, as ANSI escapes.
-fn ansi_row(row: &str, width: usize) -> String {
+/// One row with each character in the color `color` gives its column, as
+/// ANSI escapes.
+fn ansi_row(row: &str, color: impl Fn(usize) -> [u8; 3]) -> String {
     row.chars()
         .enumerate()
         .map(|(column, character)| {
-            let [red, green, blue] = gradient_color(column, width);
+            let [red, green, blue] = color(column);
             format!("\x1b[1;38;2;{red};{green};{blue}m{character}{COLOR_RESET}")
         })
         .collect()
 }
 
-/// One row with each character in its gradient color, as ratatui spans.
-fn styled_row(row: &str, width: usize) -> Line<'static> {
+/// One row with each character in the color `color` gives its column, as
+/// ratatui spans.
+fn styled_row(row: &str, color: impl Fn(usize) -> [u8; 3]) -> Line<'static> {
     let spans: Vec<Span<'static>> = row
         .chars()
         .enumerate()
         .map(|(column, character)| {
-            let [red, green, blue] = gradient_color(column, width);
+            let [red, green, blue] = color(column);
             let style = Style::default()
                 .fg(Color::Rgb(red, green, blue))
                 .add_modifier(Modifier::BOLD);
@@ -163,24 +178,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batarang_rows_are_symmetric() {
-        let rows = banner_rows();
+    fn each_logo_has_rows_of_one_width_inside_its_canvas() {
+        for art in [&LOGO, &SMALL_LOGO] {
+            let width = logo_width(art);
 
-        for row in &rows[..BATARANG_LEFT_HALF.len()] {
-            let shape = row.trim();
-            let reversed: String = shape.chars().rev().collect();
-
-            assert_eq!(shape, reversed);
+            assert!(art.rows.iter().all(|row| row.chars().count() == width));
+            assert!(art.first_column + width <= art.canvas_columns);
         }
     }
 
     #[test]
-    fn rows_hold_the_batarang_a_blank_row_and_the_wordmark() {
-        let rows = banner_rows();
+    fn the_logo_takes_its_colors_from_the_svg_canvas() {
+        let last = logo_width(&LOGO) - 1;
 
-        assert_eq!(rows.len(), BATARANG_LEFT_HALF.len() + 1 + WORDMARK.len());
-        assert_eq!(rows[BATARANG_LEFT_HALF.len()], "");
-        assert_eq!(rows[rows.len() - 1], WORDMARK[WORDMARK.len() - 1]);
+        assert_eq!(logo_color(&LOGO, 0), gradient_color(5, 60));
+        assert_ne!(
+            logo_color(&LOGO, 0),
+            GRADIENT_STOPS[0],
+            "the blade starts right of the canvas edge, so it is not pure cyan"
+        );
+        assert_eq!(logo_color(&LOGO, last), gradient_color(52, 60));
+    }
+
+    #[test]
+    fn tui_banner_holds_the_logo_a_blank_row_and_the_wordmark() {
+        let lines = banner_lines();
+        let padding = " ".repeat(logo_padding());
+
+        assert_eq!(lines.len(), LOGO.rows.len() + 1 + WORDMARK.len() + 2);
+        assert_eq!(lines[0].to_string(), format!("{padding}{}", LOGO.rows[0]));
+        assert_eq!(lines[LOGO.rows.len()].to_string(), "");
+        assert_eq!(lines[LOGO.rows.len() + 1].to_string(), WORDMARK[0]);
+    }
+
+    #[test]
+    fn the_panel_logo_is_the_small_drawing() {
+        let lines = batarang_lines();
+
+        assert_eq!(lines.len(), batarang_height());
+        assert_eq!(lines[0].to_string(), SMALL_LOGO.rows[0]);
+        assert_eq!(lines[0].width(), batarang_width());
     }
 
     #[test]
@@ -213,18 +250,17 @@ mod tests {
     }
 
     #[test]
-    fn tui_banner_has_one_line_per_row_and_the_tagline() {
+    fn tui_banner_ends_with_the_tagline() {
         let lines = banner_lines();
         let last = lines[lines.len() - 1].to_string();
 
-        assert_eq!(lines.len(), banner_rows().len() + 2);
         assert!(last.contains(TAGLINE));
     }
 
     #[test]
     fn tui_banner_colors_the_first_column_cyan() {
         let lines = banner_lines();
-        let wordmark_row = &lines[BATARANG_LEFT_HALF.len() + 1];
+        let wordmark_row = &lines[LOGO.rows.len() + 1];
 
         assert_eq!(
             wordmark_row.spans[0].style.fg,
