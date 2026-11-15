@@ -56,6 +56,7 @@ impl App {
             "perf" => self.toggle_perf(),
             "mode" => self.handle_mode_command(arg),
             "thinking" => self.handle_thinking_command(arg),
+            "temperature" => self.handle_temperature_command(arg),
             "mouse" => self.handle_mouse_command(arg),
             "yolo" => self.handle_yolo_command(),
             _ => self.log_unknown_command(name),
@@ -99,6 +100,7 @@ impl App {
             format!("  Read-only:  {}", on_off(config.is_read_only)),
             format!("  Confirm:    {}", confirm_label(config.should_confirm)),
             format!("  Thinking:   {}", on_off(config.show_thinking)),
+            format!("  Temperature: {}", temperature_label(config.temperature)),
             format!("  Mouse:      {}", on_off(self.mouse_capture)),
             format!("  Perf panel: {}", on_off(self.show_perf)),
         ];
@@ -314,6 +316,30 @@ impl App {
         self.notice(format!("Thinking display: {}", on_off(show_thinking)));
     }
 
+    /// Set the sampling temperature, or go back to the model card's with
+    /// `auto`.
+    ///
+    /// # Parameters
+    ///
+    /// - `arg`: a number from 0 to 2, or `auto`; anything else shows usage.
+    fn handle_temperature_command(&mut self, arg: &str) {
+        let temperature = match arg.trim() {
+            "auto" => Some(None),
+            number => temperature_value(number).map(Some),
+        };
+
+        let Some(temperature) = temperature else {
+            let current = temperature_label(self.run_config.temperature);
+            self.notice(format!(
+                "Temperature: {current} · Usage: /temperature <0 to 2>|auto"
+            ));
+            return;
+        };
+
+        self.run_config.temperature = temperature;
+        self.notice(format!("Temperature: {}", temperature_label(temperature)));
+    }
+
     /// Toggle mouse capture: on for wheel/scrollbar, off for native select/copy.
     ///
     /// # Parameters
@@ -512,6 +538,23 @@ fn positive_number(arg: &str) -> Option<usize> {
     arg.parse::<usize>().ok().filter(|number| *number > 0)
 }
 
+/// `arg` as a temperature from 0 to 2, the range OpenAI-compatible servers
+/// accept.
+fn temperature_value(arg: &str) -> Option<f64> {
+    arg.parse::<f64>()
+        .ok()
+        .filter(|temperature| (0.0..=2.0).contains(temperature))
+}
+
+/// A temperature as `/status` shows it: the number, or `auto` for the model
+/// card's.
+fn temperature_label(temperature: Option<f64>) -> String {
+    temperature.map_or_else(
+        || "auto (model card)".to_string(),
+        |value| format!("{value:.1}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +687,29 @@ mod tests {
             app.transcript
                 .text()
                 .contains("Usage: /mode agent|plan|chat")
+        );
+    }
+
+    #[test]
+    fn the_temperature_is_set_reset_and_checked() {
+        let cli = crate::cli::Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        app.transcript.clear();
+
+        app.handle_temperature_command("0.7");
+        assert_eq!(app.run_config.temperature, Some(0.7));
+        assert!(app.transcript.text().contains("Temperature: 0.7"));
+
+        app.handle_temperature_command("3");
+        assert_eq!(app.run_config.temperature, Some(0.7));
+        assert!(app.transcript.text().contains("Usage: /temperature"));
+
+        app.handle_temperature_command("auto");
+        assert_eq!(app.run_config.temperature, None);
+        assert!(
+            app.transcript
+                .text()
+                .contains("Temperature: auto (model card)")
         );
     }
 

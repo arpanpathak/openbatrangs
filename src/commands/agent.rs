@@ -153,6 +153,7 @@ fn agent_config(config: &AgentRunConfig, model_context: u64) -> AgentConfig {
     AgentConfig {
         cwd: config.cwd.clone(),
         max_steps: config.max_steps,
+        temperature: config.temperature,
         is_read_only: config.is_read_only || config.mode == AgentMode::Plan,
         should_confirm: config.should_confirm,
         use_sandbox: config.use_sandbox,

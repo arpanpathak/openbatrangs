@@ -5,10 +5,11 @@ use crate::agent::{
     compact_context, effective_context, max_output_tokens, run_agent,
 };
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
-use crate::constants::tui::{CHAT_SYSTEM_PROMPT, CHAT_TEMPERATURE};
+use crate::constants::tui::CHAT_SYSTEM_PROMPT;
 use crate::model_select::{calculate_memory_budget, resolve_model, resolve_model_context};
 use crate::models::ModelScore;
 use crate::ollama::{ChatMessage, ChatRequest, Delta, OllamaClient, Role};
+use crate::sampling::Sampling;
 use crate::update::{Installer, NewRelease, UpdateCheck, daily_check};
 use anyhow::Result;
 use futures_util::{Stream, TryStreamExt};
@@ -269,6 +270,7 @@ fn agent_config(config: AgentRunConfig, model_context: u64) -> AgentConfig {
     AgentConfig {
         cwd: config.cwd,
         max_steps: config.max_steps,
+        temperature: config.temperature,
         is_read_only,
         should_confirm: config.should_confirm,
         use_sandbox: config.use_sandbox,
@@ -292,7 +294,8 @@ async fn run_chat_worker(
     let selected = select_model(&client, &model_slot, &prefs, &tx).await?;
     let model_context = resolve_model_context(&client, &selected.name).await?;
     let num_ctx = effective_context(model_context, config.max_ctx);
-    let request = chat_request(selected.name, history, num_ctx);
+    let sampling = Sampling::for_model(&selected.name, config.temperature);
+    let request = chat_request(selected.name, history, num_ctx, sampling);
 
     note_model_loading(&client, &tx);
     let stream = client.chat_stream(request).await?;
@@ -304,7 +307,12 @@ async fn run_chat_worker(
 ///
 /// Old turns are paged out when the estimated prompt would overflow the
 /// safe per-device window, as in agent mode.
-fn chat_request(model: String, history: Vec<ChatMessage>, num_ctx: u64) -> ChatRequest {
+fn chat_request(
+    model: String,
+    history: Vec<ChatMessage>,
+    num_ctx: u64,
+    sampling: Sampling,
+) -> ChatRequest {
     let system = ChatMessage {
         role: Role::System,
         content: CHAT_SYSTEM_PROMPT.to_string(),
@@ -314,6 +322,11 @@ fn chat_request(model: String, history: Vec<ChatMessage>, num_ctx: u64) -> ChatR
     compact_context(&mut messages, num_ctx);
 
     let num_predict = max_output_tokens(num_ctx, &messages);
+    let mut options = serde_json::json!({
+        "num_ctx": num_ctx,
+        "num_predict": num_predict,
+    });
+    sampling.write_to(&mut options);
 
     ChatRequest {
         model,
@@ -321,11 +334,7 @@ fn chat_request(model: String, history: Vec<ChatMessage>, num_ctx: u64) -> ChatR
         stream: true,
         keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: None,
-        options: Some(serde_json::json!({
-            "temperature": CHAT_TEMPERATURE,
-            "num_ctx": num_ctx,
-            "num_predict": num_predict,
-        })),
+        options: Some(options),
     }
 }
 
@@ -483,6 +492,7 @@ mod tests {
         AgentRunConfig {
             cwd: std::path::PathBuf::from("/tmp/openbatrangs-tui-worker-missing-workspace"),
             max_steps: Some(1),
+            temperature: None,
             is_read_only: false,
             should_confirm: true,
             use_sandbox: true,

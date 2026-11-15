@@ -36,6 +36,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) api_key_file: Option<PathBuf>,
 
+    /// Sampling temperature. Without it, each model family gets the
+    /// temperature, top-p and top-k from its model card.
+    #[arg(long, global = true, value_name = "T")]
+    pub(crate) temperature: Option<f64>,
+
     /// Turn the model's thinking off (OpenAI-compatible servers only).
     #[arg(long = "no-think", global = true)]
     pub(crate) is_thinking_disabled: bool,

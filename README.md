@@ -284,6 +284,7 @@ openbatrangs update                                                      # insta
 | `--max-steps <n>` | stop after this many steps; no limit by default |
 | `--max-ctx <tokens>` | an upper limit on the context window, 32768 by default on Ollama |
 | `--no-think` | thinking off, for thinking models |
+| `--temperature <t>` | sampling temperature; by default each model family gets its model card's temperature, top-p and top-k |
 | `--searxng-url <url>` | the SearXNG instance for web search |
 | `--no-update-check` | no daily check for a newer release |
 | `--transcript-out <path>` | write the run's model, tool definitions, full conversation, outcome and step count to a JSON file (one-shot runs only) |
@@ -312,6 +313,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/yolo` | turn off every prompt |
 | `/thinking on\|off` | show or hide the model's reasoning |
 | `/steps <n>\|off` | set or remove the step limit |
+| `/temperature <t>\|auto` | set the sampling temperature, or go back to the model card's |
 | `/cwd <path>` | change the project folder |
 | `/perf` | show or hide the performance panel |
 | `/mouse on\|off` | use the mouse wheel, the scrollbar and drag to copy, or the terminal's own text selection |

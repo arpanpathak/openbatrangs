@@ -21,6 +21,7 @@ mod model_select;
 mod models;
 mod ollama;
 mod perf;
+mod sampling;
 mod tools;
 mod tui;
 mod update;

@@ -380,6 +380,7 @@ impl App {
             run_config: AgentRunConfig {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
+                temperature: cli.temperature,
                 is_read_only: cli.is_read_only,
                 should_confirm: true,
                 use_sandbox: !cli.is_sandbox_disabled,

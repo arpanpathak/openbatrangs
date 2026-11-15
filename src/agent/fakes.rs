@@ -227,6 +227,7 @@ pub(super) fn test_config(cwd: &Path, max_steps: usize) -> AgentConfig {
     AgentConfig {
         cwd: cwd.to_path_buf(),
         max_steps: Some(max_steps),
+        temperature: None,
         is_read_only: false,
         should_confirm: false,
         use_sandbox: false,
