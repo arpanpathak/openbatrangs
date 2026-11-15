@@ -71,6 +71,12 @@ pub const CUT_REPLY_NOTE: &str = "Your previous reply reached the output limit a
      so its tool call was not run. Keep each reply smaller: think briefly, and write a long \
      file in parts, first write_file with the beginning, then edit_file to add each next part.";
 
+/// Feedback injected when the model's reply holds a tool call written as text
+/// that cannot be read, such as Gemma's own call syntax cut off partway.
+pub const BROKEN_CALL_NOTE: &str = "Your previous reply wrote a tool call as text, and it could \
+     not be read, so nothing ran. Call tools only through the tool-calling interface, with one \
+     complete call per reply; write a long file in parts.";
+
 /// Small safety margin left unused so prompt + output fit inside `num_ctx`.
 pub const CONTEXT_RESERVE_TOKENS: u64 = 128;
 
