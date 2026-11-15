@@ -22,14 +22,14 @@ use crate::constants::tui::{BLOCK_LOAD_CHUNK, CHAT_SCROLL_STEP};
 use ratatui::layout::Rect;
 
 /// Width of the transcript text in a chat area `area_width` cells wide: the
-/// borders and the scrollbar column are left out.
+/// scrollbar column and the gap before it are left out.
 pub(super) fn chat_text_width(area_width: u16) -> usize {
-    (area_width as usize).saturating_sub(3).max(1)
+    (area_width as usize).saturating_sub(2).max(1)
 }
 
-/// Number of text rows inside the chat area's borders.
+/// Number of text rows in the chat area.
 pub(super) fn chat_visible_height(area: Rect) -> usize {
-    area.height.saturating_sub(2) as usize
+    area.height as usize
 }
 
 impl App {
@@ -95,12 +95,12 @@ impl App {
 
     /// Scroll by one full viewport page (`PageUp`/`PageDown`).
     ///
-    /// The page height is the visible chat area minus its two border rows. If
-    /// the area has not been measured yet, fall back to the wheel step.
+    /// The page height is the height of the chat area. If the area has not
+    /// been measured yet, fall back to the wheel step.
     pub(super) fn scroll_chat_page(&mut self, direction: i32) {
         let visible_height = self
             .last_chat_area
-            .map(|area| area.height.saturating_sub(2).max(1) as usize)
+            .map(|area| chat_visible_height(area).max(1))
             .unwrap_or(CHAT_SCROLL_STEP);
         let delta = (visible_height as i32).saturating_mul(direction);
 
@@ -121,7 +121,7 @@ impl App {
             return false;
         };
 
-        self.scroll_to_track_row(area, (row - area.y - 1) as usize);
+        self.scroll_to_track_row(area, (row - area.y) as usize);
 
         true
     }
@@ -149,12 +149,12 @@ fn scrolls_past_top(offset: usize, delta: i32) -> bool {
 
 /// Whether the cell at `column`, `row` lies on the scrollbar track of `area`.
 fn is_on_scrollbar(area: Rect, column: u16, row: u16) -> bool {
-    column == area.x + area.width.saturating_sub(2) && is_inside_track(area, row)
+    column == area.x + area.width.saturating_sub(1) && is_inside_track(area, row)
 }
 
-/// Whether `row` lies between the top and bottom borders of `area`.
+/// Whether `row` lies inside `area`.
 pub(super) fn is_inside_track(area: Rect, row: u16) -> bool {
-    row > area.y && row < area.y + area.height.saturating_sub(1)
+    row >= area.y && row < area.y + area.height
 }
 
 /// Follow new output when the offset is at the bottom, otherwise stay put.
@@ -266,8 +266,8 @@ mod tests {
         let mut app = app_with_notices(50);
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
         app.scroll_chat_page(1);
-        // Page height = 20 - 2 = 18
-        assert_eq!(app.chat_scroll_offset, 18);
+        // The page is the whole area: the chat has no border rows.
+        assert_eq!(app.chat_scroll_offset, 20);
     }
 
     #[test]
@@ -295,21 +295,21 @@ mod tests {
     }
 
     #[test]
-    fn handle_scrollbar_click_at_top_border_returns_false() {
+    fn handle_scrollbar_click_above_the_area_returns_false() {
         let mut app = test_app();
-        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
-        let scrollbar_col = 80 - 2;
-        // Click on the top border row (y=0, which is not > area.y=0)
-        assert!(!app.handle_scrollbar_click(scrollbar_col, 0));
+        app.last_chat_area = Some(Rect::new(0, 3, 80, 20));
+        let scrollbar_col = 80 - 1;
+        // Row 2 is the row above the area, which starts at row 3.
+        assert!(!app.handle_scrollbar_click(scrollbar_col, 2));
     }
 
     #[test]
-    fn handle_scrollbar_click_at_bottom_border_returns_false() {
+    fn handle_scrollbar_click_below_the_area_returns_false() {
         let mut app = test_app();
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
-        let scrollbar_col = 80 - 2;
-        // Click on the bottom border (row 19, which is not < 0 + 20 - 1 = 19)
-        assert!(!app.handle_scrollbar_click(scrollbar_col, 19));
+        let scrollbar_col = 80 - 1;
+        // Row 20 is the first row below an area of rows 0 to 19.
+        assert!(!app.handle_scrollbar_click(scrollbar_col, 20));
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
             app.notice(format!("line {i}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
-        let scrollbar_col = 80 - 2;
+        let scrollbar_col = 80 - 1;
         assert!(app.handle_scrollbar_click(scrollbar_col, 10));
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
     }
@@ -333,9 +333,9 @@ mod tests {
             app.notice(format!("line {i}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
-        let scrollbar_col = 80 - 2;
-        // Click at the last valid track row
-        assert!(app.handle_scrollbar_click(scrollbar_col, 18));
+        let scrollbar_col = 80 - 1;
+        // Click at the last row of the track
+        assert!(app.handle_scrollbar_click(scrollbar_col, 19));
         // At the bottom of the scrollbar, should be Follow mode
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
     }
@@ -371,8 +371,8 @@ mod tests {
         }
         // Area offset from (0,0) to (5,3)
         app.last_chat_area = Some(Rect::new(5, 3, 75, 17));
-        let scrollbar_col = 5 + 75 - 2;
-        // Row 10 is within track: 10 > 3 and 10 < 3+17-1=19
+        let scrollbar_col = 5 + 75 - 1;
+        // Row 10 is within the track: rows 3 to 19
         assert!(app.handle_scrollbar_click(scrollbar_col, 10));
     }
 }

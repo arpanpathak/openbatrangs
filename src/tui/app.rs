@@ -3,6 +3,7 @@
 use super::block::BlockContent;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
 use super::selection::Selection;
+use super::stats::{RemoteServer, StatsTable};
 use super::transcript::{Focus, RowHit, Transcript};
 use super::worker::{forward_job_events, send_event};
 use super::{
@@ -11,13 +12,12 @@ use super::{
 use crate::agent::{AgentEvent, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
-use crate::constants::perf::{MIB_PER_GIB, THIS_MACHINE_HEADING};
 use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_CHAT_HISTORY_MESSAGES, MAX_TRANSCRIPT_BLOCKS, SPINNER,
     STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
-use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host, server_section};
+use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -526,22 +526,13 @@ impl App {
         let mode = mode_name(self.run_config.mode);
 
         match &self.model_info {
-            Some(info) => format!("{info} · mode: {mode} · server {}", self.server_url),
+            Some(info) => format!("{info} · mode: {mode} · server: {}", self.server_url),
             None => format!(
-                "model: {} · mode: {mode} · server {}",
+                "model: {} · mode: {mode} · server: {}",
                 self.model.as_deref().unwrap_or("auto"),
                 self.server_url
             ),
         }
-    }
-
-    /// Return the user's original task prompt for display in the banner.
-    ///
-    /// # Returns
-    ///
-    /// The stored prompt string, or `None` if no task has been submitted yet.
-    pub(super) fn prompt_line(&self) -> Option<String> {
-        self.current_prompt.clone()
     }
 
     /// Re-query Ollama for the current model's metadata and update `model_info`.
@@ -1337,7 +1328,7 @@ impl App {
     /// below the text, or before the first draw.
     fn transcript_row_at(&mut self, row: u16) -> Option<RowHit> {
         let area = self.last_chat_area?;
-        let text_row = is_inside_track(area, row).then(|| (row - area.y - 1) as usize)?;
+        let text_row = is_inside_track(area, row).then(|| (row - area.y) as usize)?;
         let width = chat_text_width(area.width);
 
         let total_rows = self.transcript.layout(width);
@@ -1570,23 +1561,18 @@ impl App {
         self.start_task(task, resume, client, tx);
     }
 
-    /// The perf panel's lines. With a model server on another host, the
-    /// server's lines come first, then the local lines under a
-    /// `this machine` heading.
-    pub(super) fn perf_lines(&self) -> Vec<String> {
-        let local_lines = self.local_perf_lines();
-
-        let Some(feed) = &self.server_feed else {
-            return local_lines;
-        };
-
-        let fallback_host =
+    /// The panel's stats table: the model server's row when it runs on
+    /// another host, then this machine's.
+    pub(super) fn stats_table(&self) -> StatsTable {
+        let latest = self.server_feed.as_ref().map(ServerStatsFeed::latest);
+        let fallback_name =
             server_host(&self.server_url).unwrap_or_else(|| self.server_url.clone());
-        let mut lines = server_section(feed.latest().as_ref(), &fallback_host);
-        lines.push(THIS_MACHINE_HEADING.to_string());
-        lines.extend(local_lines);
+        let remote = latest.as_ref().map(|stats| RemoteServer {
+            fallback_name: &fallback_name,
+            stats: stats.as_ref(),
+        });
 
-        lines
+        StatsTable::new(remote, &self.system_stats)
     }
 
     /// Tell the server stats poller whether the perf panel is on screen, so
@@ -1596,63 +1582,6 @@ impl App {
             feed.set_panel_visible(on_screen);
         }
     }
-
-    /// Format this machine's stats into display lines for the perf panel.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<String>` with GPU, CPU/tokens, and RAM lines for rendering.
-    fn local_perf_lines(&self) -> Vec<String> {
-        let stats = &self.system_stats;
-        let cpu = stats
-            .cpu_util_percent
-            .map(|util| format!("{util:.0}%"))
-            .unwrap_or_else(|| "--".to_string());
-
-        let system = format!(
-            "CPU {cpu} · {} cores · ⚡ {:.1} tok/s",
-            stats.cpu_cores, self.tokens_per_sec
-        );
-
-        vec![gpu_line(stats), system, ram_line(stats)]
-    }
-}
-
-/// The perf panel's GPU line: each metric the sampler reported, or `GPU n/a`.
-fn gpu_line(stats: &SystemStats) -> String {
-    let memory = stats
-        .gpu_memory_used_mb
-        .zip(stats.gpu_memory_total_mb)
-        .map(|(used, total)| format!("{used}/{total} MB"));
-    let reported = [
-        stats.gpu_name.clone(),
-        stats.gpu_util_percent.map(|util| format!("{util:.0}%")),
-        memory,
-        stats.gpu_power_watts.map(|power| format!("{power:.1}W")),
-        stats.gpu_temp_c.map(|temp| format!("{temp:.0}°C")),
-    ];
-    let parts: Vec<String> = reported.into_iter().flatten().collect();
-
-    if parts.is_empty() {
-        return "GPU n/a".to_string();
-    }
-
-    format!("GPU {}", parts.join(" · "))
-}
-
-/// The perf panel's RAM line, in GiB.
-fn ram_line(stats: &SystemStats) -> String {
-    let gib = |mebibytes: u64| mebibytes as f64 / MIB_PER_GIB;
-
-    format!(
-        "RAM {:.1}/{:.1} GB · sh {:.1} · buf {:.1} · cache {:.1} · free {:.1}",
-        gib(stats.memory_used_mb),
-        gib(stats.memory_total_mb),
-        gib(stats.memory_shared_mb),
-        gib(stats.memory_buffers_mb),
-        gib(stats.memory_cached_mb),
-        gib(stats.memory_free_mb)
-    )
 }
 
 /// The lowercase name of an agent mode, as the header shows it.
@@ -2013,7 +1942,7 @@ mod tests {
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 100;
         app.scroll_chat_page(-1);
-        assert_eq!(app.chat_scroll_offset, 80);
+        assert_eq!(app.chat_scroll_offset, 78);
         app.scroll_chat_page(1);
         assert_eq!(app.chat_scroll_offset, 100);
     }
@@ -2031,7 +1960,7 @@ mod tests {
             height: 20,
         };
         app.last_chat_area = Some(area);
-        let consumed = app.handle_scrollbar_click(area.width - 2, area.y + area.height - 2);
+        let consumed = app.handle_scrollbar_click(area.width - 1, area.y + area.height - 1);
         assert!(consumed);
         assert!(app.chat_scroll_offset > 0);
     }
@@ -2990,7 +2919,7 @@ mod tests {
 
         assert_eq!(
             app.model_info_line(),
-            "model: chosen · mode: agent · server http://thor:11434"
+            "model: chosen · mode: agent · server: http://thor:11434"
         );
 
         Ok(())
@@ -3117,10 +3046,10 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
         assert_eq!(app.chat_scroll_offset, 0);
 
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 38, 18));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 19));
         assert_eq!(app.scroll_mode, ScrollMode::Follow);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 38, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 39, 0));
         assert_eq!(app.chat_scroll_offset, 0);
 
         app.handle_mouse(mouse(MouseEventKind::Moved, 5, 5));
@@ -3167,9 +3096,9 @@ mod tests {
         }
         app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 38, 1));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 38, 10));
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 38, 10));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 39, 0));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 10));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 39, 10));
 
         assert_eq!(app.selection, None);
         assert_eq!(app.clipboard, None);
@@ -3189,16 +3118,16 @@ mod tests {
         app.last_chat_area = Some(Rect::new(0, 0, 40, 10));
         app.scroll_mode = ScrollMode::Follow;
 
-        click(&mut app, 5, 1);
+        click(&mut app, 5, 0);
         assert!(!app.transcript.text().contains("Opening"));
 
-        click(&mut app, 5, 2);
+        click(&mut app, 5, 1);
         assert!(app.transcript.text().contains("📂 Opening"));
 
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 1;
-        click(&mut app, 5, 0);
-        click(&mut app, 5, 8);
+        click(&mut app, 5, 10);
+        click(&mut app, 5, 7);
 
         std::fs::remove_dir_all(workspace)?;
 
@@ -3329,7 +3258,7 @@ mod tests {
         app.chat_scroll_offset = 0;
         let rows_open = app.transcript.layout(57);
 
-        click(&mut app, 5, 1);
+        click(&mut app, 5, 0);
 
         assert!(app.transcript.layout(57) < rows_open);
         assert_eq!(
@@ -3510,30 +3439,20 @@ mod tests {
     }
 
     #[test]
-    fn perf_lines_list_every_reported_metric() {
+    fn the_stats_table_holds_this_machines_figures() {
         let mut app = test_app();
         app.system_stats = SystemStats {
             gpu_name: Some("Thor".to_string()),
             gpu_util_percent: Some(42.0),
-            gpu_memory_used_mb: Some(1024),
-            gpu_memory_total_mb: Some(2048),
-            gpu_power_watts: Some(15.5),
-            gpu_temp_c: Some(50.0),
-            cpu_util_percent: Some(12.0),
             cpu_cores: 14,
-            memory_used_mb: 2048,
             ..SystemStats::default()
         };
 
-        let lines = app.perf_lines();
+        let table = app.stats_table();
 
-        assert_eq!(lines[0], "GPU Thor · 42% · 1024/2048 MB · 15.5W · 50°C");
-        assert!(lines[1].starts_with("CPU 12% · 14 cores"));
-        assert!(lines[2].starts_with("RAM 2.0/"));
-
-        app.system_stats = SystemStats::default();
-
-        assert_eq!(app.perf_lines()[0], "GPU n/a");
+        assert_eq!(table.rows.len(), 1, "no server row without a remote server");
+        assert_eq!(table.rows[0].name, "local");
+        assert_eq!(table.rows[0].figures[..2], ["Thor", "42%"]);
     }
 
     #[test]
@@ -3548,14 +3467,14 @@ mod tests {
         app.server_url = "thor-without-scheme".to_string();
         app.server_feed = Some(feed);
 
-        let lines = app.perf_lines();
+        let table = app.stats_table();
 
-        assert_eq!(lines[0], "server thor-without-scheme · requests 1 running");
-        assert_eq!(lines[1], "this machine");
+        assert_eq!(table.notes[0].name, "thor-without-scheme");
+        assert_eq!(table.notes[0].text, "running   1");
     }
 }
 
-/// The header's model line: the name, then each detail the server reported.
+/// The panel's model line: the name, then each detail the server reported.
 ///
 /// Ollama reports a size, parameter count, quantization and context length. An
 /// OpenAI-compatible server often reports none of them, so a missing detail is
@@ -3563,16 +3482,20 @@ mod tests {
 fn model_summary(model: &OllamaModel) -> String {
     let details = model.details.clone().unwrap_or_default();
     let size =
-        (model.size > 0).then(|| format!("{:.1} GB", model.size as f64 / BYTES_PER_GIGABYTE));
+        (model.size > 0).then(|| format!("size: {:.1} GB", model.size as f64 / BYTES_PER_GIGABYTE));
     let context = details
         .context_length
         .filter(|length| *length > 0)
-        .map(|length| format!("{length} ctx"));
+        .map(|length| format!("context: {length}"));
 
     let reported = [
         size,
-        details.parameter_size,
-        details.quantization_level,
+        details
+            .parameter_size
+            .map(|parameters| format!("parameters: {parameters}")),
+        details
+            .quantization_level
+            .map(|quantization| format!("quantization: {quantization}")),
         context,
     ];
     let name = format!("model: {}", model.name);
@@ -3602,7 +3525,7 @@ mod model_summary_tests {
         let summary = model_summary(&model);
 
         assert!(summary.starts_with("model: qwen2.5-coder:7b · "));
-        assert!(summary.ends_with(" · 7.6B · Q4_K_M · 32768 ctx"));
+        assert!(summary.ends_with(" · parameters: 7.6B · quantization: Q4_K_M · context: 32768"));
 
         Ok(())
     }

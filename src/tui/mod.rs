@@ -29,14 +29,13 @@ mod markdown;
 mod scroll;
 mod selection;
 mod session;
+mod stats;
 mod text;
 mod transcript;
 mod ui;
 mod worker;
 
-pub(super) use text::{
-    extract_path_from_line, open_in_vim, split_command, text_wrapped_height, wrap_text_to_lines,
-};
+pub(super) use text::{extract_path_from_line, open_in_vim, split_command, wrap_text_to_lines};
 pub(super) use worker::{
     UiEvent, WorkerHistory, run_agent_worker, run_pull_worker, run_setup_worker, run_update_worker,
 };
@@ -488,6 +487,7 @@ fn tick(app: &mut app::App) -> LoopControl {
 mod tests {
     use super::*;
     use crate::banner;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A terminal of 80 by 24 cells that writes its output into `output`.
     fn memory_terminal(
@@ -718,6 +718,23 @@ mod tests {
         assert!(written.contains("\u{1b}[?25h"), "shows the cursor");
     }
 
+    #[test]
+    fn the_panic_hook_restores_the_terminal_and_keeps_the_earlier_hook() {
+        static EARLIER_HOOK_RAN: AtomicBool = AtomicBool::new(false);
+
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_info| {
+            EARLIER_HOOK_RAN.store(true, Ordering::SeqCst)
+        }));
+        install_panic_hook();
+
+        let outcome = std::panic::catch_unwind(|| panic!("a test panic"));
+
+        std::panic::set_hook(original);
+        assert!(outcome.is_err());
+        assert!(EARLIER_HOOK_RAN.load(Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn a_quitting_app_exits_without_waiting_for_input() -> anyhow::Result<()> {
         let client = refused_client()?;
@@ -933,7 +950,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains('█'), "the banner art should render");
-        assert!(content.contains("openbatrangs"));
+        assert!(content.contains("local coding agent"));
     }
 
     #[test]

@@ -907,6 +907,7 @@ mod tests {
             "/mode chat",
             "/thinking",
             "/thinking off",
+            "/temperature 0.5",
             "/mouse",
             "/mouse on",
             "/yolo",
@@ -921,10 +922,11 @@ mod tests {
         assert!(results.iter().all(Result::is_ok));
         assert!(text.contains("Auto mode"));
         assert!(text.contains("Current model: qwen2.5-coder:7b"));
-        assert!(text.contains("  Model info: model: qwen2.5-coder:7b · 4.7 GB"));
+        assert!(text.contains("  Model info: model: qwen2.5-coder:7b · size: 4.7 GB"));
         assert!(text.contains("❌ Model 'missing:1b' is not installed."));
         assert!(text.contains("Ollama reachable"));
         assert!(text.contains("Thinking display: ON · Usage"));
+        assert_eq!(app.run_config.temperature, Some(0.5));
         assert!(text.contains("Mouse mode: ON · Usage"));
         assert!(text.contains("Mouse mode: ON (wheel scroll"));
         assert!(app.is_showing_picker());

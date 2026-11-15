@@ -16,9 +16,7 @@ use crate::constants::perf::{
 };
 use gpu::{GpuStats, parse_nvidia_smi, parse_tegrastats};
 pub use poll::{ServerPoller, ServerStatsFeed};
-#[cfg(test)]
-pub use server::ServerStats;
-pub use server::{server_host, server_section};
+pub use server::{EngineLoad, LoadedModel, ServerGpu, ServerStats, ServerSystem, server_host};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};

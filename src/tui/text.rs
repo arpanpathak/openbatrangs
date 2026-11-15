@@ -5,7 +5,7 @@
 //! in one place:
 //!
 //! - [`strip_ansi`] removes terminal escapes so the chat log stores plain text.
-//! - [`text_wrapped_height`] / [`wrap_text_to_lines`] / [`wrap_spans`]
+//! - [`wrap_text_to_lines`] / [`wrap_spans`]
 //!   compute visual wrapping for Unicode-safe layout.
 //! - [`extract_path_from_line`] lets users click a file path in the chat.
 //!
@@ -77,26 +77,6 @@ fn skip_operating_system_command(characters: &mut Chars<'_>) {
 /// Skip a CSI sequence (`ESC [ ...`), which ends at a final byte in `0x40..=0x7E`.
 fn skip_control_sequence(characters: &mut Chars<'_>) {
     characters.find(|character| ('\u{40}'..='\u{7e}').contains(character));
-}
-
-/// Number of visual rows a line of `display_width` cells occupies when wrapped
-/// at `max_text_width` cells. Empty lines still occupy one row.
-pub(crate) fn wrapped_line_count(display_width: usize, max_text_width: usize) -> usize {
-    let max_text_width = max_text_width.max(1);
-
-    match display_width {
-        0 => 1,
-        _ => display_width.div_ceil(max_text_width),
-    }
-}
-
-/// Number of visual rows `text` occupies when each source line is wrapped at
-/// `max_text_width` cells.
-pub(crate) fn text_wrapped_height(text: &str, max_text_width: usize) -> usize {
-    text.split('\n')
-        .map(|line| wrapped_line_count(line.width(), max_text_width))
-        .sum::<usize>()
-        .max(1)
 }
 
 /// Wrap a multi-line string into rows that each fit within `max_text_width` cells.
@@ -342,13 +322,6 @@ mod tests {
     #[test]
     fn strip_ansi_keeps_plain_text() {
         assert_eq!(strip_ansi("plain text 🦇"), "plain text 🦇");
-    }
-
-    #[test]
-    fn wrapped_height_counts_visual_rows() {
-        assert_eq!(text_wrapped_height("", 10), 1);
-        assert_eq!(text_wrapped_height(&"a".repeat(100), 10), 10);
-        assert_eq!(text_wrapped_height("a\nbb\n", 10), 3);
     }
 
     #[test]
