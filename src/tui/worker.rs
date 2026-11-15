@@ -374,15 +374,20 @@ async fn forward_chat_stream(
         .await
 }
 
-/// Send reply text as answer text, and note the first reasoning delta once.
-/// Chat mode has no tools, so tool-call deltas are dropped.
+/// Send reply text as answer text, note the first reasoning delta once, and
+/// say when the reply was cut off at the output limit. Chat mode has no
+/// tools, so tool-call deltas are dropped.
 fn forward_delta(delta: Delta, has_noted_thinking: &mut bool, tx: &mpsc::UnboundedSender<UiEvent>) {
     match delta {
         Delta::Content(text) => send_event(tx, UiEvent::Agent(answer_text(text))),
         Delta::Thinking(_reasoning) => note_thinking(has_noted_thinking, tx),
         Delta::ToolCalls(_calls) => {}
+        Delta::Cut => send_event(tx, UiEvent::Log(CUT_REPLY_LOG.to_string())),
     }
 }
+
+/// Logged when the server cut a chat reply off at the output limit.
+const CUT_REPLY_LOG: &str = "⚠️  The reply reached the output limit and was cut off.";
 
 /// An answer-text event carrying `text`.
 fn answer_text(text: String) -> AgentEvent {
@@ -745,6 +750,16 @@ mod tests {
         forward_delta(Delta::ToolCalls(Vec::new()), &mut has_noted_thinking, &tx);
 
         assert!(sent_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_cut_chat_reply_is_logged() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut has_noted_thinking = false;
+
+        forward_delta(Delta::Cut, &mut has_noted_thinking, &tx);
+
+        assert_eq!(texts(&sent_events(&mut rx)), [CUT_REPLY_LOG]);
     }
 
     #[tokio::test]

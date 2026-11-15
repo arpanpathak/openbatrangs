@@ -66,6 +66,18 @@ impl Reply {
             body: format!("{events}data: [DONE]\n\n"),
         }
     }
+
+    /// A streamed reply of `deltas` that the server stops at `max_tokens`:
+    /// its last event has `finish_reason: "length"`.
+    pub(super) fn openai_stream_cut(deltas: &[Value]) -> Self {
+        let mut reply = Self::openai_stream(deltas);
+        let cut = json!({ "choices": [{ "delta": {}, "finish_reason": "length" }] });
+        reply.body = reply
+            .body
+            .replace("data: [DONE]", &format!("data: {cut}\n\ndata: [DONE]"));
+
+        reply
+    }
 }
 
 /// An OpenAI delta carrying reply text.
