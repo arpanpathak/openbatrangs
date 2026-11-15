@@ -27,10 +27,11 @@ use super::{
     max_output_tokens,
 };
 use crate::constants::agent::{
-    AGENT_TEMPERATURE, INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
+    INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
 };
 use crate::constants::ansi::{COLOR_DIM, COLOR_RESET};
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient, Role};
+use crate::sampling::Sampling;
 use crate::tools;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -284,7 +285,8 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
 
     /// Stream the model's reply, showing its thought and answer as they arrive.
     async fn stream(&mut self) -> Result<State> {
-        let request = chat_request(self.model, &self.messages, self.num_ctx);
+        let sampling = Sampling::for_model(self.model, self.config.temperature);
+        let request = chat_request(self.model, &self.messages, self.num_ctx, sampling);
         let show_thinking = self.config.show_thinking;
 
         let (content, answer_was_streamed) =
@@ -564,21 +566,28 @@ fn workspace_note(cwd: &Path, task: &str) -> String {
     )
 }
 
-/// Build an Ollama chat request with JSON output format and agent temperature.
-fn chat_request(model: &str, messages: &[ChatMessage], num_ctx: u64) -> ChatRequest {
+/// Build an Ollama chat request with JSON output format and `sampling`.
+fn chat_request(
+    model: &str,
+    messages: &[ChatMessage],
+    num_ctx: u64,
+    sampling: Sampling,
+) -> ChatRequest {
+    let mut options = serde_json::json!({
+        "num_ctx": num_ctx,
+        // As many output tokens as fit: the value is computed from the
+        // compacted prompt, so prompt and reply together fit num_ctx.
+        "num_predict": max_output_tokens(num_ctx, messages),
+    });
+    sampling.write_to(&mut options);
+
     ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
         stream: false,
         keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: Some(serde_json::Value::String("json".to_string())),
-        options: Some(serde_json::json!({
-            "temperature": AGENT_TEMPERATURE,
-            "num_ctx": num_ctx,
-            // As many output tokens as fit: the value is computed from the
-            // compacted prompt, so prompt and reply together fit num_ctx.
-            "num_predict": max_output_tokens(num_ctx, messages),
-        })),
+        options: Some(options),
     }
 }
 
@@ -1126,7 +1135,12 @@ mod tests {
             chat(Role::User, "task"),
         ];
 
-        let request = chat_request("test-model", &messages, 4096);
+        let request = chat_request(
+            "test-model",
+            &messages,
+            4096,
+            Sampling::for_model("test-model", None),
+        );
 
         assert_eq!(request.model, "test-model");
         assert_eq!(request.messages.len(), 2);

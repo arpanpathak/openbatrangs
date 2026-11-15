@@ -21,6 +21,7 @@ pub const COMMANDS: &[&str] = &[
     "perf",
     "mode",
     "thinking",
+    "temperature",
     "mouse",
     "yolo",
 ];
@@ -29,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
 pub const PREFIXED_COMMANDS: &[(&str, &[&str])] = &[
     ("mode ", &["agent", "plan", "chat"]),
     ("thinking ", &["on", "off"]),
+    ("temperature ", &["auto"]),
     ("mouse ", &["on", "off"]),
 ];
 
@@ -49,6 +51,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /yolo              — disable confirmations (careful!)",
     "  /thinking on|off   — show/hide model reasoning",
     "  /steps <n>|off     — set or remove the step limit",
+    "  /temperature <t>|auto — set the sampling temperature (auto = model card)",
     "  /cwd <path>        — change workspace directory",
     "  /perf              — toggle performance panel",
     "  /mouse on|off      — wheel, scrollbar, drag to copy (off = native select)",
@@ -136,13 +139,6 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a coding assistant.
 - For design/docs requests, write structured documents covering architecture, data flow, interfaces, trade-offs, and implementation steps.
 - Use any project context the user provides.
 "#;
-
-/// Sampling temperature for plain chat completions.
-///
-/// Lower than the old default so small local models produce longer, more
-/// coherent code and documentation instead of drifting after a few hundred
-/// tokens.
-pub const CHAT_TEMPERATURE: f64 = 0.3;
 
 /// Terminal emulators tried, in order, when opening a file in `vim`.
 pub const VIM_TERMINALS: &[&str] = &[

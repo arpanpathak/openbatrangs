@@ -52,14 +52,16 @@ fn openai_role(role: &Role) -> &'static str {
     }
 }
 
-/// Copy Ollama's `temperature` and `num_predict` options into `body` under
-/// their OpenAI names, `temperature` and `max_tokens`.
+/// Copy Ollama's sampling and `num_predict` options into `body` under their
+/// OpenAI names; only `num_predict` is renamed, to `max_tokens`.
 fn add_sampling_options(body: &mut Value, options: Option<&Value>) {
     let Some(options) = options else {
         return;
     };
 
     copy_field(options, "temperature", body, "temperature");
+    copy_field(options, "top_p", body, "top_p");
+    copy_field(options, "top_k", body, "top_k");
     copy_field(options, "num_predict", body, "max_tokens");
 }
 

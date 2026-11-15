@@ -101,6 +101,8 @@ pub struct AgentConfig {
     /// Maximum number of agent iterations before stopping, or `None` for no
     /// limit.
     pub max_steps: Option<usize>,
+    /// Sampling temperature set by the user, or `None` for the model card's.
+    pub temperature: Option<f64>,
     /// When `true`, mutating tools (write, run command) are disabled.
     pub is_read_only: bool,
     /// When `true`, the user must approve each write/command before execution.

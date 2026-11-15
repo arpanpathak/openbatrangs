@@ -66,9 +66,6 @@ pub const EMPTY_TURN_NUDGE: &str = "Your previous turn produced no answer or too
 /// Small safety margin left unused so prompt + output fit inside `num_ctx`.
 pub const CONTEXT_RESERVE_TOKENS: u64 = 128;
 
-/// Sampling temperature for agentic tool-calling determinism.
-pub const AGENT_TEMPERATURE: f64 = 0.2;
-
 /// System prompt for the JSON tool loop.
 pub const SYSTEM_PROMPT: &str = r#"You are a coding agent for the current workspace.
 

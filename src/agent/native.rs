@@ -28,11 +28,11 @@ use super::{
     earlier_turns_section, effective_context, ensure_workspace_exists,
 };
 use crate::constants::agent::{
-    AGENT_TEMPERATURE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE,
-    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
-    NATIVE_SYSTEM_PROMPT,
+    CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE, MAX_HISTORY_MESSAGES,
+    MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS, NATIVE_SYSTEM_PROMPT,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
+use crate::sampling::Sampling;
 use anyhow::{Context, Result};
 use futures_util::{Stream, TryStreamExt};
 use serde_json::{Value, json};
@@ -516,7 +516,8 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Stream the model's reply; a reply with tool calls runs them.
     async fn stream(&mut self) -> Result<State> {
-        let body = request_body(self.model, &self.messages, self.num_ctx, self.think);
+        let mut body = request_body(self.model, &self.messages, self.num_ctx, self.think);
+        Sampling::for_model(self.model, self.config.temperature).write_to(&mut body);
 
         let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
             .await
@@ -1042,7 +1043,6 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
         // "required" keeps served models from answering in plain text when a
         // tool call is what the task needs; the `finish` tool is the exit.
         "tool_choice": "required",
-        "temperature": AGENT_TEMPERATURE,
         "max_tokens": max_tokens,
         "stream": true,
         "chat_template_kwargs": { "enable_thinking": think },

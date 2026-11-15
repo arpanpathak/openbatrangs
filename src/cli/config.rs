@@ -33,6 +33,8 @@ pub(crate) struct AgentRunConfig {
     pub(crate) cwd: PathBuf,
     /// Maximum agent iterations, or `None` for no limit.
     pub(crate) max_steps: Option<usize>,
+    /// Sampling temperature set by the user, or `None` for the model card's.
+    pub(crate) temperature: Option<f64>,
     /// Disable file writes and shell commands.
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
@@ -65,6 +67,7 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
     AgentRunConfig {
         cwd: cli.cwd.clone(),
         max_steps: cli.max_steps,
+        temperature: cli.temperature,
         is_read_only: cli.is_read_only,
         should_confirm: cli.should_confirm,
         use_sandbox: !cli.is_sandbox_disabled,
