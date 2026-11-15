@@ -172,12 +172,15 @@ impl Transcript {
             }
             AgentEvent::Finished {
                 answer,
+                answer_was_streamed,
                 changed_files,
-                ..
-            } => self.end_with(BlockContent::Answer(Answer {
-                text: answer,
-                changed_files,
-            })),
+            } => self.finish_with(
+                Answer {
+                    text: answer,
+                    changed_files,
+                },
+                answer_was_streamed,
+            ),
         }
     }
 
@@ -200,6 +203,16 @@ impl Transcript {
     fn end_with(&mut self, content: BlockContent) {
         self.finish_running_step();
         self.push(content);
+    }
+
+    /// End the run with `answer`. An answer the model streamed as its reply
+    /// leaves the running step, so it is shown once, in the answer block.
+    fn finish_with(&mut self, answer: Answer, was_streamed: bool) {
+        if was_streamed {
+            self.update_running_step(|step| step.reply.clear());
+        }
+
+        self.end_with(BlockContent::Answer(answer));
     }
 
     /// Apply `change` to the running step, if there is one.
@@ -730,6 +743,44 @@ mod tests {
         transcript.finish_running_step();
         let lines = texts(&transcript.visible_lines(60, 0, 10, false));
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn a_streamed_answer_is_shown_once() {
+        let mut transcript = Transcript::new(50);
+
+        transcript.apply(step(1));
+        transcript.apply(text(TextKind::Answer, "The module parses stats."));
+        transcript.apply(AgentEvent::Finished {
+            answer: "The module parses stats.".to_string(),
+            answer_was_streamed: true,
+            changed_files: Vec::new(),
+        });
+
+        let copies = transcript
+            .text()
+            .matches("The module parses stats.")
+            .count();
+
+        assert_eq!(copies, 1);
+    }
+
+    #[test]
+    fn a_finish_summary_keeps_the_reply_that_came_before_it() {
+        let mut transcript = Transcript::new(50);
+
+        transcript.apply(step(1));
+        transcript.apply(text(TextKind::Answer, "Tests pass."));
+        transcript.apply(AgentEvent::Finished {
+            answer: "Added the median function.".to_string(),
+            answer_was_streamed: false,
+            changed_files: Vec::new(),
+        });
+
+        let text = transcript.text();
+
+        assert!(text.contains("Step 1 Tests pass."));
+        assert!(text.ends_with("Added the median function."));
     }
 
     #[test]
