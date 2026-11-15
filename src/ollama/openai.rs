@@ -111,9 +111,19 @@ fn payload_drain(data: &str) -> Option<Drain> {
     stream_error(&value).or_else(|| choice_delta(&value).map(Drain::Delta))
 }
 
-/// The content, reasoning, or tool-call delta of a parsed `data:` payload.
+/// The content, reasoning, or tool-call delta of a parsed `data:` payload,
+/// or [`Delta::Cut`] when the server stopped the reply at `max_tokens`.
+///
+/// The cut payload's own delta is dropped with it: the reply it ends is
+/// incomplete either way.
 fn choice_delta(value: &Value) -> Option<Delta> {
-    value.pointer("/choices/0/delta").and_then(parse_delta)
+    let choice = value.pointer("/choices/0")?;
+
+    if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+        return Some(Delta::Cut);
+    }
+
+    choice.get("delta").and_then(parse_delta)
 }
 
 /// The delta in one streamed choice: its tool calls when it has any, else
@@ -305,9 +315,10 @@ mod tests {
     fn delta_text(drain: Drain) -> Option<String> {
         match drain {
             Drain::Delta(Delta::Content(text) | Delta::Thinking(text)) => Some(text),
-            Drain::Delta(Delta::ToolCalls(_)) | Drain::Done | Drain::NeedMore | Drain::Error(_) => {
-                None
-            }
+            Drain::Delta(Delta::ToolCalls(_) | Delta::Cut)
+            | Drain::Done
+            | Drain::NeedMore
+            | Drain::Error(_) => None,
         }
     }
 
@@ -441,6 +452,17 @@ mod tests {
         let drained = drain_events(&mut buffer);
 
         assert!(matches!(drained, Drain::Error(message) if message == "model crashed"));
+    }
+
+    #[test]
+    fn a_reply_stopped_at_max_tokens_is_cut_and_a_finished_one_is_not() {
+        let cut =
+            parse_event(r#"{"choices":[{"delta":{"content":"tail"},"finish_reason":"length"}]}"#);
+        let finished =
+            parse_event(r#"{"choices":[{"delta":{"content":"end"},"finish_reason":"stop"}]}"#);
+
+        assert_eq!(cut, Some(Delta::Cut));
+        assert_eq!(finished, Some(Delta::Content("end".to_string())));
     }
 
     #[test]

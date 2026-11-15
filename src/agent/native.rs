@@ -29,8 +29,9 @@ use super::{
     earlier_turns_section, effective_context, ensure_workspace_exists,
 };
 use crate::constants::agent::{
-    CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, EMPTY_TURN_NUDGE, MAX_HISTORY_MESSAGES,
-    MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS, NATIVE_SYSTEM_PROMPT,
+    CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
+    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
+    NATIVE_SYSTEM_PROMPT,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use crate::sampling::Sampling;
@@ -41,6 +42,10 @@ use serde_json::{Value, json};
 /// Number of empty model turns answered with a nudge before an empty turn
 /// counts as the answer.
 const MAX_EMPTY_RETRIES: u8 = 2;
+
+/// Number of replies in a row cut off at the output limit that are answered
+/// with [`CUT_REPLY_NOTE`] before the run ends.
+const MAX_CUT_RETRIES: u8 = 2;
 
 /// The text of the tool result that answers an `ask_user` call.
 const QUESTION_SHOWN: &str =
@@ -60,6 +65,8 @@ enum State {
     RunTools(Turn),
     /// The reply was empty.
     EmptyTurn,
+    /// The server cut the reply off at the output limit.
+    Cut,
     /// The reply text is the answer.
     Answer(String),
     /// The model called `finish` with this summary.
@@ -328,6 +335,8 @@ struct Turn {
     reasoning: String,
     /// Tool calls, assembled by their streamed `index`.
     calls: Vec<Invocation>,
+    /// Whether the server stopped the reply at its output limit.
+    is_cut: bool,
 }
 
 impl Turn {
@@ -374,6 +383,7 @@ impl TurnPrinter {
             Delta::Thinking(text) => self.think(&text, reporter),
             Delta::Content(text) => self.content(&text, reporter),
             Delta::ToolCalls(calls) => self.tool_calls(calls, reporter),
+            Delta::Cut => self.turn.is_cut = true,
         }
     }
 
@@ -452,6 +462,8 @@ struct Run<'a, R, C> {
     step: usize,
     /// Number of consecutive empty model turns answered with a nudge message.
     empty_retries: u8,
+    /// Replies in a row cut off at the output limit.
+    cut_retries: u8,
     /// Messages sent to the model, trimmed to fit the context window.
     messages: Vec<Message>,
     /// Full message history, never trimmed; written to the transcript.
@@ -484,6 +496,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
                 State::Reply(turn) => self.reply(turn),
                 State::RunTools(turn) => self.run_tools(turn).await?,
                 State::EmptyTurn => self.empty_turn(),
+                State::Cut => self.cut_turn(),
                 State::Answer(text) => self.answer(&text),
                 State::Finish(summary) => self.finish(&summary),
                 State::AskUser(question) => self.ask_user(question),
@@ -564,11 +577,32 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         State::Ask
     }
 
+    /// Tell the model its reply was cut off at the output limit, without
+    /// running the cut-off call or keeping the reply; after
+    /// [`MAX_CUT_RETRIES`] cut replies in a row the next one ends the run.
+    fn cut_turn(&mut self) -> State {
+        if self.cut_retries >= MAX_CUT_RETRIES {
+            self.reporter
+                .notice("\n⚠️  The model's replies keep reaching the output limit.".to_string());
+            return self.done();
+        }
+
+        self.cut_retries += 1;
+        self.record(Message::User(CUT_REPLY_NOTE.to_string()));
+        self.reporter.notice(
+            "\n⚠️  The reply reached the output limit and was cut off; asking for smaller parts."
+                .to_string(),
+        );
+
+        State::Ask
+    }
+
     /// End the run with the reply text, unless the finish gate rejects it; a
     /// rejected answer stays in the conversation with the feedback after it.
     fn answer(&mut self, text: &str) -> State {
         let answer = text.trim();
         self.empty_retries = 0;
+        self.cut_retries = 0;
 
         // The answer stays in the conversation either way: a resumed run
         // needs it, and a rejected one needs it before the feedback.
@@ -591,6 +625,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         let mut outcome = CallOutcome::default();
         let calls = identified_calls(turn.calls, self.step);
         self.empty_retries = 0;
+        self.cut_retries = 0;
         self.record(Message::Assistant {
             content: turn.content,
             reasoning: turn.reasoning,
@@ -766,11 +801,13 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 }
 
-/// The state after a streamed turn: run its tool calls, or read its text.
+/// The state after a streamed turn: a cut-off turn is dropped, else its
+/// tool calls run, else its text is read.
 fn state_after_turn(turn: Turn) -> State {
-    match turn.calls.is_empty() {
-        true => State::Reply(turn),
-        false => State::RunTools(turn),
+    match (turn.is_cut, turn.calls.is_empty()) {
+        (true, _) => State::Cut,
+        (false, true) => State::Reply(turn),
+        (false, false) => State::RunTools(turn),
     }
 }
 
@@ -842,6 +879,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
         empty_retries: 0,
+        cut_retries: 0,
         full_conversation: messages.clone(),
         messages,
         changed_files,
@@ -1013,11 +1051,31 @@ fn identified_calls(calls: Vec<Invocation>, step: usize) -> Vec<Invocation> {
         .collect()
 }
 
-/// Turn a streamed invocation into a typed [`Tool`].
+/// Turn a streamed invocation into a typed [`Tool`]; arguments that are not
+/// valid JSON are an error that says so.
 fn parse_call(call: &Invocation) -> Result<Tool> {
+    let arguments = call_arguments(&call.arguments)?;
+
     Tool::from_call(ToolCall {
         name: call.name.clone(),
-        arguments: parse_arguments(&call.arguments),
+        arguments,
+    })
+}
+
+/// The JSON arguments of a call: empty text is `{}`, and text that is not
+/// valid JSON is an error naming its length and the parse failure.
+fn call_arguments(raw: &str) -> Result<Value> {
+    let raw = raw.trim();
+
+    if raw.is_empty() {
+        return Ok(json!({}));
+    }
+
+    serde_json::from_str(raw).with_context(|| {
+        format!(
+            "the arguments ({} characters) are not valid JSON; send one complete JSON object",
+            raw.len()
+        )
     })
 }
 
@@ -1536,6 +1594,93 @@ mod tests {
         assert!(!output.contains("Reached max steps"));
 
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A `write_file` call for `path` whose JSON arguments stop partway
+    /// through the content, as a reply cut at `max_tokens` leaves it.
+    fn cut_write_delta(path: &str) -> Value {
+        json!({ "tool_calls": [{
+            "index": 0,
+            "id": "cut",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": format!(r#"{{"path": "{path}", "content": "fn main() {{"#),
+            },
+        }] })
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_write_is_not_run_and_the_model_is_told_why() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-cut-reply");
+        let config = test_config(&root, 5);
+        let replies = vec![
+            Reply::openai_stream_cut(&[cut_write_delta("main.rs")]),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, output) = requests_of_run(&config, "m", "write main.rs", replies).await?;
+
+        assert!(
+            !root.join("main.rs").exists(),
+            "the cut-off call never runs"
+        );
+        assert!(requests[1].contains("reached the output limit and was cut off"));
+        assert!(
+            !requests[1].contains("fn main()"),
+            "the cut-off reply is not sent back"
+        );
+        assert!(output.contains("cut off; asking for smaller parts"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_third_cut_reply_in_a_row_ends_the_run() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-cut-thrice");
+        let config = test_config(&root, 10);
+        let replies = (0..3)
+            .map(|_attempt| Reply::openai_stream_cut(&[cut_write_delta("main.rs")]))
+            .collect();
+
+        let (requests, output) = requests_of_run(&config, "m", "write main.rs", replies).await?;
+
+        assert_eq!(requests.len(), 3);
+        assert!(output.contains("keep reaching the output limit"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn arguments_that_are_not_json_are_reported_as_such() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-bad-arguments");
+        let config = test_config(&root, 5);
+        let replies = vec![
+            Reply::openai_stream(&[cut_write_delta("main.rs")]),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, _output) = requests_of_run(&config, "m", "write main.rs", replies).await?;
+
+        assert!(!root.join("main.rs").exists());
+        assert!(requests[1].contains("are not valid JSON"));
+        assert!(
+            !requests[1].contains("missing"),
+            "not reported as a missing argument"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn empty_arguments_are_an_empty_object() -> Result<()> {
+        assert_eq!(call_arguments("  ")?, json!({}));
+        assert_eq!(call_arguments(r#"{"path": "a"}"#)?, json!({ "path": "a" }));
+
         Ok(())
     }
 

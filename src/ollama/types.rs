@@ -107,6 +107,9 @@ pub enum Delta {
     Thinking(String),
     /// One or more incremental tool calls (OpenAI-compatible servers only).
     ToolCalls(Vec<ToolCallDelta>),
+    /// The server stopped the reply at its `max_tokens` limit
+    /// (`finish_reason: "length"`), so the last text or tool call is cut off.
+    Cut,
 }
 
 /// One incremental tool-call chunk from a streamed OpenAI reply.

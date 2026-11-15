@@ -98,12 +98,14 @@ impl ResponsePrinter {
         }
     }
 
-    /// Print one delta. Tool-call deltas never reach the JSON loop.
+    /// Print one delta. Tool-call deltas never reach the JSON loop, and a
+    /// cut-off reply needs no mark here: the JSON loop rejects the unfinished
+    /// JSON it leaves.
     fn take<R: Reporter>(&mut self, delta: Delta, reporter: &mut R) {
         match delta {
             Delta::Thinking(text) => self.reason(&text, reporter),
             Delta::Content(text) => self.content(&text, reporter),
-            Delta::ToolCalls(..) => {}
+            Delta::ToolCalls(..) | Delta::Cut => {}
         }
     }
 

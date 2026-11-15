@@ -38,8 +38,10 @@ pub const CHARS_PER_TOKEN: f64 = 4.0;
 /// Minimum output tokens reserved for a model response.
 pub const MIN_OUTPUT_TOKENS: u64 = 1_024;
 
-/// Upper cap for `num_predict`; Ollama also stops at the context window.
-pub const MAX_OUTPUT_TOKENS: u64 = 8_192;
+/// Upper cap for `num_predict` and `max_tokens`; the server also stops at
+/// the context window. A thinking model writing a whole file needs room for
+/// its reasoning and the file in one reply.
+pub const MAX_OUTPUT_TOKENS: u64 = 16_384;
 
 /// Share of the prompt budget, in percent, that the earlier turns of the
 /// conversation may use in a new task's first message.
@@ -62,6 +64,12 @@ pub const TOOL_RESULT_PREFIX: &str = "Tool result:";
 pub const EMPTY_TURN_NUDGE: &str = "Your previous turn produced no answer or tool call. \
      Continue the task now: call the necessary tools to inspect or change files; \
      do not repeat your plan or ask the user to do the work.";
+
+/// Feedback injected when the server cut the model's reply off at the output
+/// limit; the cut-off tool call is not run.
+pub const CUT_REPLY_NOTE: &str = "Your previous reply reached the output limit and was cut off, \
+     so its tool call was not run. Keep each reply smaller: think briefly, and write a long \
+     file in parts, first write_file with the beginning, then edit_file to add each next part.";
 
 /// Small safety margin left unused so prompt + output fit inside `num_ctx`.
 pub const CONTEXT_RESERVE_TOKENS: u64 = 128;
