@@ -103,6 +103,10 @@ enum Message {
     Assistant {
         /// Assistant text; often empty when the turn only calls tools.
         content: String,
+        /// The model's reasoning for this turn, sent back as
+        /// `reasoning_content` so later steps continue from it instead of
+        /// planning the task again.
+        reasoning: String,
         /// Tool calls the assistant requested.
         calls: Vec<Invocation>,
     },
@@ -121,7 +125,11 @@ impl Message {
         match self {
             Self::System(text) => json!({ "role": "system", "content": text }),
             Self::User(text) => json!({ "role": "user", "content": text }),
-            Self::Assistant { content, calls } => assistant_json(content, calls),
+            Self::Assistant {
+                content,
+                reasoning,
+                calls,
+            } => assistant_json(content, reasoning, calls),
             Self::Tool { id, content } => {
                 json!({ "role": "tool", "tool_call_id": id, "content": content })
             }
@@ -144,6 +152,7 @@ impl Message {
             "user" => Some(Self::User(content)),
             "assistant" => Some(Self::Assistant {
                 content,
+                reasoning: string_field(value, "reasoning_content"),
                 calls: invocations(value),
             }),
             "tool" => Some(Self::Tool {
@@ -174,8 +183,14 @@ impl Message {
     fn char_len(&self) -> usize {
         match self {
             Self::System(text) | Self::User(text) => text.len(),
-            Self::Assistant { content, calls } => {
-                content.len() + calls.iter().map(Invocation::char_len).sum::<usize>()
+            Self::Assistant {
+                content,
+                reasoning,
+                calls,
+            } => {
+                let calls_len: usize = calls.iter().map(Invocation::char_len).sum();
+
+                content.len() + reasoning.len() + calls_len
             }
             Self::Tool { content, .. } => content.len(),
         }
@@ -207,8 +222,12 @@ impl Message {
 
 /// An assistant message in the OpenAI shape; `tool_calls` is present only
 /// when the turn calls tools.
-fn assistant_json(content: &str, calls: &[Invocation]) -> Value {
+fn assistant_json(content: &str, reasoning: &str, calls: &[Invocation]) -> Value {
     let mut message = json!({ "role": "assistant", "content": content });
+
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+    }
 
     if !calls.is_empty() {
         message["tool_calls"] = calls.iter().map(Invocation::to_json).collect();
@@ -304,6 +323,8 @@ fn replace_when_present(field: &mut String, value: Option<String>) {
 struct Turn {
     /// Assistant text streamed so far.
     content: String,
+    /// Reasoning streamed so far.
+    reasoning: String,
     /// Tool calls, assembled by their streamed `index`.
     calls: Vec<Invocation>,
 }
@@ -355,8 +376,11 @@ impl TurnPrinter {
         }
     }
 
-    /// Print reasoning text, when reasoning is shown.
+    /// Keep reasoning text for the conversation and print it, when
+    /// reasoning is shown.
     fn think<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
+        self.turn.reasoning.push_str(text);
+
         if !self.show_thinking {
             return;
         }
@@ -544,6 +568,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         // needs it, and a rejected one needs it before the feedback.
         self.record(Message::Assistant {
             content: answer.to_string(),
+            reasoning: String::new(),
             calls: Vec::new(),
         });
 
@@ -562,6 +587,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         self.empty_retries = 0;
         self.record(Message::Assistant {
             content: turn.content,
+            reasoning: turn.reasoning,
             calls: calls.clone(),
         });
 
@@ -1392,6 +1418,7 @@ mod tests {
     fn assistant_call(id: &str) -> Message {
         Message::Assistant {
             content: String::new(),
+            reasoning: String::new(),
             calls: vec![read_call(id)],
         }
     }
@@ -1675,16 +1702,38 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_sent_back_only_when_there_is_some() {
+        let thought = Message::Assistant {
+            content: String::new(),
+            reasoning: "Read the file first.".to_string(),
+            calls: vec![read_call("call_1")],
+        };
+        let silent = Message::Assistant {
+            content: "done".to_string(),
+            reasoning: String::new(),
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            thought.to_json()["reasoning_content"],
+            "Read the file first."
+        );
+        assert!(silent.to_json().get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn every_message_round_trips_through_json() {
         let originals = [
             Message::System("rules".to_string()),
             Message::User("task".to_string()),
             Message::Assistant {
                 content: "plain answer".to_string(),
+                reasoning: String::new(),
                 calls: Vec::new(),
             },
             Message::Assistant {
                 content: "reading".to_string(),
+                reasoning: "Read the file first.".to_string(),
                 calls: vec![read_call("call_1")],
             },
             tool_result("call_1"),
@@ -1788,6 +1837,7 @@ mod tests {
         };
         let messages = vec![Message::Assistant {
             content: String::new(),
+            reasoning: String::new(),
             calls: vec![
                 call("c1", "write_file", r#"{"path":"src/lib.rs","content":"x"}"#),
                 call("c2", "edit_file", r#"{"path":"README.md"}"#),
@@ -1811,6 +1861,7 @@ mod tests {
         };
         let written = Message::Assistant {
             content: String::new(),
+            reasoning: String::new(),
             calls: vec![write],
         };
         let passed = Message::Tool {
@@ -1858,8 +1909,9 @@ mod tests {
 
         let mut hidden = RecordingReporter::default();
         hidden.report(native_step());
-        collect_turn(deltas(), &mut hidden, false).await?;
+        let turn = collect_turn(deltas(), &mut hidden, false).await?;
         assert!(hidden.output.ends_with(" m\nHi"));
+        assert_eq!(turn.reasoning, "plan moreagainlast");
 
         Ok(())
     }
@@ -2303,6 +2355,7 @@ mod tests {
     fn read_turn(id: &str) -> Message {
         Message::Assistant {
             content: String::new(),
+            reasoning: String::new(),
             calls: vec![Invocation {
                 id: id.to_string(),
                 name: "read_file".to_string(),
