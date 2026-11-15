@@ -45,7 +45,7 @@ const CONTEXT_BAR_CELLS: usize = 30;
 const BATARANG_ROWS: u16 = 5;
 
 /// The keys shown on the input box's top border.
-const INPUT_KEYS_HINT: &str = " Enter send · Shift+Enter or \\ Enter new line ";
+const INPUT_KEYS_HINT: &str = " Enter send · Alt+Enter or \\ Enter new line ";
 
 /// Top-level rendering function: compose and draw the full TUI frame.
 ///
@@ -1025,6 +1025,17 @@ mod tests {
         assert!(screen.contains("mode: agent"));
         assert!(!screen.contains("▀▀▀▀▀▀▀▀▀▀▀▀"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn the_input_box_names_the_keys_for_a_new_line() -> anyhow::Result<()> {
+        let mut app = test_app();
+
+        let screen = draw(&mut app, 120, 30)?;
+
+        assert!(screen.contains("Enter send · Alt+Enter or \\ Enter new line"));
+        assert!(!screen.contains("Shift+Enter"));
         Ok(())
     }
 

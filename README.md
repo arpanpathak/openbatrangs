@@ -325,9 +325,21 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 Press Ctrl+C to stop a running task, then type a correction to continue the same
 conversation.
 
-To start a new line in the input, press Shift+Enter, or type `\` and press Enter.
-Terminal.app and tmux send Shift+Enter as a plain Enter, so the backslash works in
-every terminal. Ctrl+J and Alt+Enter also start a new line.
+To start a new line in the input, type `\` and press Enter, which works in every
+terminal without setup. Alt+Enter and Ctrl+J work too. On a Mac, Option+Enter
+works once Option sends Esc: in iTerm2, Settings › Profiles › Keys › Left Option
+key › Esc+; in Terminal.app, Settings › Profiles › Keyboard › Use Option as Meta key.
+
+Shift+Enter starts a new line only where the terminal reports it apart from Enter:
+kitty, WezTerm, Ghostty, and iTerm2 with "Report keys using CSI u" turned on. GNOME
+Terminal, Terminal.app and tmux send Shift+Enter as the same byte as Enter, so no
+program can tell them apart. tmux 3.5 and later can report it with these lines in
+`~/.tmux.conf`:
+
+```
+set -s extended-keys on
+set -s extended-keys-format csi-u
+```
 
 Drag across the transcript to copy text. The copy reaches your clipboard through
 the terminal's OSC 52 support, which also works over SSH:

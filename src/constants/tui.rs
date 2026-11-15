@@ -60,7 +60,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /clear             — clear chat log",
     "",
     "═══ Keys ═══",
-    "  Enter = send · Ctrl+J / Alt+Enter = newline · Ctrl+C = cancel",
+    "  Enter = send · Alt+Enter, \\ Enter or Ctrl+J = newline · Ctrl+C = cancel",
     "  PgUp/PgDn = scroll · Mouse wheel = scroll · Tab = complete, or switch to the transcript",
     "  In the transcript: ↑↓ = move · Enter / Space = fold or unfold · Tab / Esc = back",
     "  Click a step, thinking line or tool line to fold or unfold it",
