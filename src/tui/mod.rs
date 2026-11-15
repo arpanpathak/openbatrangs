@@ -27,6 +27,7 @@ mod commands;
 mod input;
 mod markdown;
 mod scroll;
+mod selection;
 mod session;
 mod text;
 mod transcript;
@@ -296,13 +297,15 @@ async fn step<W: Write>(
     next_control(app, events, rx, &mut state.ticker, client, tx).await
 }
 
-/// Apply the mouse-capture setting and draw one frame.
+/// Apply the mouse-capture setting, put copied text on the clipboard, and
+/// draw one frame.
 fn draw_frame<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut app::App,
     mouse_capture: &mut bool,
 ) -> Result<()> {
     sync_mouse_capture(terminal, app.mouse_capture, mouse_capture)?;
+    selection::copy_to_clipboard(terminal.backend_mut(), app.clipboard.take())?;
     terminal.draw(|frame| ui::ui(frame, app))?;
 
     Ok(())

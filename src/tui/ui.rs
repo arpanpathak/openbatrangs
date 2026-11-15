@@ -16,6 +16,7 @@
 
 use super::app::{App, FocusArea};
 use super::scroll::{chat_text_width, chat_visible_height};
+use super::selection;
 use super::{ScrollMode, text_wrapped_height, wrap_text_to_lines};
 use crate::banner;
 use crate::cli::{AgentMode, AgentRunConfig};
@@ -242,6 +243,24 @@ fn render_chat_area(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         area,
     );
     render_chat_scrollbar(frame, area, content_height, scroll_y);
+    render_selection(frame, app, area);
+}
+
+/// Draw the selected transcript text in reverse video and keep its text for
+/// the clipboard.
+fn render_selection(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let Some(selection) = app.selection else {
+        return;
+    };
+
+    let text_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: chat_text_width(area.width) as u16,
+        height: chat_visible_height(area) as u16,
+    };
+
+    app.selected_text = selection::highlight(frame.buffer_mut(), text_area, selection);
 }
 
 /// Re-stick to the bottom when the user scrolls down to the latest line, but
@@ -691,13 +710,16 @@ fn input_height(app: &App, width: u16, area_height: u16) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::selection::Selection;
     use super::*;
     use crate::agent::AgentEvent;
     use crate::cli::Cli;
     use crate::perf::{ServerStats, ServerStatsFeed};
+    use anyhow::Context;
     use clap::Parser;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -775,6 +797,48 @@ mod tests {
             .collect();
 
         Ok(screen)
+    }
+
+    #[test]
+    fn the_selection_is_read_from_the_screen() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.notice("first notice".to_string());
+        app.notice("second notice".to_string());
+        draw(&mut app, 60, 30)?;
+
+        let area = app.last_chat_area.context("the chat was drawn")?;
+        let row_of = |needle: &str, screen: &str| {
+            screen
+                .lines()
+                .position(|line| line.contains(needle))
+                .map(|row| row as u16)
+        };
+        let screen = draw_rows(&mut app, 60, 30)?;
+        let first = row_of("first notice", &screen).context("first row")?;
+        let second = row_of("second notice", &screen).context("second row")?;
+
+        app.selection = Some(Selection {
+            anchor: Position::new(area.x + 1, first),
+            cursor: Position::new(area.x + 6, second),
+        });
+        draw(&mut app, 60, 30)?;
+
+        assert!(app.selected_text.starts_with("first notice"));
+        assert!(app.selected_text.ends_with("\nsecond"));
+
+        Ok(())
+    }
+
+    /// Draw the whole UI and return the screen as lines of `width` cells.
+    fn draw_rows(app: &mut App, width: u16, height: u16) -> anyhow::Result<String> {
+        let screen: Vec<String> = draw(app, width, height)?
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(width as usize)
+            .map(|row| row.iter().collect())
+            .collect();
+
+        Ok(screen.join("\n"))
     }
 
     #[test]

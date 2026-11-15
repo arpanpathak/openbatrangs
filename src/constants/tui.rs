@@ -51,7 +51,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /steps <n>         — set max agent iterations",
     "  /cwd <path>        — change workspace directory",
     "  /perf              — toggle performance panel",
-    "  /mouse on|off      — wheel/scrollbar (off = native select/copy)",
+    "  /mouse on|off      — wheel, scrollbar, drag to copy (off = native select)",
     "  /clear             — clear chat log",
     "",
     "═══ Keys ═══",

@@ -895,6 +895,7 @@ name = "openbatrangs"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "futures-util",

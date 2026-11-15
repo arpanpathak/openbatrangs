@@ -12,6 +12,7 @@ include = ["/src/**/*", "/tests/**/*", "/Cargo.toml", "/Cargo.lock", "/README.md
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"

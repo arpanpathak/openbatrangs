@@ -314,7 +314,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/steps <n>` | set the step limit |
 | `/cwd <path>` | change the project folder |
 | `/perf` | show or hide the performance panel |
-| `/mouse on\|off` | use the mouse wheel and scrollbar, or the terminal's own text selection |
+| `/mouse on\|off` | use the mouse wheel, the scrollbar and drag to copy, or the terminal's own text selection |
 | `/clear` | clear the transcript |
 | `/pull <tag>`, `/setup`, `/doctor` | download a model, install Ollama, or check it (Ollama only) |
 | `/exit`, `/quit` | leave openbatrangs |
