@@ -73,6 +73,20 @@ pub(super) fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     render_confirmation(frame, app);
     settings::render_settings(frame, app);
     choice::render_choice(frame, app);
+    blank_control_characters(frame);
+}
+
+/// Replace every cell that holds a control character with a space.
+///
+/// Widgets draw text from the model, tools and the server. A control
+/// character in it would reach the terminal, which acts on it instead of
+/// showing it, so none is let through, whichever widget drew it.
+fn blank_control_characters(frame: &mut ratatui::Frame) {
+    for cell in &mut frame.buffer_mut().content {
+        if cell.symbol().contains(char::is_control) {
+            cell.set_symbol(" ");
+        }
+    }
 }
 
 /// Whether the perf panel should be shown given current app state and terminal height.
@@ -869,6 +883,29 @@ mod tests {
             .collect();
 
         Ok(screen)
+    }
+
+    #[test]
+    fn no_widget_draws_a_control_character() -> anyhow::Result<()> {
+        let mut app = test_app();
+
+        app.model = Some("served\x1b]0;renamed\x07model".to_string());
+
+        app.open_choice(&crate::agent::Question {
+            text: "Which?\x1b[2J".to_string(),
+            options: vec!["first\r\x1b[1Afake".to_string(), "second".to_string()],
+            is_multiple: false,
+        });
+
+        let screen = draw(&mut app, 100, 40)?;
+
+        assert!(!screen.contains(char::is_control), "{screen:?}");
+        assert!(
+            screen.contains("served"),
+            "the rest of the model name is drawn"
+        );
+
+        Ok(())
     }
 
     #[test]

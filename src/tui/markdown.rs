@@ -18,19 +18,24 @@
 
 use super::chat::code_lines;
 use super::text::{spans_text, spans_width, wrap_spans};
+use crate::terminal_text::strip_ansi;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// Draw `text` as Markdown rows at most `width` cells wide.
 pub(super) fn markdown_lines(text: &str, width: usize, highlight: bool) -> Vec<Line<'static>> {
+    // Escape codes go before parsing, so that none is split across events
+    // and every row is wrapped at its drawn width.
+    let text = strip_ansi(text);
+
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
     let mut writer = MarkdownWriter::new(width, highlight);
 
-    for event in Parser::new_ext(text, options) {
+    for event in Parser::new_ext(&text, options) {
         writer.event(event);
     }
 

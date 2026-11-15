@@ -22,6 +22,7 @@ mod models;
 mod ollama;
 mod perf;
 mod sampling;
+mod terminal_text;
 mod tools;
 mod tui;
 mod update;

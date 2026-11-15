@@ -17,6 +17,7 @@ use crate::constants::ansi::{
     ANSI_GREEN_CHECK, ANSI_YELLOW_FILES_HEADER, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_MAGENTA,
     COLOR_RESET,
 };
+use crate::terminal_text::printable_text;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -157,7 +158,7 @@ fn question_text(question: &Question) -> String {
         (false, true) => "   Reply with any of the choices, or your own answer.\n",
     };
 
-    format!("\n❓ {}\n{options}{how}", question.text)
+    printable_text(&format!("\n❓ {}\n{options}{how}", question.text))
 }
 
 /// The context window and how much of it the next request uses, in tokens
@@ -193,7 +194,9 @@ pub fn step_limit_notice(max_steps: usize) -> String {
 }
 
 impl StdoutReporter {
-    /// The terminal text for `event`.
+    /// The terminal text for `event`. Each part made from the model's, a
+    /// tool's or the server's text is made printable, so it cannot send
+    /// control sequences to the user's terminal.
     pub(super) fn render(&mut self, event: AgentEvent) -> String {
         match event {
             AgentEvent::StepStarted {
@@ -208,7 +211,7 @@ impl StdoutReporter {
                 name, arguments, ..
             } => self.tool_call(&name, &arguments),
             AgentEvent::ToolResult { output, .. } => self.tool_result(&output),
-            AgentEvent::Notice(text) => format!("{text}\n"),
+            AgentEvent::Notice(text) => format!("{}\n", printable_text(&text)),
             AgentEvent::Context(_) => String::new(),
             AgentEvent::AskUser { question } => question_text(&question),
             AgentEvent::StepLimitReached { max_steps } => {
@@ -236,7 +239,9 @@ impl StdoutReporter {
         loop_kind: LoopKind,
     ) -> String {
         self.loop_kind = Some(loop_kind);
+
         let step = step_number(step, max_steps);
+        let model = printable_text(model);
 
         match loop_kind {
             LoopKind::Native => format!("\n── step {step} ── {model}\n"),
@@ -248,11 +253,14 @@ impl StdoutReporter {
 
     /// Streamed text, after the marker of its kind when the kind changes.
     fn text(&mut self, kind: TextKind, text: &str) -> String {
+        let text = printable_text(text);
+
         if self.open_text == Some(kind) {
-            return text.to_string();
+            return text;
         }
 
         self.open_text = Some(kind);
+
         format!("{}{text}", text_opening(self.style(), kind))
     }
 
@@ -265,7 +273,7 @@ impl StdoutReporter {
 
     /// The tool-call line.
     fn tool_call(&self, name: &str, arguments: &str) -> String {
-        let description = describe_call(name, arguments);
+        let description = printable_text(&describe_call(name, arguments));
 
         match self.style() {
             LoopKind::Native => format!("\n🔧 {description}\n"),
@@ -275,6 +283,8 @@ impl StdoutReporter {
 
     /// The tool's full output.
     fn tool_result(&self, output: &str) -> String {
+        let output = printable_text(output);
+
         match self.style() {
             LoopKind::Native => format!("{output}\n"),
             LoopKind::Json => format!("{COLOR_DIM}{output}{COLOR_RESET}\n"),
@@ -288,6 +298,8 @@ impl StdoutReporter {
         answer_was_streamed: bool,
         changed_files: &[PathBuf],
     ) -> String {
+        let answer = printable_text(answer);
+
         let answer_line = match (self.style(), answer_was_streamed) {
             (LoopKind::Native, _) => format!("\n✅ {answer}\n"),
             (LoopKind::Json, false) => format!("\n{ANSI_GREEN_CHECK} {answer}\n"),
@@ -414,6 +426,56 @@ mod tests {
         assert!(output.contains("\n✅ done\n"));
         assert!(output.contains("📁 Files changed:"));
         assert!(output.contains("   \x1b]8;;file:///w/a.rs"));
+    }
+
+    #[test]
+    fn untrusted_text_is_printed_without_control_sequences() {
+        let events = vec![
+            AgentEvent::StepStarted {
+                step: 1,
+                max_steps: None,
+                model: "m\x1b]0;title\x07".to_string(),
+                loop_kind: LoopKind::Native,
+            },
+            text(TextKind::Answer, "plan\x1b[2J\x1b[H"),
+            AgentEvent::ToolCall {
+                id: "c1".to_string(),
+                name: "run_command".to_string(),
+                arguments: r#"{"command":"ls\u001b[8m"}"#.to_string(),
+            },
+            AgentEvent::ToolResult {
+                id: "c1".to_string(),
+                success: true,
+                summary: "ok".to_string(),
+                output: "50%\r100%\x1b[1A".to_string(),
+            },
+            AgentEvent::Notice("server said \x1bP+q\x1b\\".to_string()),
+            AgentEvent::AskUser {
+                question: Question {
+                    text: "Which?\u{9b}2J".to_string(),
+                    options: vec!["a\x08b".to_string()],
+                    is_multiple: false,
+                },
+            },
+            AgentEvent::Finished {
+                answer: "done\x1b[4m".to_string(),
+                answer_was_streamed: false,
+                changed_files: Vec::new(),
+            },
+        ];
+
+        let output = printed(events);
+
+        assert!(
+            !output.contains(|character: char| character.is_control() && character != '\n'),
+            "{output:?}"
+        );
+        assert!(output.contains("── step 1 ── m\nplan"), "{output:?}");
+        assert!(
+            output.contains("🔧 run_command → ls\n50%100%\n"),
+            "{output:?}"
+        );
+        assert!(output.contains("\n✅ done\n"), "{output:?}");
     }
 
     #[test]

@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn stripped_banner_has_content_for_tui() {
-        let banner = text::strip_ansi(&banner::banner_text());
+        let banner = crate::terminal_text::strip_ansi(&banner::banner_text());
         assert!(!banner.contains('\x1b'));
         assert!(banner.lines().count() > 5);
         assert!(banner.contains('█'));

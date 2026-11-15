@@ -14,8 +14,9 @@
 
 use super::block::{Answer, Block, BlockContent, Part, Step, ToolOutcome};
 use super::session::BlockStore;
-use super::text::{spans_text, strip_ansi};
+use super::text::spans_text;
 use crate::agent::{AgentEvent, Question, TextKind, step_limit_notice};
+use crate::terminal_text::printable_text;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use std::collections::VecDeque;
@@ -577,9 +578,9 @@ fn question_markdown(question: &Question) -> String {
     }
 }
 
-/// The lines of a notice, without terminal escapes or leading blank lines.
+/// The lines of a notice, without control characters or leading blank lines.
 fn notice_lines(text: &str) -> Vec<String> {
-    strip_ansi(text)
+    printable_text(text)
         .trim_start_matches('\n')
         .lines()
         .map(str::to_string)
