@@ -815,9 +815,23 @@ fn heading_title(text: &str) -> Option<String> {
 /// The text up to the first sentence end or line break.
 fn first_sentence(text: &str) -> String {
     let trimmed = text.trim_start();
-    let end = trimmed.find(['.', '!', '?', '\n']).unwrap_or(trimmed.len());
+    let end = trimmed
+        .char_indices()
+        .find(|&(index, character)| {
+            ends_sentence(character, &trimmed[index + character.len_utf8()..])
+        })
+        .map_or(trimmed.len(), |(index, _)| index);
 
     trimmed[..end].trim().to_string()
+}
+
+/// Whether `character`, followed by `rest`, ends a sentence: a line break,
+/// or `.`, `!` or `?` before whitespace or the end of the text. The dots in
+/// `server.rs` and `1.5` do not.
+fn ends_sentence(character: char, rest: &str) -> bool {
+    let is_before_space = rest.chars().next().is_none_or(char::is_whitespace);
+
+    character == '\n' || (matches!(character, '.' | '!' | '?') && is_before_space)
 }
 
 #[cfg(test)]
@@ -878,6 +892,12 @@ mod tests {
         );
         assert_eq!(title_from_text("## Reading files"), "Reading files");
         assert_eq!(title_from_text("  I will look. Then act."), "I will look");
+        assert_eq!(
+            title_from_text("The `server.rs` module parses stats. It polls."),
+            "The `server.rs` module parses stats"
+        );
+        assert_eq!(title_from_text("Version 1.5 works!"), "Version 1.5 works");
+        assert_eq!(title_from_text("Read a.rs"), "Read a.rs");
         assert_eq!(title_from_text("**  **\nplain line"), "**  **");
         assert_eq!(title_from_text(""), "");
     }
