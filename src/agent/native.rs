@@ -20,6 +20,7 @@ use super::Question;
 use super::context::{context_use, max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
+use super::file_log::FileLog;
 use super::gemma_call::{has_raw_call_marker, parse_gemma_call};
 use super::quality::{FinishGate, command_succeeded};
 use super::repeats::RepeatGuard;
@@ -471,8 +472,8 @@ struct Run<'a, R, C> {
     messages: Vec<Message>,
     /// Full message history, never trimmed; written to the transcript.
     full_conversation: Vec<Message>,
-    /// Files changed by tools so far.
-    changed_files: Vec<String>,
+    /// Files changed by tools so far, and the files the run has read.
+    files: FileLog,
     /// Gate that rejects a finish before changed files are checked.
     finish_gate: FinishGate,
     /// Stops a model that repeats the same tool call.
@@ -708,7 +709,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Report the answer and the changed files, and end the run.
     fn report_done(&mut self, answer: &str, answer_was_streamed: bool) -> State {
-        let changed_files = absolute_paths(&self.config.cwd, &self.changed_files);
+        let changed_files = absolute_paths(&self.config.cwd, &self.files.changed);
 
         self.reporter.report(AgentEvent::Finished {
             answer: answer.to_string(),
@@ -766,17 +767,10 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             arguments: call.arguments.clone(),
         });
 
-        let changes_before = self.changed_files.len();
+        let changes_before = self.files.changed.len();
         let cwd = &self.config.cwd;
-        let report = run_tool_call(
-            self.config,
-            cwd,
-            &tool,
-            &mut self.changed_files,
-            self.confirmer,
-        )
-        .await;
-        let files_changed = self.changed_files.len() > changes_before;
+        let report = run_tool_call(self.config, cwd, &tool, &mut self.files, self.confirmer).await;
+        let files_changed = self.files.changed.len() > changes_before;
         self.finish_gate
             .record_tool_result(&tool, &report.output, files_changed);
 
@@ -893,7 +887,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
 
     // Carry the prior run's state forward so the gate does not demand a
     // check that already passed before the interrupt.
-    let changed_files = previously_changed_files(&messages);
+    let files = FileLog::with_changed(previously_changed_files(&messages));
     let finish_gate = gate_for_run(&messages);
 
     let mut run = Run {
@@ -909,7 +903,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         cut_retries: 0,
         full_conversation: messages.clone(),
         messages,
-        changed_files,
+        files,
         finish_gate,
         repeat_guard: RepeatGuard::default(),
         sink,
@@ -1429,7 +1423,7 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create a file or overwrite it completely. Parent directories are created as needed.",
+                "description": "Create a new file, or overwrite a file you have read in this run and that has not changed since. Parent directories are created as needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1444,7 +1438,7 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace a literal string inside an existing file. Prefer this over write_file for small changes.",
+                "description": "Replace a literal string inside an existing file you have read in this run, copying old_string exactly from what read_file returned. Prefer this over write_file for changes to existing files.",
                 "parameters": {
                     "type": "object",
                     "properties": {

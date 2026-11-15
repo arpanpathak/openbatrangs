@@ -17,6 +17,7 @@
 use super::Question;
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
+use super::file_log::FileLog;
 use super::quality::FinishGate;
 use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
@@ -116,8 +117,8 @@ struct JsonRun<'a, R, C> {
     step: usize,
     /// Conversation history sent to the model.
     messages: Vec<ChatMessage>,
-    /// Files written successfully during the task.
-    changed_files: Vec<String>,
+    /// Files written successfully during the task, and the files it read.
+    files: FileLog,
     /// Gate that rejects a finish before changed files are checked.
     finish_gate: FinishGate,
     /// Stops a model that repeats the same tool call.
@@ -173,7 +174,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
         messages: initial_messages(&config.cwd, &opening),
-        changed_files: Vec::new(),
+        files: FileLog::default(),
         finish_gate: FinishGate::default(),
         repeat_guard: RepeatGuard::default(),
         transcript,
@@ -315,7 +316,7 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
             return self.block_finish(feedback);
         }
 
-        let changed_files = absolute_paths(&self.config.cwd, &self.changed_files);
+        let changed_files = absolute_paths(&self.config.cwd, &self.files.changed);
         self.reporter.report(AgentEvent::Finished {
             answer: summary,
             answer_was_streamed,
@@ -382,17 +383,10 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
             arguments: arguments.clone(),
         });
 
-        let changes_before = self.changed_files.len();
+        let changes_before = self.files.changed.len();
         let cwd = &self.config.cwd;
-        let report = run_tool_call(
-            self.config,
-            cwd,
-            &tool,
-            &mut self.changed_files,
-            self.confirmer,
-        )
-        .await;
-        let files_changed = self.changed_files.len() > changes_before;
+        let report = run_tool_call(self.config, cwd, &tool, &mut self.files, self.confirmer).await;
+        let files_changed = self.files.changed.len() > changes_before;
         self.finish_gate
             .record_tool_result(&tool, &report.output, files_changed);
 
