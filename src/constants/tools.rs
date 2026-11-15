@@ -67,6 +67,9 @@ pub const BINARY_SNIFF_BYTES: usize = 8_192;
 /// Maximum number of characters returned by any tool to protect context memory.
 pub const MAX_TOOL_OUTPUT: usize = 20_000;
 
+/// Most lines of the file shown when an edit's `old_string` is not found.
+pub const MAX_CLOSEST_LINES: usize = 40;
+
 /// Minimum shell timeout in seconds (avoids instant timeout bugs).
 pub const MIN_COMMAND_TIMEOUT_SECONDS: u64 = 1;
 

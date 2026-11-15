@@ -13,7 +13,8 @@
 use super::path::{canonical_root, ensure_canonical_within_root, resolve_in_root};
 use super::text::{truncate, truncate_to};
 use crate::constants::tools::{
-    BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, MAX_LISTED_FILES, SKIPPED_DIRS, SKIPPED_ROOT_DIRS,
+    BINARY_SNIFF_BYTES, GREP_MAX_DEPTH, MAX_CLOSEST_LINES, MAX_LISTED_FILES, SKIPPED_DIRS,
+    SKIPPED_ROOT_DIRS,
 };
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
@@ -461,9 +462,7 @@ fn replacement_count(
     let occurrences = overlapping_count(content, old_string);
 
     match (occurrences, replace_all) {
-        (0, _) => {
-            bail!("old_string was not found in {path}; re-read the file and copy the exact text")
-        }
+        (0, _) => bail!("{}", missing_text_help(content, old_string, path)),
         (1, _) => Ok(1),
         // `str::replace` replaces only matches that do not overlap.
         (_, true) => Ok(content.matches(old_string).count()),
@@ -471,6 +470,78 @@ fn replacement_count(
             "old_string appears {occurrences} times in {path}; add surrounding context or pass replace_all=true"
         ),
     }
+}
+
+/// The error for an `old_string` that `content` does not hold: the closest
+/// text the file has, and whether it differs only in whitespace.
+fn missing_text_help(content: &str, old_string: &str, path: &str) -> String {
+    let Some(closest) = closest_lines(content, old_string) else {
+        return format!(
+            "old_string was not found in {path}, and none of its lines are in the file; \
+             read the file again with read_file and copy the exact text"
+        );
+    };
+
+    let whitespace_note = match same_but_whitespace(&closest.text, old_string) {
+        true => "It differs from old_string only in whitespace, such as indentation.\n",
+        false => "",
+    };
+
+    format!(
+        "old_string was not found in {path}. The closest text in the file, lines {}-{}, is:\n\
+         {}\n{whitespace_note}Copy old_string exactly from the file.",
+        closest.first, closest.last, closest.text
+    )
+}
+
+/// Lines of a file shown in an error.
+struct Excerpt {
+    /// Number of the first line, counting from 1.
+    first: usize,
+    /// Number of the last line.
+    last: usize,
+    /// The lines, joined with `\n`.
+    text: String,
+}
+
+/// The lines of `content` where `old_string` most likely belongs: found by
+/// the longest line of `old_string` that the file has, ignoring the spaces
+/// around it, and as many lines as `old_string` has, at most
+/// [`MAX_CLOSEST_LINES`]. `None` when the file has none of its lines.
+fn closest_lines(content: &str, old_string: &str) -> Option<Excerpt> {
+    let file_lines: Vec<&str> = content.lines().collect();
+    let mut wanted: Vec<(usize, &str)> = old_string
+        .lines()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_index, line)| !line.is_empty())
+        .collect();
+    wanted.sort_by_key(|(_index, line)| std::cmp::Reverse(line.len()));
+
+    let (wanted_index, file_index) = wanted.iter().find_map(|(wanted_index, line)| {
+        file_lines
+            .iter()
+            .position(|file_line| file_line.trim() == *line)
+            .map(|file_index| (*wanted_index, file_index))
+    })?;
+
+    let first = file_index.saturating_sub(wanted_index);
+    let count = old_string.lines().count().min(MAX_CLOSEST_LINES);
+    let last = (first + count).min(file_lines.len());
+
+    Some(Excerpt {
+        first: first + 1,
+        last,
+        text: file_lines[first..last].join("\n"),
+    })
+}
+
+/// Whether `text` and `old_string` have the same lines once the spaces
+/// around each line are removed.
+fn same_but_whitespace(text: &str, old_string: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .eq(old_string.lines().map(str::trim))
 }
 
 /// How many places in `content` start a match of `old_string`, counting
@@ -836,6 +907,49 @@ mod tests {
 
         assert_eq!(confirmation, "✅ edited lib.rs (3 replacements)");
         assert_eq!(fs::read_to_string(root.join("lib.rs"))?, "b b b");
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_missed_edit_shows_the_closest_text_in_the_file() -> Result<()> {
+        let root = temp_dir();
+        let code = concat!(
+            "fn convert() {\n",
+            "    if lang.is_empty() {\n",
+            "        html.push_str(\"<code>\");\n",
+            "    }\n",
+            "}\n",
+        );
+        fs::write(root.join("lib.rs"), code)?;
+        // From a real run: the model's own notes in place of the file's text.
+        let remembered = concat!(
+            "    if lang.is_empty() {\n",
+            "        html.push_str(\"<code\");\n",
+            "        // Wait, I missed the closing bracket\n",
+        );
+        let indented = "  if lang.is_empty() {\n      html.push_str(\"<code>\");";
+
+        let stale = edit_file(&root, "lib.rs", remembered, "x", false);
+        let spaces = edit_file(&root, "lib.rs", indented, "x", false);
+        let unrelated = edit_file(&root, "lib.rs", "struct Other;", "x", false);
+
+        let stale = format!("{:#}", stale.err().context("the stale edit misses")?);
+        assert_eq!(
+            stale,
+            concat!(
+                "old_string was not found in lib.rs. The closest text in the file, lines 2-4, is:\n",
+                "    if lang.is_empty() {\n",
+                "        html.push_str(\"<code>\");\n",
+                "    }\n",
+                "Copy old_string exactly from the file.",
+            )
+        );
+        assert!(format!("{spaces:?}").contains("lines 2-3"));
+        assert!(format!("{spaces:?}").contains("only in whitespace"));
+        assert!(format!("{unrelated:?}").contains("none of its lines are in the file"));
+        assert_eq!(fs::read_to_string(root.join("lib.rs"))?, code);
 
         fs::remove_dir_all(root)?;
         Ok(())
