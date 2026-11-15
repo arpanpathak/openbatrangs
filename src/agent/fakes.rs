@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 /// One canned HTTP reply.
 pub(super) struct Reply {
@@ -90,28 +91,39 @@ pub(super) fn tool_call_delta(id: &str, name: &str, arguments: &Value) -> Value 
 /// Start a server on a free local port that answers the n-th request with
 /// `replies[n]` and stops after the last one. Returns the base URL.
 pub(super) async fn serve_replies(replies: Vec<Reply>) -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let base_url = format!("http://{}", listener.local_addr()?);
-
-    tokio::spawn(answer_in_order(listener, replies));
+    let (base_url, _requests) = serve_and_record(replies).await?;
 
     Ok(base_url)
 }
 
-/// Answer one connection per reply, stopping at the first failure.
-async fn answer_in_order(listener: TcpListener, replies: Vec<Reply>) -> Result<()> {
-    let mut served = Ok(());
-    let mut replies = replies.into_iter();
+/// Like [`serve_replies`], and also returns the server task, which ends with
+/// the request bodies it read, in order.
+pub(super) async fn serve_and_record(
+    replies: Vec<Reply>,
+) -> Result<(String, JoinHandle<Result<Vec<String>>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
 
-    while let (Ok(()), Some(reply)) = (&served, replies.next()) {
-        served = serve_one(&listener, &reply).await;
-    }
+    let requests = tokio::spawn(answer_in_order(listener, replies));
 
-    served
+    Ok((base_url, requests))
 }
 
-/// Accept one connection, read the whole request, and send `reply`.
-async fn serve_one(listener: &TcpListener, reply: &Reply) -> Result<()> {
+/// Answer one connection per reply and return the request bodies; the first
+/// failure ends the server with that error.
+async fn answer_in_order(listener: TcpListener, replies: Vec<Reply>) -> Result<Vec<String>> {
+    let mut requests = Vec::with_capacity(replies.len());
+
+    for reply in &replies {
+        requests.push(serve_one(&listener, reply).await?);
+    }
+
+    Ok(requests)
+}
+
+/// Accept one connection, read the whole request, send `reply`, and return
+/// the request body.
+async fn serve_one(listener: &TcpListener, reply: &Reply) -> Result<String> {
     let (socket, _peer) = listener.accept().await?;
     let mut reader = BufReader::new(socket);
 
@@ -119,7 +131,9 @@ async fn serve_one(listener: &TcpListener, reply: &Reply) -> Result<()> {
     let mut body = vec![0; content_length(&head)];
     reader.read_exact(&mut body).await?;
 
-    write_reply(reader.into_inner(), reply).await
+    write_reply(reader.into_inner(), reply).await?;
+
+    Ok(String::from_utf8(body)?)
 }
 
 /// The request line and headers, read up to the blank line that ends them.
