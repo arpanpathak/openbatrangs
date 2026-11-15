@@ -21,6 +21,7 @@
 //! - ReAct: reasoning + acting: <https://arxiv.org/abs/2210.03629>
 
 use crate::constants::agent::{DEFAULT_GREP_MAX_RESULTS, DEFAULT_READ_CHARS};
+use crate::tools::LineRange;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,10 +46,12 @@ pub(super) enum Tool {
         /// Relative directory to list; `.` means the workspace root.
         path: String,
     },
-    /// Read a text file with a character cap.
+    /// Read whole lines of a text file, up to a character cap.
     ReadFile {
         /// Relative file path inside the workspace.
         path: String,
+        /// The first line and the most lines to read.
+        lines: LineRange,
         /// Maximum characters to include in the result.
         max_chars: usize,
     },
@@ -182,10 +185,17 @@ fn list_files_tool(args: &Value) -> Result<Tool> {
     })
 }
 
-/// `read_file`: a required path and an optional character cap.
+/// `read_file`: a required path, and an optional first line, line count and
+/// character cap.
 fn read_file_tool(args: &Value) -> Result<Tool> {
+    let lines = LineRange {
+        offset: optional_u64_arg(args, "offset")?.unwrap_or(1) as usize,
+        limit: optional_u64_arg(args, "limit")?.map(|limit| limit as usize),
+    };
+
     Ok(Tool::ReadFile {
         path: required_path_arg(args, "read_file")?.to_string(),
+        lines,
         max_chars: optional_u64_arg(args, "max_chars")?.unwrap_or(DEFAULT_READ_CHARS as u64)
             as usize,
     })
@@ -595,6 +605,28 @@ mod tests {
     }
 
     #[test]
+    fn read_file_takes_a_first_line_and_a_line_count() -> Result<()> {
+        let read = tool(
+            "read_file",
+            json!({"path": "a", "offset": 120, "limit": 40}),
+        )?;
+
+        assert!(matches!(
+            read,
+            Tool::ReadFile {
+                lines: LineRange {
+                    offset: 120,
+                    limit: Some(40)
+                },
+                ..
+            }
+        ));
+        assert!(tool("read_file", json!({"path": "a", "offset": "two"})).is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn defaults_fill_optional_arguments() -> Result<()> {
         let read = tool("read_file", json!({"path": "a"}))?;
         let grep = tool("grep_files", json!({"pattern": "x", "max_results": 5}))?;
@@ -603,6 +635,10 @@ mod tests {
         assert!(matches!(
             read,
             Tool::ReadFile {
+                lines: LineRange {
+                    offset: 1,
+                    limit: None
+                },
                 max_chars: DEFAULT_READ_CHARS,
                 ..
             }

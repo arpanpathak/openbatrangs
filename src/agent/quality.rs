@@ -193,6 +193,7 @@ mod tests {
         let mut gate = FinishGate::default();
         let read = Tool::ReadFile {
             path: "log.txt".to_string(),
+            lines: crate::tools::LineRange::default(),
             max_chars: 100,
         };
 
