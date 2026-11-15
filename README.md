@@ -324,6 +324,20 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 Press Ctrl+C to stop a running task, then type a correction to continue the same
 conversation.
 
+To start a new line in the input, press Shift+Enter, or type `\` and press Enter.
+Terminal.app and tmux send Shift+Enter as a plain Enter, so the backslash works in
+every terminal. Ctrl+J and Alt+Enter also start a new line.
+
+Drag across the transcript to copy text. The copy reaches your clipboard through
+the terminal's OSC 52 support, which also works over SSH:
+
+| Terminal | Setup |
+|---|---|
+| iTerm2 | Settings › General › Selection › turn on "Applications in terminal may access clipboard" |
+| kitty, WezTerm, Ghostty, Windows Terminal | works without setup |
+| tmux | the copy also goes to `tmux load-buffer -w`, so tmux 3.2 and later pass it on to the outer terminal |
+| Terminal.app | has no OSC 52; use `/mouse off`, then the terminal's own selection |
+
 On macOS, the performance panel stays empty. Its GPU figures are read from
 `tegrastats` or `nvidia-smi`, and its CPU and memory figures from `/proc`.
 

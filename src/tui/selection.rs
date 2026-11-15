@@ -7,9 +7,15 @@
 //! release, the text of those cells is sent to the system clipboard with an
 //! OSC 52 escape sequence, which terminals also accept over SSH.
 //!
+//! tmux does not pass OSC 52 from the programs inside it to the outer
+//! terminal by default, so inside tmux the text also goes to
+//! `tmux load-buffer -w -`. tmux 3.2 and later keep it as a paste buffer and
+//! send it on to the outer terminal's clipboard themselves.
+//!
 //! ## References
 //!
 //! - OSC 52: <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands>
+//! - tmux `load-buffer -w` and `set-clipboard`: <https://man7.org/linux/man-pages/man1/tmux.1.html>
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -17,6 +23,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// The cells between two points of a left-button drag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +91,29 @@ pub(super) fn copy_to_clipboard(
     writer.flush()
 }
 
+/// Puts `text` in tmux's paste buffer by running `tmux load-buffer -w -`
+/// with the program `tmux`. Returns whether tmux took the text.
+pub(super) fn load_tmux_buffer(tmux: &str, text: &str) -> bool {
+    let started = Command::new(tmux)
+        .args(["load-buffer", "-w", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let Ok(mut child) = started else {
+        return false;
+    };
+
+    let is_written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    let has_succeeded = child.wait().is_ok_and(|status| status.success());
+
+    is_written && has_succeeded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +164,36 @@ mod tests {
         let text = highlight(&mut screen, area, selection(0, 0, 9, 1));
 
         assert_eq!(text, "inside\ntext");
+    }
+
+    #[test]
+    fn tmux_gets_the_text_on_its_standard_input() -> std::io::Result<()> {
+        let directory = crate::test_support::unique_temp_dir("openbatrangs-fake-tmux");
+        let received = directory.join("received.txt");
+        let fake_tmux = directory.join("tmux");
+        let script = format!(
+            "#!/bin/sh\n[ \"$*\" = \"load-buffer -w -\" ] || exit 1\ncat > '{}'\n",
+            received.display()
+        );
+        std::fs::write(&fake_tmux, script)?;
+        std::fs::set_permissions(
+            &fake_tmux,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+
+        let is_loaded = load_tmux_buffer(&fake_tmux.to_string_lossy(), "copied text");
+
+        assert!(is_loaded);
+        assert_eq!(std::fs::read_to_string(&received)?, "copied text");
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_or_failing_tmux_reports_that_it_took_nothing() {
+        assert!(!load_tmux_buffer("/no/such/tmux", "text"));
+        assert!(!load_tmux_buffer("false", "text"));
     }
 
     #[test]
