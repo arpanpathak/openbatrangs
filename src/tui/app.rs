@@ -1325,10 +1325,7 @@ impl App {
         let count = text.chars().count();
         let is_in_tmux = std::env::var_os("TMUX").is_some() && load_tmux_buffer("tmux", &text);
 
-        self.status = match is_in_tmux {
-            true => format!("copied {count} characters, also to the tmux buffer"),
-            false => format!("copied {count} characters"),
-        };
+        self.status = copy_status(count, is_in_tmux);
         self.selection = None;
         self.clipboard = Some(text);
     }
@@ -1790,6 +1787,15 @@ fn corrected_task_prompt(previous: &str, correction: &str) -> String {
     )
 }
 
+/// The status line after copying `count` characters, which name the tmux
+/// buffer when the text went there too.
+fn copy_status(count: usize, is_in_tmux: bool) -> String {
+    match is_in_tmux {
+        true => format!("copied {count} characters, also to the tmux buffer"),
+        false => format!("copied {count} characters"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::block::Part;
@@ -1916,6 +1922,66 @@ mod tests {
             app.input, "a",
             "a single keystroke must insert one character"
         );
+    }
+
+    #[test]
+    fn the_copy_status_names_the_tmux_buffer_inside_tmux() {
+        assert_eq!(copy_status(12, false), "copied 12 characters");
+        assert_eq!(
+            copy_status(12, true),
+            "copied 12 characters, also to the tmux buffer"
+        );
+    }
+
+    /// Typing `/settings` and pressing keys reaches the settings dialog the
+    /// way a user reaches it.
+    #[tokio::test]
+    async fn typed_settings_opens_the_dialog_and_keys_change_it() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:9")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.model = Some("gemma-4-26b".to_string());
+        let thinking_before = app.run_config.think;
+        let keys = "/settings".chars().map(KeyCode::Char).chain([
+            KeyCode::Enter,
+            KeyCode::Left,
+            KeyCode::Down,
+            KeyCode::Right,
+        ]);
+
+        for code in keys {
+            app.handle_key(event::KeyEvent::new(code, KeyModifiers::NONE), &client, &tx)
+                .await;
+        }
+
+        assert!(matches!(app.modal, Some(ActiveModal::Settings(_))));
+        assert_eq!(app.run_config.temperature, Some(0.9));
+        assert_eq!(app.run_config.think, !thinking_before);
+        Ok(())
+    }
+
+    /// Keys reach an open choice dialog before the input line.
+    #[tokio::test]
+    async fn keys_reach_an_open_choice_dialog() -> anyhow::Result<()> {
+        let client = crate::ollama::OllamaClient::new("http://127.0.0.1:9")?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+        app.open_choice(&Question {
+            text: "Which?".to_string(),
+            options: vec!["a".to_string(), "b".to_string()],
+            is_multiple: false,
+        });
+
+        app.handle_key(
+            event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &client,
+            &tx,
+        )
+        .await;
+
+        assert!(app.modal.is_none());
+        assert!(app.input.is_empty());
+        Ok(())
     }
 
     /// A held key repeats; the repeats are real input and must still land.

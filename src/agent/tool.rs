@@ -39,7 +39,7 @@ pub(super) struct ToolCall {
 ///
 /// Each variant stores only the arguments that tool actually needs. This makes
 /// the rest of the codebase free of stringly-typed tool dispatch.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Tool {
     /// Recursively list files under `path`.
     ListFiles {
@@ -680,11 +680,7 @@ mod tests {
 
     #[test]
     fn ask_user_reads_its_options_and_whether_several_may_be_picked() -> Result<()> {
-        let question = |arguments: Value| match tool("ask_user", arguments) {
-            Ok(Tool::AskUser { question }) => Ok(question),
-            Ok(other) => Err(anyhow!("not ask_user: {other:?}")),
-            Err(error) => Err(error),
-        };
+        let question = |arguments: Value| tool("ask_user", arguments);
 
         let open = question(json!({ "question": "Name?" }))?;
         let choice = question(json!({
@@ -695,17 +691,21 @@ mod tests {
 
         assert_eq!(
             open,
-            Question {
-                text: "Name?".to_string(),
-                ..Question::default()
+            Tool::AskUser {
+                question: Question {
+                    text: "Name?".to_string(),
+                    ..Question::default()
+                }
             }
         );
         assert_eq!(
             choice,
-            Question {
-                text: "Which?".to_string(),
-                options: vec!["a".to_string(), "b".to_string()],
-                is_multiple: true,
+            Tool::AskUser {
+                question: Question {
+                    text: "Which?".to_string(),
+                    options: vec!["a".to_string(), "b".to_string()],
+                    is_multiple: true,
+                }
             }
         );
         assert!(question(json!({ "question": "Which?", "options": "a" })).is_err());

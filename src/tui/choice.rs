@@ -318,6 +318,18 @@ mod tests {
     }
 
     #[test]
+    fn ticking_a_list_without_options_does_nothing() {
+        let mut state = ChoiceState::new(Question {
+            is_multiple: true,
+            ..Question::default()
+        });
+
+        state.tick();
+
+        assert!(state.ticked.is_empty());
+    }
+
+    #[test]
     fn one_choice_answers_with_the_highlighted_option() {
         let mut state = ChoiceState::new(question(false));
 
@@ -365,9 +377,10 @@ mod tests {
         press(&mut app, KeyCode::Char(' ')).await?;
         press(&mut app, KeyCode::Up).await?;
         press(&mut app, KeyCode::Esc).await?;
+        press(&mut app, KeyCode::Down).await?;
         press(&mut app, KeyCode::Enter).await?;
 
-        assert!(app.modal.is_none());
+        assert!(app.modal.is_none(), "keys after Esc reopen nothing");
         assert!(app.history.is_empty());
         Ok(())
     }
