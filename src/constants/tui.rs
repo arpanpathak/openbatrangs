@@ -48,7 +48,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /confirm           — toggle confirm before writes/commands",
     "  /yolo              — disable confirmations (careful!)",
     "  /thinking on|off   — show/hide model reasoning",
-    "  /steps <n>         — set max agent iterations",
+    "  /steps <n>|off     — set or remove the step limit",
     "  /cwd <path>        — change workspace directory",
     "  /perf              — toggle performance panel",
     "  /mouse on|off      — wheel, scrollbar, drag to copy (off = native select)",

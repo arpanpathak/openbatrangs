@@ -10,9 +10,6 @@ pub const THOR_OPENAI_URL: &str = "https://arpanpathak.taildb9a39.ts.net/v1";
 /// Access key file for the Thor's model server, relative to `$HOME`.
 pub const THOR_KEY_FILE: &str = ".config/thor-chat/api-key";
 
-/// Default maximum agent iterations.
-pub const DEFAULT_MAX_STEPS: usize = 40;
-
 /// Default minimum acceptable context window for auto model selection.
 pub const DEFAULT_MIN_CONTEXT: usize = 8_192;
 

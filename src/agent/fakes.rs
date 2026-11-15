@@ -226,7 +226,7 @@ impl HistorySink for RecordingSink {
 pub(super) fn test_config(cwd: &Path, max_steps: usize) -> AgentConfig {
     AgentConfig {
         cwd: cwd.to_path_buf(),
-        max_steps,
+        max_steps: Some(max_steps),
         is_read_only: false,
         should_confirm: false,
         use_sandbox: false,

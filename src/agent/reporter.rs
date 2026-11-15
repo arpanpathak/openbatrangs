@@ -47,8 +47,8 @@ pub enum AgentEvent {
     StepStarted {
         /// Step number, counted from 1.
         step: usize,
-        /// Step budget of the run.
-        max_steps: usize,
+        /// Step budget of the run, or `None` for no limit.
+        max_steps: Option<usize>,
         /// Model that answers this step.
         model: String,
         /// Loop that runs the step.
@@ -138,6 +138,19 @@ impl Reporter for StdoutReporter {
     }
 }
 
+/// The step number as headers show it: `3/40` under a limit, `3` without one.
+pub fn step_number(step: usize, max_steps: Option<usize>) -> String {
+    match max_steps {
+        Some(limit) => format!("{step}/{limit}"),
+        None => step.to_string(),
+    }
+}
+
+/// The step limit in words: the number, or `no limit`.
+pub fn step_limit(max_steps: Option<usize>) -> String {
+    max_steps.map_or_else(|| "no limit".to_string(), |limit| limit.to_string())
+}
+
 /// The warning shown when a run used all `max_steps` steps without a final
 /// answer.
 pub fn step_limit_notice(max_steps: usize) -> String {
@@ -182,16 +195,17 @@ impl StdoutReporter {
     fn step_header(
         &mut self,
         step: usize,
-        max_steps: usize,
+        max_steps: Option<usize>,
         model: &str,
         loop_kind: LoopKind,
     ) -> String {
         self.loop_kind = Some(loop_kind);
+        let step = step_number(step, max_steps);
 
         match loop_kind {
-            LoopKind::Native => format!("\n── step {step}/{max_steps} ── {model}\n"),
+            LoopKind::Native => format!("\n── step {step} ── {model}\n"),
             LoopKind::Json => format!(
-                "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}/{max_steps}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}\n"
+                "\n{COLOR_BOLD}{COLOR_CYAN}🦇 Step {step}{COLOR_RESET} — model: {COLOR_BOLD}{model}{COLOR_RESET}\n"
             ),
         }
     }
@@ -305,11 +319,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn step_numbers_show_the_limit_only_when_there_is_one() {
+        assert_eq!(step_number(3, Some(40)), "3/40");
+        assert_eq!(step_number(3, None), "3");
+        assert_eq!(step_limit(Some(40)), "40");
+        assert_eq!(step_limit(None), "no limit");
+    }
+
     /// A step header event for `loop_kind`.
     fn step(loop_kind: LoopKind) -> AgentEvent {
         AgentEvent::StepStarted {
             step: 1,
-            max_steps: 3,
+            max_steps: Some(3),
             model: "m".to_string(),
             loop_kind,
         }

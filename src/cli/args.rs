@@ -1,6 +1,6 @@
 //! Clap argument definitions and default values.
 
-use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
+use crate::constants::cli::{DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 use clap::builder::FalseyValueParser;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -48,9 +48,9 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = ".")]
     pub(crate) cwd: PathBuf,
 
-    /// Maximum agent steps.
-    #[arg(long, global = true, default_value_t = DEFAULT_MAX_STEPS)]
-    pub(crate) max_steps: usize,
+    /// Stop the agent after this many steps. There is no limit by default.
+    #[arg(long, global = true)]
+    pub(crate) max_steps: Option<usize>,
 
     /// Read-only mode: no file writes or shell commands.
     #[arg(long = "read-only", global = true)]
@@ -134,7 +134,7 @@ pub(crate) enum Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::cli::{DEFAULT_MAX_STEPS, DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
+    use crate::constants::cli::{DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
 
     #[test]
     fn parses_defaults_without_arguments() {
@@ -142,7 +142,7 @@ mod tests {
 
         assert!(cli.task.is_empty());
         assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
-        assert_eq!(cli.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(cli.max_steps, None);
         assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
         assert_eq!(cli.max_ctx, None);
         assert_eq!(cli.cwd, PathBuf::from("."));
@@ -173,7 +173,7 @@ mod tests {
         ]);
 
         assert_eq!(cli.model.as_deref(), Some("qwen2.5-coder:7b"));
-        assert_eq!(cli.max_steps, 5);
+        assert_eq!(cli.max_steps, Some(5));
         assert!(cli.is_read_only);
         assert!(matches!(cli.command, Some(Commands::ListModels)));
     }
