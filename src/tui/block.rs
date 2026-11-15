@@ -1,11 +1,12 @@
 //! # Transcript blocks
 //!
 //! The transcript is a list of blocks: a user message, an agent step, a
-//! final answer, a question from the model, or a notice. A step folds to one
-//! line (number, title, model, time taken); an open step shows a thinking
-//! line, a decision line, its reply, and one line per tool call. The thinking
-//! line and each tool line open again to show the full reasoning, or the
-//! arguments and full output.
+//! final answer, a question from the model, or a notice. A step stays open
+//! when it finishes and shows a thinking line, a decision line, its reply,
+//! and one line per tool call with the first lines of the tool's output. The
+//! thinking line and each tool line open to show the full reasoning, or the
+//! arguments and full output. A step header folds the step to one line
+//! (number, title, model, time taken).
 //!
 //! A block draws itself as rows that already fit the width, and caches them
 //! by its content version and the width. Every change to a block gives it a
@@ -126,14 +127,14 @@ impl Step {
         }
     }
 
-    /// Stop the clock and fold the step.
+    /// Stop the clock. The step stays open, so the log keeps showing what
+    /// its tools did.
     pub(super) fn finish(&mut self) {
         let elapsed = self
             .started_at
             .map_or(0, |started_at| started_at.elapsed().as_millis() as u64);
 
         self.elapsed_ms = self.elapsed_ms.or(Some(elapsed));
-        self.is_open = false;
     }
 
     /// Fold or unfold `part`; false when the step has no such part.
@@ -573,6 +574,9 @@ const STEP_INDENT: usize = 4;
 /// Cells that indent the arguments and output of an open tool line.
 const TOOL_INDENT: usize = 6;
 
+/// Output lines shown under a folded tool line.
+const TOOL_PREVIEW_LINES: usize = 3;
+
 /// The thinking line, and the full reasoning when it is open.
 fn thinking_rows(step: &Step, width: usize, highlight: bool, rows: &mut BlockRows) {
     if !has_text(&step.reasoning) {
@@ -647,8 +651,30 @@ fn reply_rows(step: &Step, width: usize, highlight: bool, rows: &mut BlockRows) 
 fn tool_rows(index: usize, tool: &ToolRun, width: usize, highlight: bool, rows: &mut BlockRows) {
     rows.push_fitted(tool_line(tool), width, Part::Tool(index));
 
-    if tool.is_open {
-        tool_detail_rows(index, tool, width, highlight, rows);
+    match tool.is_open {
+        true => tool_detail_rows(index, tool, width, highlight, rows),
+        false => tool_preview_rows(index, tool, width, rows),
+    }
+}
+
+/// The first non-blank lines of a folded tool's output, dimmed and cut to
+/// one row each.
+fn tool_preview_rows(index: usize, tool: &ToolRun, width: usize, rows: &mut BlockRows) {
+    let output = tool
+        .outcome
+        .as_ref()
+        .map_or("", |outcome| outcome.output.as_str());
+    let preview = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(TOOL_PREVIEW_LINES);
+
+    for line in preview {
+        let spans = vec![
+            Span::raw(" ".repeat(TOOL_INDENT)),
+            Span::styled(line.to_string(), Style::new().fg(Color::DarkGray)),
+        ];
+        rows.push_fitted(spans, width, Part::Tool(index));
     }
 }
 
@@ -893,8 +919,29 @@ mod tests {
         assert_eq!(rows[2], "  → run_command, read_file");
         assert_eq!(rows[3], "    Running cargo test.");
         assert_eq!(rows[4], "  ▸ ✓ run_command → cargo test · ✓ 4 passed");
-        assert_eq!(rows[5], "  ▸ … read_file → a.rs · … running");
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[5], "      test result: ok");
+        assert_eq!(rows[6], "  ▸ … read_file → a.rs · … running");
+        assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn a_folded_tool_previews_at_most_three_non_blank_output_lines() {
+        let mut step = Step::new(1, None, "m".to_string());
+        step.add_tool("c1".to_string(), "list_files".to_string(), "{}".to_string());
+        step.set_result(
+            "c1",
+            ToolOutcome {
+                success: true,
+                summary: "5 lines".to_string(),
+                output: "a.rs\n\nb.rs\nc.rs\nd.rs\ne.rs".to_string(),
+            },
+        );
+        let mut block = Block::new(BlockContent::Step(step));
+
+        let rows = row_texts(&mut block, 80);
+
+        assert_eq!(rows[2], "  ▸ ✓ list_files → . · ✓ 5 lines");
+        assert_eq!(rows[3..], ["      a.rs", "      b.rs", "      c.rs"]);
     }
 
     #[test]
@@ -917,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_step_folds_to_its_header() {
+    fn a_finished_step_stays_open_and_its_header_folds_it() {
         let mut step = busy_step();
         step.finish();
         step.elapsed_ms = Some(4_200);
@@ -925,7 +972,15 @@ mod tests {
 
         let rows = row_texts(&mut block, 80);
 
-        assert_eq!(rows, ["▸ Step 3/10 · Checking the tests · qwen · 4.2s"]);
+        assert_eq!(rows[0], "▾ Step 3/10 · Checking the tests · qwen · 4.2s");
+        assert_eq!(rows.len(), 7);
+
+        assert!(block.toggle(Part::Header));
+
+        assert_eq!(
+            row_texts(&mut block, 80),
+            ["▸ Step 3/10 · Checking the tests · qwen · 4.2s"]
+        );
         assert_eq!(block.focus_parts(), [Part::Header]);
         assert_eq!(row_texts(&mut block, 20), ["▸ Step 3/10 · Check…"]);
     }

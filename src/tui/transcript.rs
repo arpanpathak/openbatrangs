@@ -189,7 +189,7 @@ impl Transcript {
         self.running_step = Some(self.total - 1);
     }
 
-    /// Stop the running step's clock and fold it.
+    /// Stop the running step's clock.
     pub(super) fn finish_running_step(&mut self) {
         self.update_running_step(Step::finish);
 
@@ -708,15 +708,21 @@ mod tests {
         let lines = texts(&transcript.visible_lines(60, 0, 40, false));
 
         assert_eq!(lines[0], "🔎 web_search → x");
-        assert!(lines[1].starts_with("▸ Step 1/5 · Look · m · "));
-        assert!(lines[2].starts_with("▸ Step 2/5 · done · m · "));
+        assert!(lines[1].starts_with("▾ Step 1/5 · Look · m · "));
+        assert!(lines.contains(&"      a".to_string()));
+        assert!(lines.contains(&"      b".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("▾ Step 2/5 · done · m · "))
+        );
         assert!(lines.contains(&"✅ Answer".to_string()));
         assert!(lines.contains(&"   /w/a.rs".to_string()));
         assert!(lines.contains(&"❓ Question".to_string()));
     }
 
     #[test]
-    fn the_running_step_stays_open() {
+    fn a_step_stays_open_while_running_and_after() {
         let mut transcript = Transcript::new(50);
 
         transcript.apply(step(1));
@@ -729,7 +735,8 @@ mod tests {
 
         transcript.finish_running_step();
         let lines = texts(&transcript.visible_lines(60, 0, 10, false));
-        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("▾ Step 1/5 · Plan it · m · "));
+        assert_eq!(lines[1], "  ▸ 💭 Plan it.");
     }
 
     #[test]
