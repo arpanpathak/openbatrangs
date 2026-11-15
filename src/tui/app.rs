@@ -3,6 +3,7 @@
 use super::block::BlockContent;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
 use super::selection::{Selection, load_tmux_buffer};
+use super::settings::SettingsRow;
 use super::stats::{RemoteServer, StatsTable};
 use super::transcript::{Focus, RowHit, Transcript};
 use super::worker::{forward_job_events, send_event};
@@ -85,6 +86,8 @@ pub(super) enum ActiveModal {
     Picker(PickerState),
     /// A tool-confirmation prompt is displayed.
     Confirm(PendingConfirmation),
+    /// The settings dialog is open on this row.
+    Settings(SettingsRow),
 }
 
 /// Where a key press goes, decided by the open modal.
@@ -95,6 +98,8 @@ enum KeyTarget {
     Confirmation,
     /// The model picker.
     Picker,
+    /// The settings dialog.
+    Settings,
     /// The input line.
     Input,
     /// The transcript, focused with Tab.
@@ -381,6 +386,7 @@ impl App {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
                 temperature: cli.temperature,
+                think: !cli.is_thinking_disabled,
                 is_read_only: cli.is_read_only,
                 should_confirm: true,
                 use_sandbox: !cli.is_sandbox_disabled,
@@ -535,13 +541,23 @@ impl App {
         }
     }
 
-    /// Re-query Ollama for the current model's metadata and update `model_info`.
+    /// Re-query the server for the current model's metadata and update
+    /// `model_info`. With no model chosen, an OpenAI-compatible server's
+    /// first listed model becomes the model, as it is the one model
+    /// selection would run; Ollama's choice waits for the first task.
     ///
     /// # Parameters
     ///
-    /// - `client`: Ollama client used to fetch the installed model tags.
+    /// - `client`: client used to fetch the installed or served models.
     pub(super) async fn refresh_model_info(&mut self, client: &OllamaClient) {
         let tags = client.tags().await.unwrap_or_default();
+        let first_served = tags
+            .first()
+            .filter(|_model| client.is_openai())
+            .map(|model| model.name.clone());
+
+        self.model = self.model.take().or(first_served);
+
         let selected = self.model.as_deref();
 
         if let Some(model) = tags
@@ -979,6 +995,7 @@ impl App {
             KeyTarget::Ignored => {}
             KeyTarget::Confirmation => self.handle_confirmation_key(key, client, tx),
             KeyTarget::Picker => self.handle_picker_key(key, client).await,
+            KeyTarget::Settings => self.handle_settings_key(key),
             KeyTarget::Input => self.handle_input_key(key, client, tx).await,
             KeyTarget::Transcript => self.handle_transcript_key(key, client, tx),
         }
@@ -1001,6 +1018,7 @@ impl App {
             (false, _, _) => KeyTarget::Ignored,
             (true, Some(ActiveModal::Confirm(_)), _) => KeyTarget::Confirmation,
             (true, Some(ActiveModal::Picker(_)), _) => KeyTarget::Picker,
+            (true, Some(ActiveModal::Settings(_)), _) => KeyTarget::Settings,
             (true, None, FocusArea::Input) => KeyTarget::Input,
             (true, None, FocusArea::Transcript) => KeyTarget::Transcript,
         }
@@ -2971,6 +2989,33 @@ mod tests {
         assert_eq!(
             app.model_info_line(),
             "model: chosen · mode: agent · server: http://thor:11434"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_openai_server_names_its_first_model_when_none_is_chosen() -> anyhow::Result<()> {
+        let base_url = crate::test_support::spawn_mock_server(|_path| {
+            crate::test_support::MockResponse::json(
+                "200 OK",
+                r#"{"data":[{"id":"Gemma-4-26B-A4B-NVFP4"},{"id":"qwen"}]}"#,
+            )
+        })
+        .await;
+        let served = OllamaClient::openai(&format!("{base_url}/v1"), None, true)?;
+        let ollama = OllamaClient::new(&base_url)?;
+        let mut app = test_app();
+        let mut ollama_app = test_app();
+
+        app.refresh_model_info(&served).await;
+        ollama_app.refresh_model_info(&ollama).await;
+
+        assert_eq!(app.model.as_deref(), Some("Gemma-4-26B-A4B-NVFP4"));
+        assert_eq!(app.temperature_in_use(), 1.0, "Gemma's model card");
+        assert_eq!(
+            ollama_app.model, None,
+            "Ollama picks its model on the first task"
         );
 
         Ok(())

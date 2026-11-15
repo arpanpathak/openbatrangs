@@ -809,7 +809,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         sink,
         transcript,
     } = continuation.unwrap_or_default();
-    let think = client.requests_thinking();
+    let think = config.think;
     let resuming = resume.is_some();
     let context_cap = config.max_ctx.or(client.default_context_cap());
     let num_ctx = effective_context(config.model_context, context_cap);

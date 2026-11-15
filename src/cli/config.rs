@@ -35,6 +35,9 @@ pub(crate) struct AgentRunConfig {
     pub(crate) max_steps: Option<usize>,
     /// Sampling temperature set by the user, or `None` for the model card's.
     pub(crate) temperature: Option<f64>,
+    /// Whether thinking models reason before they answer (OpenAI-compatible
+    /// servers only). `--no-think` turns it off; `/settings` changes it.
+    pub(crate) think: bool,
     /// Disable file writes and shell commands.
     pub(crate) is_read_only: bool,
     /// Ask before mutating actions.
@@ -68,6 +71,7 @@ pub(crate) fn agent_run_config(cli: &Cli) -> AgentRunConfig {
         cwd: cli.cwd.clone(),
         max_steps: cli.max_steps,
         temperature: cli.temperature,
+        think: !cli.is_thinking_disabled,
         is_read_only: cli.is_read_only,
         should_confirm: cli.should_confirm,
         use_sandbox: !cli.is_sandbox_disabled,

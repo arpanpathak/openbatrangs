@@ -1,0 +1,373 @@
+//! # The settings dialog
+//!
+//! `/settings` opens a dialog with the two settings worth changing during a
+//! session: the sampling temperature, as a slider from 0 to 2 in steps of
+//! 0.1, and whether the model thinks before it answers. ↑ and ↓ choose a
+//! setting, ← and → change it, `a` sets the temperature back to the model
+//! card's, and Esc or Enter closes the dialog. A change applies from the next
+//! request on.
+
+use super::app::{ActiveModal, App};
+use crate::sampling::Sampling;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+
+/// A row of the settings dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsRow {
+    /// The sampling temperature slider.
+    Temperature,
+    /// Thinking on or off.
+    Thinking,
+}
+
+impl SettingsRow {
+    /// The other row; the dialog has two.
+    fn other(self) -> Self {
+        match self {
+            Self::Temperature => Self::Thinking,
+            Self::Thinking => Self::Temperature,
+        }
+    }
+}
+
+/// What a key does in the settings dialog.
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsKey {
+    /// ↑ or ↓: choose the other setting.
+    Switch,
+    /// ←: lower the temperature, or turn thinking off or on.
+    Lower,
+    /// →: raise the temperature, or turn thinking off or on.
+    Raise,
+    /// `a`: use the model card's temperature.
+    Auto,
+    /// Esc or Enter: close the dialog.
+    Close,
+    /// Any other key.
+    Nothing,
+}
+
+/// Highest temperature the slider reaches, the most OpenAI-compatible servers
+/// accept.
+const MAX_TEMPERATURE: f64 = 2.0;
+
+/// Change of one slider step.
+const TEMPERATURE_STEP: f64 = 0.1;
+
+/// Cells of the slider track, one per step.
+const SLIDER_CELLS: usize = 20;
+
+/// Width and height of the dialog, borders included.
+const DIALOG_SIZE: (u16, u16) = (60, 8);
+
+/// The action of `key` in the dialog.
+fn settings_key(key: &KeyEvent) -> SettingsKey {
+    match key.code {
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab => SettingsKey::Switch,
+        KeyCode::Left => SettingsKey::Lower,
+        KeyCode::Right => SettingsKey::Raise,
+        KeyCode::Char('a') => SettingsKey::Auto,
+        KeyCode::Esc | KeyCode::Enter => SettingsKey::Close,
+        _ => SettingsKey::Nothing,
+    }
+}
+
+impl App {
+    /// Open the settings dialog on the temperature row.
+    pub(super) fn open_settings(&mut self) {
+        self.modal = Some(ActiveModal::Settings(SettingsRow::Temperature));
+    }
+
+    /// Apply a key pressed while the settings dialog is open.
+    pub(super) fn handle_settings_key(&mut self, key: KeyEvent) {
+        match settings_key(&key) {
+            SettingsKey::Switch => self.switch_settings_row(),
+            SettingsKey::Lower => self.change_setting(-TEMPERATURE_STEP),
+            SettingsKey::Raise => self.change_setting(TEMPERATURE_STEP),
+            SettingsKey::Auto => self.run_config.temperature = None,
+            SettingsKey::Close => self.modal = None,
+            SettingsKey::Nothing => {}
+        }
+    }
+
+    /// The row the dialog has chosen, or `None` when it is closed.
+    fn settings_row(&self) -> Option<SettingsRow> {
+        match self.modal {
+            Some(ActiveModal::Settings(row)) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Choose the other row.
+    fn switch_settings_row(&mut self) {
+        if let Some(row) = self.settings_row() {
+            self.modal = Some(ActiveModal::Settings(row.other()));
+        }
+    }
+
+    /// Move the temperature by `step`, or flip thinking.
+    fn change_setting(&mut self, step: f64) {
+        match self.settings_row() {
+            Some(SettingsRow::Temperature) => self.step_temperature(step),
+            Some(SettingsRow::Thinking) => self.run_config.think = !self.run_config.think,
+            None => {}
+        }
+    }
+
+    /// Move the temperature by `step`, starting from the one in use, within
+    /// 0 to [`MAX_TEMPERATURE`] and rounded to a tenth.
+    fn step_temperature(&mut self, step: f64) {
+        let next = (self.temperature_in_use() + step).clamp(0.0, MAX_TEMPERATURE);
+
+        self.run_config.temperature = Some((next * 10.0).round() / 10.0);
+    }
+
+    /// The temperature the next request uses: the user's, else the model
+    /// card's for the selected model.
+    pub(super) fn temperature_in_use(&self) -> f64 {
+        let model = self.model.as_deref().unwrap_or_default();
+
+        Sampling::for_model(model, self.run_config.temperature).temperature
+    }
+}
+
+/// Draw the settings dialog in the middle of the screen while it is open.
+pub(super) fn render_settings(frame: &mut ratatui::Frame, app: &App) {
+    let Some(row) = app.settings_row() else {
+        return;
+    };
+
+    let area = centered(frame.area(), DIALOG_SIZE);
+    let lines = vec![
+        Line::default(),
+        temperature_line(app, row == SettingsRow::Temperature),
+        thinking_line(app.run_config.think, row == SettingsRow::Thinking),
+        Line::default(),
+        Line::styled(
+            "  ↑↓ choose · ←→ change · a model card · Esc close",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" settings ");
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The temperature row: the slider, then the value, marked `model card`
+/// while the user has not set one.
+fn temperature_line(app: &App, is_chosen: bool) -> Line<'static> {
+    let temperature = app.temperature_in_use();
+    let source = match app.run_config.temperature {
+        Some(_) => "",
+        None => "  model card",
+    };
+
+    Line::from(vec![
+        label("Temperature", is_chosen),
+        Span::styled(slider(temperature), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("  {temperature:.1}"),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(source, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+/// The thinking row: `● on  ○ off`, with the chosen state filled.
+fn thinking_line(think: bool, is_chosen: bool) -> Line<'static> {
+    let (on, off) = match think {
+        true => ("● on", "○ off"),
+        false => ("○ on", "● off"),
+    };
+
+    Line::from(vec![
+        label("Thinking", is_chosen),
+        Span::styled(format!("{on}   {off}"), Style::default().fg(Color::White)),
+    ])
+}
+
+/// A row's label, after a `›` marker when the row is chosen.
+fn label(name: &str, is_chosen: bool) -> Span<'static> {
+    let (marker, style) = match is_chosen {
+        true => (
+            "›",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        false => (" ", Style::default().fg(Color::Gray)),
+    };
+
+    Span::styled(format!(" {marker} {name:<13}"), style)
+}
+
+/// The slider for `temperature`: a filled track up to the knob, then an
+/// empty one, [`SLIDER_CELLS`] cells long.
+fn slider(temperature: f64) -> String {
+    let knob = (temperature / MAX_TEMPERATURE * SLIDER_CELLS as f64).round() as usize;
+    let knob = knob.min(SLIDER_CELLS);
+
+    format!("{}●{}", "━".repeat(knob), "─".repeat(SLIDER_CELLS - knob))
+}
+
+/// A rectangle of `size` in the middle of `area`, cut to fit.
+fn centered(area: Rect, (width, height): (u16, u16)) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+    use clap::Parser;
+    use crossterm::event::KeyModifiers;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::{Arc, Mutex};
+
+    /// An app with default settings and the model `model`.
+    fn app_with_model(model: &str) -> App {
+        let cli = Cli::parse_from(["openbatrangs"]);
+        let mut app = App::new(&cli, Arc::new(Mutex::new(None)));
+        app.model = Some(model.to_string());
+
+        app
+    }
+
+    /// Press `code` in the settings dialog.
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_settings_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_slider_starts_at_the_model_card_and_moves_in_tenths() {
+        let mut app = app_with_model("gemma-4-26b");
+        app.open_settings();
+
+        assert_eq!(app.temperature_in_use(), 1.0);
+
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+
+        assert_eq!(app.run_config.temperature, Some(0.8));
+
+        press(&mut app, KeyCode::Char('a'));
+
+        assert_eq!(app.run_config.temperature, None);
+    }
+
+    #[test]
+    fn the_temperature_stays_between_zero_and_two() {
+        let mut app = app_with_model("gemma-4-26b");
+        app.open_settings();
+
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.run_config.temperature, Some(2.0));
+
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.run_config.temperature, Some(0.0));
+    }
+
+    #[test]
+    fn the_thinking_row_flips_thinking_and_esc_closes() {
+        let mut app = app_with_model("gemma-4-26b");
+        app.open_settings();
+        let was_thinking = app.run_config.think;
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.run_config.think, !was_thinking);
+        assert_eq!(
+            app.run_config.temperature, None,
+            "the temperature is untouched"
+        );
+
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.settings_row(), Some(SettingsRow::Temperature));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.settings_row(), None);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.run_config.temperature, None,
+            "a closed dialog changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_slider_knob_sits_at_the_temperature() {
+        assert_eq!(slider(0.0), format!("●{}", "─".repeat(20)));
+        assert_eq!(
+            slider(1.0),
+            format!("{}●{}", "━".repeat(10), "─".repeat(10))
+        );
+        assert_eq!(slider(2.0), format!("{}●", "━".repeat(20)));
+    }
+
+    #[test]
+    fn the_dialog_shows_the_slider_the_value_and_thinking() -> anyhow::Result<()> {
+        let mut app = app_with_model("gemma-4-26b");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+
+        terminal.draw(|frame| render_settings(frame, &app))?;
+        let closed: String = screen(&terminal);
+
+        app.open_settings();
+        terminal.draw(|frame| render_settings(frame, &app))?;
+        let open = screen(&terminal);
+
+        assert!(!closed.contains("settings"));
+        assert!(open.contains("› Temperature"));
+        assert!(open.contains("1.0  model card"));
+        assert!(open.contains("● on   ○ off"));
+
+        app.run_config.think = false;
+        app.run_config.temperature = Some(0.4);
+        terminal.draw(|frame| render_settings(frame, &app))?;
+        let changed = screen(&terminal);
+
+        assert!(changed.contains("○ on   ● off"));
+        assert!(changed.contains("0.4"));
+        assert!(
+            !changed.contains("0.4  model card"),
+            "a value the user set is not labeled as the model card's"
+        );
+
+        Ok(())
+    }
+
+    /// The text of every cell on `terminal`, row after row.
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+}

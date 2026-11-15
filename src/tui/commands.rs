@@ -57,6 +57,7 @@ impl App {
             "mode" => self.handle_mode_command(arg),
             "thinking" => self.handle_thinking_command(arg),
             "temperature" => self.handle_temperature_command(arg),
+            "settings" => self.open_settings(),
             "mouse" => self.handle_mouse_command(arg),
             "yolo" => self.handle_yolo_command(),
             _ => self.log_unknown_command(name),
@@ -101,6 +102,7 @@ impl App {
             format!("  Confirm:    {}", confirm_label(config.should_confirm)),
             format!("  Thinking:   {}", on_off(config.show_thinking)),
             format!("  Temperature: {}", temperature_label(config.temperature)),
+            format!("  Model thinks: {}", on_off(config.think)),
             format!("  Mouse:      {}", on_off(self.mouse_capture)),
             format!("  Perf panel: {}", on_off(self.show_perf)),
         ];

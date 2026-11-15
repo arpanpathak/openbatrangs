@@ -82,6 +82,11 @@ pub struct ChatRequest {
     /// Optional sampling options (`temperature`, `num_ctx`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Value>,
+    /// Whether an OpenAI-compatible server is asked to think, in place of the
+    /// client's `--no-think` setting; `None` keeps that setting. Never sent to
+    /// Ollama, which rejects `think` for models that cannot think.
+    #[serde(skip)]
+    pub think: Option<bool>,
 }
 
 /// Payload for `POST /api/pull`.

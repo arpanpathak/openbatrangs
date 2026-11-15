@@ -16,12 +16,14 @@ use super::types::{ChatMessage, ChatRequest, Delta, OllamaModel, Role, ToolCallD
 use crate::constants::ollama::GEMMA_CHANNEL_MARKERS;
 use serde_json::{Value, json};
 
-/// Build the `/chat/completions` body for a chat request.
+/// Build the `/chat/completions` body for a chat request. The request's own
+/// `think` setting wins over `think`, the client's `--no-think` setting.
 ///
 /// Tool results are sent with the `user` role: the OpenAI `tool` role needs a
 /// `tool_call_id`, and openBatarangs passes tool calls as JSON text instead.
 pub(super) fn chat_body(request: &ChatRequest, think: bool) -> Value {
     let messages: Vec<Value> = request.messages.iter().map(message_json).collect();
+    let think = request.think.unwrap_or(think);
     let mut body = json!({
         "model": request.model,
         "messages": messages,
@@ -295,6 +297,7 @@ mod tests {
             keep_alive: None,
             format,
             options,
+            think: None,
         }
     }
 
@@ -331,6 +334,19 @@ mod tests {
         assert!(body.get("response_format").is_none());
         assert!(body.get("temperature").is_none());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn the_request_think_setting_wins_over_the_client_flag() {
+        let mut chosen = request(None, None);
+
+        chosen.think = Some(false);
+        let off = chat_body(&chosen, true);
+        chosen.think = Some(true);
+        let on = chat_body(&chosen, false);
+
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(on["chat_template_kwargs"]["enable_thinking"], true);
     }
 
     #[test]

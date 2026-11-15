@@ -29,6 +29,7 @@ mod markdown;
 mod scroll;
 mod selection;
 mod session;
+mod settings;
 mod stats;
 mod text;
 mod transcript;

@@ -588,6 +588,7 @@ fn chat_request(
         keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: Some(serde_json::Value::String("json".to_string())),
         options: Some(options),
+        think: None,
     }
 }
 
