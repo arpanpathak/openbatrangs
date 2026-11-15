@@ -24,6 +24,7 @@ use super::gemma_call::{has_raw_call_marker, parse_gemma_call};
 use super::quality::{FinishGate, command_succeeded};
 use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
+use super::runaway::ends_in_a_loop;
 use super::tool::{Tool, ToolCall, strip_code_fence};
 use super::{
     AgentConfig, AgentEvent, Confirmer, HistorySink, LoopKind, Reporter, RunContinuation, TextKind,
@@ -32,7 +33,7 @@ use super::{
 use crate::constants::agent::{
     BROKEN_CALL_NOTE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
     MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
-    NATIVE_SYSTEM_PROMPT,
+    NATIVE_SYSTEM_PROMPT, RUNAWAY_NOTE,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use crate::sampling::Sampling;
@@ -68,6 +69,8 @@ enum State {
     EmptyTurn,
     /// The server cut the reply off at the output limit.
     Cut,
+    /// The reply fell into repeating one short piece of text and was stopped.
+    Runaway,
     /// The reply holds a tool call written as text that cannot be read.
     BrokenCall,
     /// The reply text is the answer.
@@ -340,6 +343,8 @@ struct Turn {
     calls: Vec<Invocation>,
     /// Whether the server stopped the reply at its output limit.
     is_cut: bool,
+    /// Whether the reply fell into repeating one short piece of text.
+    is_runaway: bool,
 }
 
 impl Turn {
@@ -394,6 +399,7 @@ impl TurnPrinter {
     /// reasoning is shown.
     fn think<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
         self.turn.reasoning.push_str(text);
+        self.turn.is_runaway = ends_in_a_loop(&self.turn.reasoning);
 
         if !self.show_thinking {
             return;
@@ -420,6 +426,7 @@ impl TurnPrinter {
     fn content<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
         self.end_thinking(reporter);
         self.turn.content.push_str(text);
+        self.turn.is_runaway = ends_in_a_loop(&self.turn.content);
         reporter.report(AgentEvent::Text {
             kind: TextKind::Answer,
             text: text.to_string(),
@@ -500,6 +507,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
                 State::RunTools(turn) => self.run_tools(turn).await?,
                 State::EmptyTurn => self.empty_turn(),
                 State::Cut => self.cut_turn(),
+                State::Runaway => self.runaway_turn(),
                 State::BrokenCall => self.broken_call(),
                 State::Answer(text) => self.answer(&text),
                 State::Finish(summary) => self.finish(&summary),
@@ -595,6 +603,26 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         self.record(Message::User(CUT_REPLY_NOTE.to_string()));
         self.reporter.notice(
             "\n⚠️  The reply reached the output limit and was cut off; asking for smaller parts."
+                .to_string(),
+        );
+
+        State::Ask
+    }
+
+    /// Drop a reply that fell into a loop and ask again; it counts toward
+    /// the same limit as empty turns, so a model that keeps looping ends the
+    /// run.
+    fn runaway_turn(&mut self) -> State {
+        if self.empty_retries >= MAX_EMPTY_RETRIES {
+            self.reporter
+                .notice("\n⚠️  The model keeps repeating the same text.".to_string());
+            return self.done();
+        }
+
+        self.empty_retries += 1;
+        self.record(Message::User(RUNAWAY_NOTE.to_string()));
+        self.reporter.notice(
+            "\n⚠️  The reply kept repeating the same text and was stopped; asking again."
                 .to_string(),
         );
 
@@ -826,13 +854,14 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 }
 
-/// The state after a streamed turn: a cut-off turn is dropped, else its
-/// tool calls run, else its text is read.
+/// The state after a streamed turn: a turn stopped in a loop or cut off is
+/// dropped, else its tool calls run, else its text is read.
 fn state_after_turn(turn: Turn) -> State {
-    match (turn.is_cut, turn.calls.is_empty()) {
-        (true, _) => State::Cut,
-        (false, true) => State::Reply(turn),
-        (false, false) => State::RunTools(turn),
+    match (turn.is_runaway, turn.is_cut, turn.calls.is_empty()) {
+        (true, _, _) => State::Runaway,
+        (false, true, _) => State::Cut,
+        (false, false, true) => State::Reply(turn),
+        (false, false, false) => State::RunTools(turn),
     }
 }
 
@@ -1196,20 +1225,24 @@ async fn stream_turn<R: Reporter>(
     collect_turn(stream, reporter, show_thinking).await
 }
 
-/// Collect every delta of `stream` into a turn, printing text as it arrives.
+/// Collect every delta of `stream` into a turn, printing text as it
+/// arrives; stop at once when the text falls into a loop.
 async fn collect_turn<R: Reporter>(
     stream: impl Stream<Item = Result<Delta>>,
     reporter: &mut R,
     show_thinking: bool,
 ) -> Result<Turn> {
-    let printer = TurnPrinter::new(show_thinking);
+    let mut printer = TurnPrinter::new(show_thinking);
+    let mut stream = std::pin::pin!(stream);
 
-    let printer = stream
-        .try_fold(printer, |mut printer, delta| {
-            printer.take(delta, reporter);
-            std::future::ready(Ok(printer))
-        })
-        .await?;
+    while let Some(delta) = stream.try_next().await? {
+        printer.take(delta, reporter);
+
+        // Returning drops the stream, which closes the request.
+        if printer.turn.is_runaway {
+            break;
+        }
+    }
 
     Ok(printer.finish(reporter))
 }
@@ -1509,7 +1542,7 @@ mod tests {
     use super::*;
     use crate::agent::fakes::{
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_and_record, serve_replies,
-        test_config, text_delta, tool_call_delta,
+        test_config, text_delta, thinking_delta, tool_call_delta,
     };
     use crate::ollama::ChatMessage;
     use std::path::{Path, PathBuf};
@@ -1780,6 +1813,51 @@ mod tests {
 
         assert_eq!(requests.len(), 3);
         assert!(output.contains("keeps writing tool calls as text"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_repeats_itself_is_stopped_and_dropped() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-runaway");
+        let config = test_config(&root, 5);
+        let write = json!({ "path": "a.py", "content": "print(1)\n" });
+        let mut looping: Vec<Value> = (0..5)
+            .map(|_chunk| thinking_delta(&"^".repeat(100)))
+            .collect();
+        looping.push(tool_call_delta("after", "write_file", &write));
+        let replies = vec![
+            Reply::openai_stream(&looping),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, output) = requests_of_run(&config, "m", "write a.py", replies).await?;
+
+        assert!(
+            !root.join("a.py").exists(),
+            "nothing after the loop is used"
+        );
+        assert!(requests[1].contains("kept repeating the same text"));
+        assert!(!requests[1].contains("^^^^"), "the loop is not sent back");
+        assert!(output.contains("was stopped; asking again"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_looping_is_stopped() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-runaways");
+        let config = test_config(&root, 10);
+        let replies = (0..3)
+            .map(|_attempt| Reply::openai_stream(&[text_delta(&"wait, ".repeat(80))]))
+            .collect();
+
+        let (requests, output) = requests_of_run(&config, "m", "write a.py", replies).await?;
+
+        assert_eq!(requests.len(), 3);
+        assert!(output.contains("keeps repeating the same text"));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
