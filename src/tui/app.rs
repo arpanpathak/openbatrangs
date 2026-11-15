@@ -2,6 +2,7 @@
 
 use super::block::BlockContent;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
+use super::selection::Selection;
 use super::transcript::{Focus, RowHit, Transcript};
 use super::worker::{forward_job_events, send_event};
 use super::{
@@ -20,7 +21,7 @@ use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host, server
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -317,6 +318,15 @@ pub(super) struct App {
     pub(super) jobs_started: u64,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
+    /// Cell where the left button went down in the transcript text, until it
+    /// is released. A press on the scrollbar is not recorded.
+    pub(super) press: Option<Position>,
+    /// Transcript text selected by a left-button drag.
+    pub(super) selection: Option<Selection>,
+    /// Text of [`Self::selection`] as drawn in the last frame.
+    pub(super) selected_text: String,
+    /// Text to put on the clipboard before the next frame is drawn.
+    pub(super) clipboard: Option<String>,
     /// Characters accumulated in the current rate-measurement window.
     pub(super) rate_window_chars: u64,
     /// Start time of the current rate-measurement window.
@@ -395,6 +405,10 @@ impl App {
             current_task: None,
             jobs_started: 0,
             last_chat_area: None,
+            press: None,
+            selection: None,
+            selected_text: String::new(),
+            clipboard: None,
             rate_window_chars: 0,
             rate_window_start: None,
             last_chunk_at: None,
@@ -1225,27 +1239,67 @@ impl App {
         self.apply_mouse_event(event);
     }
 
-    /// Scroll on the wheel, drag the scrollbar, or open a clicked file.
+    /// Scroll on the wheel, drag the scrollbar, select text, or act on a
+    /// clicked row.
     fn apply_mouse_event(&mut self, event: MouseEvent) {
+        let cell = Position::new(event.column, event.row);
+
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll_chat(-(CHAT_SCROLL_STEP as i32)),
             MouseEventKind::ScrollDown => self.scroll_chat(CHAT_SCROLL_STEP as i32),
-            MouseEventKind::Down(MouseButton::Left) => self.click_chat(event.column, event.row),
-            MouseEventKind::Drag(MouseButton::Left) => self.drag_scrollbar(event.column, event.row),
+            MouseEventKind::Down(MouseButton::Left) => self.press_at(cell),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(cell),
+            MouseEventKind::Up(MouseButton::Left) => self.release(),
             _ => {}
         }
     }
 
-    /// A left click: jump on the scrollbar, or act on the clicked row.
-    fn click_chat(&mut self, column: u16, row: u16) {
-        if !self.handle_scrollbar_click(column, row) {
-            self.click_transcript(row);
+    /// A left press clears the selection, then jumps on the scrollbar or
+    /// starts a click or a selection in the text.
+    fn press_at(&mut self, cell: Position) {
+        self.selection = None;
+        self.press = None;
+
+        if self.handle_scrollbar_click(cell.x, cell.y) {
+            return;
+        }
+
+        self.press = Some(cell);
+    }
+
+    /// A left drag selects text from the press, or moves the scrollbar when
+    /// the press was on it.
+    fn drag_to(&mut self, cell: Position) {
+        let Some(anchor) = self.press else {
+            self.handle_scrollbar_click(cell.x, cell.y);
+            return;
+        };
+
+        self.selection = (cell != anchor).then_some(Selection {
+            anchor,
+            cursor: cell,
+        });
+    }
+
+    /// Releasing the left button copies the selection, or acts on the row
+    /// of a press that did not move.
+    fn release(&mut self) {
+        let Some(anchor) = self.press.take() else {
+            return;
+        };
+
+        match self.selection {
+            Some(_) => self.copy_selection(),
+            None => self.click_transcript(anchor.y),
         }
     }
 
-    /// A left drag moves the scrollbar; a drag elsewhere does nothing.
-    fn drag_scrollbar(&mut self, column: u16, row: u16) {
-        self.handle_scrollbar_click(column, row);
+    /// Queue the selected text for the clipboard and say how much was copied.
+    fn copy_selection(&mut self) {
+        let text = std::mem::take(&mut self.selected_text);
+
+        self.status = format!("copied {} characters", text.chars().count());
+        self.clipboard = Some(text);
     }
 
     /// Fold or unfold the block part at terminal row `row`; a row that does
@@ -2469,6 +2523,12 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A left click, press and release, at `column`, `row`.
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), column, row));
+    }
+
     /// A key press with Ctrl held.
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
@@ -3072,6 +3132,50 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_in_the_text_selects_and_the_release_copies() {
+        let mut app = test_app();
+        app.notice("some text".to_string());
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 1));
+
+        assert_eq!(
+            app.selection,
+            Some(Selection {
+                anchor: Position::new(2, 1),
+                cursor: Position::new(9, 1)
+            })
+        );
+
+        app.selected_text = "some text".to_string();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9, 1));
+
+        assert_eq!(app.clipboard.as_deref(), Some("some text"));
+        assert_eq!(app.status, "copied 9 characters");
+
+        click(&mut app, 2, 1);
+        assert_eq!(app.selection, None);
+    }
+
+    #[test]
+    fn a_drag_that_starts_on_the_scrollbar_selects_nothing() {
+        let mut app = test_app();
+        for index in 0..100 {
+            app.notice(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 38, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 38, 10));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 38, 10));
+
+        assert_eq!(app.selection, None);
+        assert_eq!(app.clipboard, None);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+    }
+
+    #[test]
     fn clicking_a_line_with_a_file_path_opens_it() -> anyhow::Result<()> {
         let workspace = crate::test_support::unique_temp_dir("openbatrangs-tui-click");
         std::fs::write(workspace.join("notes.txt"), "notes")?;
@@ -3084,16 +3188,16 @@ mod tests {
         app.last_chat_area = Some(Rect::new(0, 0, 40, 10));
         app.scroll_mode = ScrollMode::Follow;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+        click(&mut app, 5, 1);
         assert!(!app.transcript.text().contains("Opening"));
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        click(&mut app, 5, 2);
         assert!(app.transcript.text().contains("📂 Opening"));
 
         app.scroll_mode = ScrollMode::Manual;
         app.chat_scroll_offset = 1;
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 0));
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 8));
+        click(&mut app, 5, 0);
+        click(&mut app, 5, 8);
 
         std::fs::remove_dir_all(workspace)?;
 
@@ -3224,7 +3328,7 @@ mod tests {
         app.chat_scroll_offset = 0;
         let rows_open = app.transcript.layout(57);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+        click(&mut app, 5, 1);
 
         assert!(app.transcript.layout(57) < rows_open);
         assert_eq!(
