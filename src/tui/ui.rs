@@ -38,6 +38,9 @@ use unicode_width::UnicodeWidthStr;
 /// Rows of the batarang in the panel's corner.
 const BATARANG_ROWS: u16 = 5;
 
+/// The keys shown on the input box's top border.
+const INPUT_KEYS_HINT: &str = " Enter send · Shift+Enter or \\ Enter new line ";
+
 /// Top-level rendering function: compose and draw the full TUI frame.
 ///
 /// Called by ratatui's `Terminal::draw` on every frame.
@@ -522,7 +525,11 @@ fn render_input_box(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
-                )),
+                ))
+                .title_top(
+                    Line::styled(INPUT_KEYS_HINT, Style::default().fg(Color::DarkGray))
+                        .right_aligned(),
+                ),
         )
         .scroll((input_scroll_y(app, area), 0));
 

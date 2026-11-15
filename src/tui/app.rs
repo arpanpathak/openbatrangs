@@ -2,7 +2,7 @@
 
 use super::block::BlockContent;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
-use super::selection::Selection;
+use super::selection::{Selection, load_tmux_buffer};
 use super::stats::{RemoteServer, StatsTable};
 use super::transcript::{Focus, RowHit, Transcript};
 use super::worker::{forward_job_events, send_event};
@@ -1033,7 +1033,7 @@ impl App {
             InputAction::PageUp => self.scroll_chat_page(-1),
             InputAction::PageDown => self.scroll_chat_page(1),
             InputAction::Complete => self.complete_or_focus_transcript(),
-            InputAction::Submit => self.submit_input(client, tx).await,
+            InputAction::Submit => self.submit_or_continue(client, tx).await,
             InputAction::Nothing => {}
         }
     }
@@ -1286,11 +1286,20 @@ impl App {
         }
     }
 
-    /// Queue the selected text for the clipboard and say how much was copied.
+    /// Queue the selected text for the clipboard, also put it in tmux's
+    /// buffer when running inside tmux, and say how much was copied. The
+    /// highlight is cleared: it marks screen cells, so new output would
+    /// scroll text under it.
     fn copy_selection(&mut self) {
         let text = std::mem::take(&mut self.selected_text);
+        let count = text.chars().count();
+        let is_in_tmux = std::env::var_os("TMUX").is_some() && load_tmux_buffer("tmux", &text);
 
-        self.status = format!("copied {} characters", text.chars().count());
+        self.status = match is_in_tmux {
+            true => format!("copied {count} characters, also to the tmux buffer"),
+            false => format!("copied {count} characters"),
+        };
+        self.selection = None;
         self.clipboard = Some(text);
     }
 
@@ -1428,6 +1437,27 @@ impl App {
         if let Some(name) = chosen {
             self.activate_model(client, &name).await;
         }
+    }
+
+    /// Enter after a backslash replaces the backslash with a newline, for
+    /// terminals that send Shift+Enter as a plain Enter, such as Terminal.app
+    /// and tmux. Any other Enter submits the input.
+    async fn submit_or_continue(
+        &mut self,
+        client: &OllamaClient,
+        tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let is_continued = self
+            .input
+            .get(..self.cursor)
+            .is_some_and(|before| before.ends_with('\\'));
+
+        if !is_continued {
+            return self.submit_input(client, tx).await;
+        }
+
+        self.backspace();
+        self.insert_newline();
     }
 
     /// Submit the current input line as a task or slash command.
@@ -2633,6 +2663,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enter_after_a_backslash_starts_a_new_line() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = test_app();
+
+        app.insert_text("first line\\");
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+        app.insert_text("second line");
+
+        assert_eq!(app.input, "first line\nsecond line");
+        assert!(app.history.is_empty(), "nothing was submitted");
+
+        app.handle_key(press(KeyCode::Enter), &client, &tx).await;
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.history.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn empty_input_submits_nothing() -> anyhow::Result<()> {
         let client = refused_client()?;
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -3083,8 +3134,23 @@ mod tests {
 
         assert_eq!(app.clipboard.as_deref(), Some("some text"));
         assert_eq!(app.status, "copied 9 characters");
+        assert_eq!(app.selection, None, "the copy clears the highlight");
+    }
 
-        click(&mut app, 2, 1);
+    #[test]
+    fn scrolling_clears_the_highlight() {
+        let mut app = test_app();
+        for index in 0..100 {
+            app.notice(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 1));
+        assert!(app.selection.is_some());
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+
         assert_eq!(app.selection, None);
     }
 
