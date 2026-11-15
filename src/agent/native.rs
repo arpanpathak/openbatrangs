@@ -20,6 +20,7 @@ use super::Question;
 use super::context::{context_use, max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
+use super::gemma_call::{has_raw_call_marker, parse_gemma_call};
 use super::quality::{FinishGate, command_succeeded};
 use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
@@ -29,7 +30,7 @@ use super::{
     earlier_turns_section, effective_context, ensure_workspace_exists,
 };
 use crate::constants::agent::{
-    CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
+    BROKEN_CALL_NOTE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
     MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
     NATIVE_SYSTEM_PROMPT,
 };
@@ -67,6 +68,8 @@ enum State {
     EmptyTurn,
     /// The server cut the reply off at the output limit.
     Cut,
+    /// The reply holds a tool call written as text that cannot be read.
+    BrokenCall,
     /// The reply text is the answer.
     Answer(String),
     /// The model called `finish` with this summary.
@@ -497,6 +500,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
                 State::RunTools(turn) => self.run_tools(turn).await?,
                 State::EmptyTurn => self.empty_turn(),
                 State::Cut => self.cut_turn(),
+                State::BrokenCall => self.broken_call(),
                 State::Answer(text) => self.answer(&text),
                 State::Finish(summary) => self.finish(&summary),
                 State::AskUser(question) => self.ask_user(question),
@@ -545,7 +549,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 
     /// Run a tool call the model wrote as text; otherwise the text is the
-    /// answer, or an empty turn.
+    /// answer, an empty turn, or a broken call when it holds a call marker.
     fn reply(&mut self, turn: Turn) -> State {
         let Some(call) = parse_text_tool_call(&turn.content) else {
             return state_for_text(turn.content);
@@ -591,6 +595,27 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         self.record(Message::User(CUT_REPLY_NOTE.to_string()));
         self.reporter.notice(
             "\n⚠️  The reply reached the output limit and was cut off; asking for smaller parts."
+                .to_string(),
+        );
+
+        State::Ask
+    }
+
+    /// Ask again for a tool call the model wrote as text that cannot be
+    /// read; it counts toward the same limit as empty turns, so a model that
+    /// keeps doing it ends the run.
+    fn broken_call(&mut self) -> State {
+        if self.empty_retries >= MAX_EMPTY_RETRIES {
+            self.reporter.notice(
+                "\n⚠️  The model keeps writing tool calls as text that cannot be read.".to_string(),
+            );
+            return self.done();
+        }
+
+        self.empty_retries += 1;
+        self.record(Message::User(BROKEN_CALL_NOTE.to_string()));
+        self.reporter.notice(
+            "\n⚠️  The model wrote a tool call as text that cannot be read; asking again."
                 .to_string(),
         );
 
@@ -811,11 +836,13 @@ fn state_after_turn(turn: Turn) -> State {
     }
 }
 
-/// The state for a reply without tool calls: blank text is an empty turn.
+/// The state for a reply without tool calls: blank text is an empty turn,
+/// text with a tool-call marker is a broken call, and other text the answer.
 fn state_for_text(text: String) -> State {
-    match text.trim().is_empty() {
-        true => State::EmptyTurn,
-        false => State::Answer(text),
+    match (text.trim().is_empty(), has_raw_call_marker(&text)) {
+        (true, _) => State::EmptyTurn,
+        (false, true) => State::BrokenCall,
+        (false, false) => State::Answer(text),
     }
 }
 
@@ -1112,20 +1139,34 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
     })
 }
 
-/// Parse a JSON tool call the model wrote as plain text instead of using the
+/// Parse a tool call the model wrote as plain text instead of using the
 /// server's structured `tool_calls` channel.
 ///
 /// Some served models put `{"name": ..., "arguments": ...}` in the reply
-/// text; when `tool_choice` does not force the structured channel
-/// the loop would otherwise treat that JSON as the final answer. Known tools
-/// are extracted and executed instead; anything else is left to the answer path.
+/// text, and Gemma writes its own call syntax there when the server's
+/// parser misses it; the loop would otherwise treat either as the final
+/// answer. Known tools are extracted and executed instead; anything else is
+/// left to the answer path.
 fn parse_text_tool_call(content: &str) -> Option<Invocation> {
     let invocation = serde_json::from_str::<Value>(strip_code_fence(content))
         .ok()
-        .and_then(|value| text_invocation(&value))?;
+        .and_then(|value| text_invocation(&value))
+        .or_else(|| gemma_invocation(content))?;
 
     let is_known_tool = parse_call(&invocation).is_ok();
     is_known_tool.then_some(invocation)
+}
+
+/// The invocation of a complete Gemma tool call in `content`, in Gemma's
+/// own `<|tool_call>call:name{...}<tool_call|>` syntax.
+fn gemma_invocation(content: &str) -> Option<Invocation> {
+    let (name, arguments) = parse_gemma_call(content)?;
+
+    Some(Invocation {
+        id: String::new(),
+        name: name.to_string(),
+        arguments: Value::Object(arguments).to_string(),
+    })
 }
 
 /// The invocation in a parsed `{"name": ..., "arguments": ...}` object.
@@ -1681,6 +1722,64 @@ mod tests {
         assert_eq!(call_arguments("  ")?, json!({}));
         assert_eq!(call_arguments(r#"{"path": "a"}"#)?, json!({ "path": "a" }));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_complete_gemma_call_in_the_text_is_run() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-gemma-call");
+        let config = test_config(&root, 5);
+        let call = "<|tool_call>call:write_file{path:<|\"|>a.py<|\"|>,content:<|\"|>print(1)\n<|\"|>}<tool_call|>";
+        let replies = vec![
+            Reply::openai_stream(&[text_delta(call)]),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, output) = requests_of_run(&config, "m", "write a.py", replies).await?;
+
+        assert_eq!(std::fs::read_to_string(root.join("a.py"))?, "print(1)\n");
+        assert_eq!(requests.len(), 2);
+        assert!(output.contains("tool call as text; executing it anyway"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_gemma_call_in_the_text_is_not_the_answer() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-broken-call");
+        let config = test_config(&root, 5);
+        // The reply of a real run: a call cut off partway, then a second one.
+        let broken = "<|tool_call>call:write_file{content:<|\"|>import json\n```\n<|tool_call>call:write_file{content:<|\"|>from typing import List";
+        let replies = vec![
+            Reply::openai_stream(&[text_delta(broken)]),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, output) = requests_of_run(&config, "m", "write a.py", replies).await?;
+
+        assert_eq!(requests.len(), 2, "the broken call is not the answer");
+        assert!(requests[1].contains("it could not be read, so nothing ran"));
+        assert!(output.contains("cannot be read; asking again"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_writing_broken_calls_is_stopped() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-broken-calls");
+        let config = test_config(&root, 10);
+        let replies = (0..3)
+            .map(|_attempt| Reply::openai_stream(&[text_delta("<tool_call>{\"name\": ")]))
+            .collect();
+
+        let (requests, output) = requests_of_run(&config, "m", "write a.py", replies).await?;
+
+        assert_eq!(requests.len(), 3);
+        assert!(output.contains("keeps writing tool calls as text"));
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
