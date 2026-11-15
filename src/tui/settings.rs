@@ -312,10 +312,12 @@ mod tests {
         assert_eq!(app.settings_row(), None);
 
         press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Down);
         assert_eq!(
             app.run_config.temperature, None,
             "a closed dialog changes nothing"
         );
+        assert_eq!(app.settings_row(), None, "and stays closed");
     }
 
     #[test]
