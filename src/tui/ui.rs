@@ -15,6 +15,7 @@
 //! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
 use super::app::{App, FocusArea};
+use super::choice;
 use super::scroll::{chat_text_width, chat_visible_height};
 use super::selection;
 use super::settings;
@@ -71,6 +72,7 @@ pub(super) fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     render_model_picker(frame, app);
     render_confirmation(frame, app);
     settings::render_settings(frame, app);
+    choice::render_choice(frame, app);
 }
 
 /// Whether the perf panel should be shown given current app state and terminal height.

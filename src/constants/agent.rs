@@ -85,7 +85,7 @@ Tools:
 - web_read(url) — read a public web page, such as documentation found by web_search
 - write_file(path, content)
 - run_command(command)
-- ask_user(question) — ask the user one short question when the request is unclear and the workspace cannot settle it; the user's reply arrives as the next message
+- ask_user(question, options, multiple) — ask the user one short question when the request is unclear and the workspace cannot settle it; list known choices in options (multiple: true to allow several); the user's reply arrives as the next message
 - finish(summary)
 
 Behavior:

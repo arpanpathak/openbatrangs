@@ -101,9 +101,20 @@ pub(super) enum Tool {
     },
     /// Stop and ask the user a question; their next message is the answer.
     AskUser {
-        /// The question to show the user.
-        question: String,
+        /// The question, with the answers to choose from, if any.
+        question: Question,
     },
+}
+
+/// A question the model asks the user.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Question {
+    /// The question, in plain words.
+    pub text: String,
+    /// Answers the user can pick from; empty for a free-text question.
+    pub options: Vec<String>,
+    /// Whether the user may pick several options instead of one.
+    pub is_multiple: bool,
 }
 
 impl Tool {
@@ -142,7 +153,7 @@ impl Tool {
             Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),
             Self::Finish { .. } => "finish".to_string(),
-            Self::AskUser { question } => format!("ask_user → {question}"),
+            Self::AskUser { question } => format!("ask_user → {}", question.text),
         }
     }
 }
@@ -237,11 +248,37 @@ fn finish_tool(args: &Value) -> Result<Tool> {
     })
 }
 
-/// `ask_user`: a required question.
+/// `ask_user`: a required question, optional `options` to pick from, and
+/// `multiple` to allow several of them.
 fn ask_user_tool(args: &Value) -> Result<Tool> {
+    let options = present_arg(args, "options")
+        .map(|value| string_list(value, "options"))
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(Tool::AskUser {
-        question: required_string_arg(args, "question", "ask_user")?.to_string(),
+        question: Question {
+            text: required_string_arg(args, "question", "ask_user")?.to_string(),
+            options,
+            is_multiple: optional_bool_arg(args, "multiple")?.unwrap_or(false),
+        },
     })
+}
+
+/// `value` as a list of strings, or an error naming argument `key`.
+fn string_list(value: &Value, key: &str) -> Result<Vec<String>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("argument '{key}' must be a list of strings"))?;
+
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("argument '{key}' must be a list of strings"))
+        })
+        .collect()
 }
 
 /// The one-line description of a call to tool `name` with JSON `arguments`;
@@ -603,5 +640,40 @@ mod tests {
     fn code_fences_are_stripped() {
         assert_eq!(strip_code_fence(" ```json\n{}\n``` "), "{}");
         assert_eq!(strip_code_fence("```\n{}\n```"), "{}");
+    }
+
+    #[test]
+    fn ask_user_reads_its_options_and_whether_several_may_be_picked() -> Result<()> {
+        let question = |arguments: Value| match tool("ask_user", arguments) {
+            Ok(Tool::AskUser { question }) => Ok(question),
+            Ok(other) => Err(anyhow!("not ask_user: {other:?}")),
+            Err(error) => Err(error),
+        };
+
+        let open = question(json!({ "question": "Name?" }))?;
+        let choice = question(json!({
+            "question": "Which?",
+            "options": ["a", "b"],
+            "multiple": true
+        }))?;
+
+        assert_eq!(
+            open,
+            Question {
+                text: "Name?".to_string(),
+                ..Question::default()
+            }
+        );
+        assert_eq!(
+            choice,
+            Question {
+                text: "Which?".to_string(),
+                options: vec!["a".to_string(), "b".to_string()],
+                is_multiple: true,
+            }
+        );
+        assert!(question(json!({ "question": "Which?", "options": "a" })).is_err());
+        assert!(question(json!({ "question": "Which?", "options": [1] })).is_err());
+        Ok(())
     }
 }

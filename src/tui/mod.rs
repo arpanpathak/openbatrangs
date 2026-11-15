@@ -23,6 +23,7 @@
 mod app;
 mod block;
 mod chat;
+mod choice;
 mod commands;
 mod input;
 mod markdown;

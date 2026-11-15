@@ -58,6 +58,7 @@ pub use reporter::{
     AgentEvent, ContextUse, LoopKind, Reporter, StdoutReporter, TextKind, step_limit,
     step_limit_notice, step_number,
 };
+pub use tool::Question;
 pub(crate) use tool::describe_call;
 
 /// Receives snapshots of the conversation as it grows.

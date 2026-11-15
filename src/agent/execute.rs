@@ -138,7 +138,7 @@ pub(super) async fn execute_tool<C: Confirmer>(
         }
         Tool::RunCommand { command } => run_command(config, cwd, command, confirmer).await,
         Tool::Finish { summary } => Ok(format!("{ANSI_GREEN_CHECK} {summary}")),
-        Tool::AskUser { question } => Ok(question.clone()),
+        Tool::AskUser { question } => Ok(question.text.clone()),
     }
 }
 
@@ -542,7 +542,10 @@ mod tests {
         assert_eq!(finished.output, format!("{ANSI_GREEN_CHECK} all done"));
 
         let asked = report(Tool::AskUser {
-            question: "Which file?".to_string(),
+            question: crate::agent::Question {
+                text: "Which file?".to_string(),
+                ..crate::agent::Question::default()
+            },
         })
         .await;
         assert_eq!(asked.output, "Which file?");

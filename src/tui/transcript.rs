@@ -15,7 +15,7 @@
 use super::block::{Answer, Block, BlockContent, Part, Step, ToolOutcome};
 use super::session::BlockStore;
 use super::text::{spans_text, strip_ansi};
-use crate::agent::{AgentEvent, TextKind, step_limit_notice};
+use crate::agent::{AgentEvent, Question, TextKind, step_limit_notice};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use std::collections::VecDeque;
@@ -166,7 +166,9 @@ impl Transcript {
                 )
             }),
             AgentEvent::Notice(text) => self.push_notice(notice_lines(&text)),
-            AgentEvent::AskUser { question } => self.end_with(BlockContent::Question(question)),
+            AgentEvent::AskUser { question } => {
+                self.end_with(BlockContent::Question(question_markdown(&question)))
+            }
             AgentEvent::StepLimitReached { max_steps } => {
                 self.push_notice(notice_lines(&step_limit_notice(max_steps)))
             }
@@ -559,6 +561,22 @@ impl Transcript {
     }
 }
 
+/// A question as Markdown: the question, then its options as a numbered
+/// list, so the transcript keeps them after the dialog closes.
+fn question_markdown(question: &Question) -> String {
+    let options: Vec<String> = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| format!("{}. {option}", index + 1))
+        .collect();
+
+    match options.is_empty() {
+        true => question.text.clone(),
+        false => format!("{}\n\n{}", question.text, options.join("\n")),
+    }
+}
+
 /// The lines of a notice, without terminal escapes or leading blank lines.
 fn notice_lines(text: &str) -> Vec<String> {
     strip_ansi(text)
@@ -715,7 +733,10 @@ mod tests {
             changed_files: vec![PathBuf::from("/w/a.rs")],
         });
         transcript.apply(AgentEvent::AskUser {
-            question: "More?".to_string(),
+            question: crate::agent::Question {
+                text: "More?".to_string(),
+                ..crate::agent::Question::default()
+            },
         });
 
         let lines = texts(&transcript.visible_lines(60, 0, 40, false));
@@ -889,5 +910,20 @@ mod tests {
         assert!(!transcript.has_older());
         assert_eq!(transcript.layout(40), 0);
         assert_eq!(transcript.total_rows(), 0);
+    }
+
+    #[test]
+    fn a_question_keeps_its_options_in_the_transcript() {
+        let mut transcript = Transcript::new(50);
+
+        transcript.apply(AgentEvent::AskUser {
+            question: Question {
+                text: "Which file?".to_string(),
+                options: vec!["a.rs".to_string(), "b.rs".to_string()],
+                is_multiple: false,
+            },
+        });
+
+        assert_eq!(transcript.text(), "Which file?\n\n1. a.rs\n2. b.rs");
     }
 }

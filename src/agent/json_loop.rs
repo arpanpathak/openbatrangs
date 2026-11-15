@@ -14,6 +14,7 @@
 //! The run is a state machine: [`JsonRun::run`] moves through [`State`]
 //! values, one small function per state, until the run is over.
 
+use super::Question;
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
 use super::quality::FinishGate;
@@ -82,7 +83,7 @@ enum State {
         answer_was_streamed: bool,
     },
     /// The model asked the user this question.
-    AskUser(String),
+    AskUser(Question),
     /// The reply had neither an answer nor a tool call.
     Empty(String),
     /// The reply was not JSON.
@@ -335,7 +336,7 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
     }
 
     /// Show the question and end the run.
-    fn ask_user(&mut self, question: String) -> State {
+    fn ask_user(&mut self, question: Question) -> State {
         self.reporter.report(AgentEvent::AskUser { question });
 
         State::Done
