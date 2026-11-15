@@ -4,7 +4,8 @@
 //! sequences, very long lines, and file paths. This module keeps those concerns
 //! in one place:
 //!
-//! - [`strip_ansi`] removes terminal escapes so the chat log stores plain text.
+//! - [`printable_line`] removes terminal escapes and control characters, so a
+//!   drawn row cannot change the terminal's state.
 //! - [`wrap_text_to_lines`] / [`wrap_spans`]
 //!   compute visual wrapping for Unicode-safe layout.
 //! - [`extract_path_from_line`] lets users click a file path in the chat.
@@ -15,68 +16,33 @@
 //! - Unicode grapheme clusters: <https://www.unicode.org/reports/tr29/>
 //! - Ratatui wrapping: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 
+use crate::terminal_text::printable_text;
 use ratatui::style::Style;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::Chars;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-/// Remove ANSI escape sequences (CSI, OSC) from a string, returning plain text.
+/// `text` without escape sequences or other control characters; a tab
+/// becomes four spaces.
 ///
-/// # Parameters
-///
-/// - `text`: input string potentially containing terminal escape sequences.
-///
-/// # Returns
-///
-/// The input with all ANSI/OSC escape sequences removed.
-pub(crate) fn strip_ansi(text: &str) -> String {
-    let mut plain = String::new();
-    let mut characters = text.chars();
-
-    while let Some(character) = characters.next() {
-        keep_unless_escape(&mut plain, character, &mut characters);
-    }
-
-    plain
+/// A terminal acts on a control character instead of showing it: `ESC[4m`
+/// underlines every cell drawn after it, and a carriage return moves the
+/// cursor. Text drawn in the TUI must hold none of them.
+pub(crate) fn printable(text: &str) -> String {
+    printable_text(text).replace('\t', "    ").replace('\n', "")
 }
 
-/// Append `character` to `plain`, or skip the escape sequence it starts.
-fn keep_unless_escape(plain: &mut String, character: char, characters: &mut Chars<'_>) {
-    if character == '\x1b' {
-        skip_escape_sequence(characters);
-        return;
+/// `line` with the text of every span made [`printable`].
+pub(crate) fn printable_line(mut line: Line<'static>) -> Line<'static> {
+    for span in &mut line.spans {
+        if span.content.contains(char::is_control) {
+            span.content = printable(&span.content).into();
+        }
     }
 
-    plain.push(character);
-}
-
-/// Consume and discard one ANSI escape sequence after the initial ESC character.
-///
-/// Other single-character escape sequences need no further characters.
-fn skip_escape_sequence(characters: &mut Chars<'_>) {
-    match characters.next() {
-        Some(']') => skip_operating_system_command(characters),
-        Some('[') => skip_control_sequence(characters),
-        Some(_) | None => {}
-    }
-}
-
-/// Skip an OSC sequence (`ESC ] ...`), which ends at BEL or at the string
-/// terminator `ESC \`.
-fn skip_operating_system_command(characters: &mut Chars<'_>) {
-    let terminator = characters.find(|character| matches!(character, '\x07' | '\x1b'));
-
-    if terminator == Some('\x1b') {
-        characters.next();
-    }
-}
-
-/// Skip a CSI sequence (`ESC [ ...`), which ends at a final byte in `0x40..=0x7E`.
-fn skip_control_sequence(characters: &mut Chars<'_>) {
-    characters.find(|character| ('\u{40}'..='\u{7e}').contains(character));
+    line
 }
 
 /// Wrap a multi-line string into rows that each fit within `max_text_width` cells.
@@ -302,29 +268,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_ansi_removes_csi_color_codes() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
-        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
-    }
-
-    #[test]
-    fn strip_ansi_removes_osc_hyperlinks() {
-        let input = "\x1b]8;;file:///tmp/a\x1b\\/tmp/a\x1b]8;;\x1b\\";
-        assert_eq!(strip_ansi(input), "/tmp/a");
-    }
-
-    #[test]
-    fn strip_ansi_removes_osc_with_bel_terminator() {
-        let input = "\x1b]0;title\x07visible";
-        assert_eq!(strip_ansi(input), "visible");
-    }
-
-    #[test]
-    fn strip_ansi_keeps_plain_text() {
-        assert_eq!(strip_ansi("plain text 🦇"), "plain text 🦇");
-    }
-
-    #[test]
     fn styled_spans_wrap_and_keep_their_styles() {
         let bold = Style::new().add_modifier(ratatui::style::Modifier::BOLD);
         let spans = vec![Span::raw("ab"), Span::styled("cde", bold), Span::raw("f")];
@@ -341,13 +284,19 @@ mod tests {
     }
 
     #[test]
-    fn strip_ansi_drops_single_character_escapes_and_a_trailing_escape() {
-        assert_eq!(strip_ansi("a\x1b7b\x1b"), "ab");
-    }
+    fn printable_text_has_no_escapes_or_control_characters() {
+        let underlined = Style::new().add_modifier(ratatui::style::Modifier::UNDERLINED);
+        let line = Line::from(vec![
+            Span::styled("\x1b[4mtitle\x1b[24m", underlined),
+            Span::raw("50%\r100%\x07\u{9b}2J\tdone"),
+            Span::raw("plain"),
+        ]);
 
-    #[test]
-    fn strip_ansi_drops_an_unterminated_operating_system_command() {
-        assert_eq!(strip_ansi("a\x1b]0;title"), "a");
+        let cleaned = printable_line(line);
+
+        assert_eq!(spans_text(&cleaned.spans), "title50%100%2J    doneplain");
+        assert_eq!(cleaned.spans[0].style, underlined);
+        assert_eq!(printable("a\nb"), "ab");
     }
 
     #[test]

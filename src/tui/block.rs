@@ -14,7 +14,7 @@
 
 use super::chat::{code_lines, notice_line};
 use super::markdown::markdown_lines;
-use super::text::{spans_width, wrap_spans};
+use super::text::{printable_line, spans_width, wrap_spans};
 use crate::agent::{describe_call, step_number};
 use crate::constants::tui::CHAT_SEPARATOR_LENGTH;
 use ratatui::style::{Color, Modifier, Style};
@@ -392,9 +392,9 @@ fn has_text(text: &str) -> bool {
 }
 
 impl BlockRows {
-    /// Add one row that already fits.
+    /// Add one row that already fits, without control characters.
     fn push_line(&mut self, line: Line<'static>, part: Part) {
-        self.lines.push(line);
+        self.lines.push(printable_line(line));
         self.parts.push(part);
     }
 
@@ -962,6 +962,60 @@ mod tests {
 
         assert_eq!(rows[2], "  ▸ ✓ list_files → . · ✓ 5 lines");
         assert_eq!(rows[3..], ["      a.rs", "      b.rs", "      c.rs"]);
+    }
+
+    /// Whether any row of `block` at `width` holds a control character,
+    /// which the terminal would act on instead of showing.
+    fn has_control_characters(block: &mut Block, width: usize) -> bool {
+        row_texts(block, width)
+            .iter()
+            .any(|row| row.contains(char::is_control))
+    }
+
+    #[test]
+    fn escape_codes_in_an_answer_are_not_drawn() {
+        let answer = Answer {
+            text: "\x1b[4munderlined title\x1b[0m\n\nThe rest stays plain.".to_string(),
+            changed_files: Vec::new(),
+        };
+        let mut block = Block::new(BlockContent::Answer(answer));
+
+        let rows = row_texts(&mut block, 16);
+
+        assert_eq!(rows[2..4], ["underlined title", ""], "{rows:?}");
+        assert!(!has_control_characters(&mut block, 16));
+    }
+
+    #[test]
+    fn escape_codes_in_tool_output_are_not_drawn_folded_or_open() {
+        let mut step = Step::new(1, None, "m".to_string());
+
+        step.add_tool(
+            "c1".to_string(),
+            "run_command".to_string(),
+            r#"{"command":"pytest\u001b[4m"}"#.to_string(),
+        );
+
+        step.set_result(
+            "c1",
+            ToolOutcome {
+                success: true,
+                summary: "\x1b[32m3 passed\x1b[0m".to_string(),
+                output: "\x1b[1mtests\x1b[0m\n50%\r100%\n\x1b[4mdoc\x1b[24m".to_string(),
+            },
+        );
+
+        let mut block = Block::new(BlockContent::Step(step));
+
+        let folded = row_texts(&mut block, 80);
+
+        block.toggle(Part::Tool(0));
+        let open = row_texts(&mut block, 80);
+
+        assert_eq!(folded[2], "  ▸ ✓ run_command → pytest · ✓ 3 passed");
+        assert_eq!(folded[3..], ["      tests", "      50%100%", "      doc"]);
+        assert!(open.contains(&"      doc".to_string()), "{open:?}");
+        assert!(!has_control_characters(&mut block, 80));
     }
 
     #[test]
