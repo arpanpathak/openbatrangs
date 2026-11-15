@@ -1299,7 +1299,7 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Search current web documentation. Prefer official vendor sources for APIs, libraries, GPU programming, and version-sensitive behavior. Return URLs and snippets. Search once or twice, then use web_read on an official result; do not repeat near-identical queries.",
+                "description": "Search the web for documentation. Use it whenever you are unsure about an API, a library or crate version, a command-line flag, a configuration key or an error message, before writing code from memory. Prefer official sources. Returns URLs and snippets. Search once or twice, then use web_read on the best result; do not repeat near-identical queries.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1313,11 +1313,11 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "web_read",
-                "description": "Read an official NVIDIA or GitHub documentation page found by web_search. Pages are capped at 128 KiB and only approved HTTPS documentation hosts are allowed.",
+                "description": "Read a public web page, such as documentation found by web_search. Pages are capped at 128 KiB; addresses on this machine or a private network are refused.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "url": { "type": "string", "description": "HTTPS URL from a web_search result on nvidia.github.io, developer.nvidia.com, docs.nvidia.com, or github.com." }
+                        "url": { "type": "string", "description": "HTTP or HTTPS URL of a public page, usually from a web_search result." }
                     },
                     "required": ["url"]
                 }

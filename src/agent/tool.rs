@@ -66,7 +66,7 @@ pub(super) enum Tool {
         /// Focused search query.
         query: String,
     },
-    /// Read official NVIDIA or GitHub documentation returned by search.
+    /// Read a public web page, such as documentation returned by search.
     WebRead {
         /// HTTPS URL of an approved documentation page.
         url: String,

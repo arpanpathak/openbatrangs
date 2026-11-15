@@ -30,18 +30,6 @@ const MAX_SNIPPET_CHARS: usize = 500;
 /// The most redirects one `web_read` follows.
 const MAX_REDIRECTS: usize = 5;
 
-/// Hosts of official NVIDIA, GitHub and Rust documentation. Their subdomains
-/// count as official too.
-const OFFICIAL_DOC_HOSTS: &[&str] = &[
-    "nvidia.github.io",
-    "developer.nvidia.com",
-    "docs.nvidia.com",
-    "github.com",
-    "raw.githubusercontent.com",
-    "docs.rs",
-    "doc.rust-lang.org",
-];
-
 /// Search the SearXNG instance at `base_url` and return cited results. `key`
 /// is sent as a bearer token when the search sits behind the Thor's agent.
 pub(crate) async fn web_search(base_url: &str, key: Option<&str>, query: &str) -> Result<String> {
@@ -264,29 +252,6 @@ fn main_part(html: &str) -> String {
                 .map(|part| part.as_str().to_string())
         })
         .unwrap_or_else(|| html.to_string())
-}
-
-/// True when `url` is on an official documentation host. Research prefers
-/// these among search results; `web_read` reads any public page.
-pub(crate) fn is_official_doc(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|url| approved_doc_url(&raw_source(url)))
-}
-
-/// True for HTTPS pages on official NVIDIA or GitHub documentation hosts.
-fn approved_doc_url(url: &Url) -> bool {
-    url.scheme() == "https" && is_official_doc_host(url.host_str().unwrap_or_default())
-}
-
-/// Whether `host` is one of [`OFFICIAL_DOC_HOSTS`] or a subdomain of one.
-fn is_official_doc_host(host: &str) -> bool {
-    OFFICIAL_DOC_HOSTS
-        .iter()
-        .any(|domain| is_same_or_subdomain(host, domain))
-}
-
-/// Whether `host` is `domain` itself or a name under it.
-fn is_same_or_subdomain(host: &str, domain: &str) -> bool {
-    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// True for an http or https URL whose host is not this machine or a private
@@ -531,31 +496,6 @@ mod tests {
         assert!(is_public_web_url(&public));
 
         Ok(())
-    }
-
-    #[test]
-    fn only_allows_https_official_documentation_hosts() -> Result<()> {
-        assert!(approved_doc_url(&Url::parse(
-            "https://nvidia.github.io/cuda-rust/"
-        )?));
-        assert!(approved_doc_url(&Url::parse(
-            "https://docs.nvidia.com/cuda/"
-        )?));
-        assert!(!approved_doc_url(&Url::parse("http://nvidia.github.io/")?));
-        assert!(!approved_doc_url(&Url::parse("https://evil.example/")?));
-        assert!(!approved_doc_url(&Url::parse(
-            "https://evilnvidia.github.io/"
-        )?));
-
-        Ok(())
-    }
-
-    #[test]
-    fn official_docs_include_github_files_read_as_raw_source() {
-        assert!(is_official_doc(
-            "https://github.com/rust-lang/rust/blob/master/README.md"
-        ));
-        assert!(!is_official_doc("not a url"));
     }
 
     #[tokio::test]
