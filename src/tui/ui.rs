@@ -17,6 +17,7 @@
 use super::app::{App, FocusArea};
 use super::scroll::{chat_text_width, chat_visible_height};
 use super::selection;
+use super::settings;
 use super::{ScrollMode, wrap_text_to_lines};
 use crate::banner;
 use crate::cli::{AgentMode, AgentRunConfig};
@@ -65,6 +66,7 @@ pub(super) fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     render_cursor(frame, app, chunks[5]);
     render_model_picker(frame, app);
     render_confirmation(frame, app);
+    settings::render_settings(frame, app);
 }
 
 /// Whether the perf panel should be shown given current app state and terminal height.

@@ -314,6 +314,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/thinking on\|off` | show or hide the model's reasoning |
 | `/steps <n>\|off` | set or remove the step limit |
 | `/temperature <t>\|auto` | set the sampling temperature, or go back to the model card's |
+| `/settings` | a dialog with a temperature slider and thinking on or off |
 | `/cwd <path>` | change the project folder |
 | `/perf` | show or hide the performance panel |
 | `/mouse on\|off` | use the mouse wheel, the scrollbar and drag to copy, or the terminal's own text selection |

@@ -22,6 +22,7 @@ pub const COMMANDS: &[&str] = &[
     "mode",
     "thinking",
     "temperature",
+    "settings",
     "mouse",
     "yolo",
 ];
@@ -52,6 +53,7 @@ pub const HELP_LINES: &[&str] = &[
     "  /thinking on|off   — show/hide model reasoning",
     "  /steps <n>|off     — set or remove the step limit",
     "  /temperature <t>|auto — set the sampling temperature (auto = model card)",
+    "  /settings          — temperature slider and thinking on or off",
     "  /cwd <path>        — change workspace directory",
     "  /perf              — toggle performance panel",
     "  /mouse on|off      — wheel, scrollbar, drag to copy (off = native select)",

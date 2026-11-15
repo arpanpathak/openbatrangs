@@ -108,16 +108,6 @@ impl OllamaClient {
         matches!(self.api, Api::OpenAi { .. })
     }
 
-    /// Whether the model is asked to think before answering.
-    ///
-    /// Only an OpenAI-compatible server takes this flag, and only `--no-think`
-    /// clears it. Showing or hiding the reasoning is a separate concern: the
-    /// model must keep thinking for its instructions to hold, so a display
-    /// toggle never changes what is sent.
-    pub fn requests_thinking(&self) -> bool {
-        matches!(self.api, Api::OpenAi { think: true, .. })
-    }
-
     /// The context window to ask for when `--max-ctx` is not given.
     ///
     /// Ollama reserves memory for the whole window a request asks for, so it
@@ -593,6 +583,7 @@ mod tests {
             keep_alive: None,
             format: None,
             options: None,
+            think: None,
         }
     }
 
@@ -1028,18 +1019,6 @@ mod tests {
         let client = OllamaClient::openai(&format!("{base_url}/v1"), None, false)?;
 
         assert_eq!(client.show("qwen").await?, serde_json::json!({}));
-        Ok(())
-    }
-
-    #[test]
-    fn only_the_openai_flag_decides_whether_the_model_thinks() -> Result<()> {
-        let thinking = OllamaClient::openai("http://127.0.0.1:8079/v1", None, true)?;
-        let not_thinking = OllamaClient::openai("http://127.0.0.1:8079/v1", None, false)?;
-        let ollama = OllamaClient::new("http://127.0.0.1:11434")?;
-
-        assert!(thinking.requests_thinking());
-        assert!(!not_thinking.requests_thinking());
-        assert!(!ollama.requests_thinking());
         Ok(())
     }
 

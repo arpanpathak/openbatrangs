@@ -250,5 +250,6 @@ pub(super) fn test_config(cwd: &Path, max_steps: usize) -> AgentConfig {
         max_ctx: None,
         searxng_url: "http://127.0.0.1:9".to_string(),
         search_key: None,
+        think: true,
     }
 }

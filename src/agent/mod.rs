@@ -103,6 +103,8 @@ pub struct AgentConfig {
     pub max_steps: Option<usize>,
     /// Sampling temperature set by the user, or `None` for the model card's.
     pub temperature: Option<f64>,
+    /// Whether the model is asked to think before it answers.
+    pub think: bool,
     /// When `true`, mutating tools (write, run command) are disabled.
     pub is_read_only: bool,
     /// When `true`, the user must approve each write/command before execution.

@@ -271,6 +271,7 @@ fn agent_config(config: AgentRunConfig, model_context: u64) -> AgentConfig {
         cwd: config.cwd,
         max_steps: config.max_steps,
         temperature: config.temperature,
+        think: config.think,
         is_read_only,
         should_confirm: config.should_confirm,
         use_sandbox: config.use_sandbox,
@@ -295,7 +296,10 @@ async fn run_chat_worker(
     let model_context = resolve_model_context(&client, &selected.name).await?;
     let num_ctx = effective_context(model_context, config.max_ctx);
     let sampling = Sampling::for_model(&selected.name, config.temperature);
-    let request = chat_request(selected.name, history, num_ctx, sampling);
+    let request = ChatRequest {
+        think: Some(config.think),
+        ..chat_request(selected.name, history, num_ctx, sampling)
+    };
 
     note_model_loading(&client, &tx);
     let stream = client.chat_stream(request).await?;
@@ -335,6 +339,7 @@ fn chat_request(
         keep_alive: Some(serde_json::json!(crate::constants::ollama::KEEP_ALIVE)),
         format: None,
         options: Some(options),
+        think: None,
     }
 }
 
@@ -493,6 +498,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp/openbatrangs-tui-worker-missing-workspace"),
             max_steps: Some(1),
             temperature: None,
+            think: true,
             is_read_only: false,
             should_confirm: true,
             use_sandbox: true,

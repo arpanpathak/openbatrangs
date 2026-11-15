@@ -501,6 +501,7 @@ mod tests {
             keep_alive: None,
             format: None,
             options: None,
+            think: None,
         }
     }
 
