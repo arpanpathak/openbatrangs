@@ -1400,8 +1400,8 @@ pub(crate) fn tools_schema() -> Value {
 mod tests {
     use super::*;
     use crate::agent::fakes::{
-        FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_replies, test_config,
-        text_delta, tool_call_delta,
+        FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_and_record, serve_replies,
+        test_config, text_delta, tool_call_delta,
     };
     use crate::ollama::ChatMessage;
     use std::path::{Path, PathBuf};
@@ -1466,6 +1466,94 @@ mod tests {
         .await;
 
         Ok((reporter.output, result))
+    }
+
+    /// The request bodies a native run of `task` by `model` sent, with the
+    /// step limit and temperature of `config`, against a server that sends
+    /// `replies`; and the run's output.
+    async fn requests_of_run(
+        config: &AgentConfig,
+        model: &str,
+        task: &str,
+        replies: Vec<Reply>,
+    ) -> Result<(Vec<Value>, String)> {
+        let (url, server) = serve_and_record(replies).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            config,
+            &client,
+            model,
+            task,
+            None,
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        // A run that sends fewer requests than there are replies leaves the
+        // server waiting; fail instead of hanging.
+        let bodies = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .context("the run sent fewer requests than the server had replies")???;
+        let requests = bodies
+            .iter()
+            .map(|body| serde_json::from_str(body))
+            .collect::<serde_json::Result<Vec<Value>>>()?;
+
+        Ok((requests, reporter.output))
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_step_limit_goes_past_forty_steps() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-no-step-limit");
+        let mut config = test_config(&root, 1);
+        config.max_steps = None;
+
+        // Each call reads a different missing file, so the repeat guard,
+        // which stops five identical calls, never fires.
+        let mut replies: Vec<Reply> = (0..45)
+            .map(|index| {
+                let arguments = json!({ "path": format!("missing-{index}.rs") });
+                Reply::openai_stream(&[tool_call_delta(
+                    &format!("c{index}"),
+                    "read_file",
+                    &arguments,
+                )])
+            })
+            .collect();
+        replies.push(Reply::openai_stream(&[text_delta("Done.")]));
+
+        let (requests, output) = requests_of_run(&config, "m", "read files", replies).await?;
+
+        assert_eq!(requests.len(), 46);
+        assert!(output.contains("── step 46 ──"));
+        assert!(!output.contains("Reached max steps"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_request_carries_the_model_family_sampling() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-sampling");
+        let mut config = test_config(&root, 2);
+        let answer = || vec![Reply::openai_stream(&[text_delta("Done.")])];
+
+        let (card, _output) = requests_of_run(&config, "gemma-4-26b", "hi", answer()).await?;
+        config.temperature = Some(0.3);
+        let (chosen, _output) = requests_of_run(&config, "gemma-4-26b", "hi", answer()).await?;
+
+        assert_eq!(card[0]["temperature"], 1.0);
+        assert_eq!(card[0]["top_p"], 0.95);
+        assert_eq!(card[0]["top_k"], 64);
+        assert_eq!(chosen[0]["temperature"], 0.3);
+        assert_eq!(chosen[0]["top_k"], 64);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     /// Like [`run_in`], in a new empty workspace that is removed afterwards.
