@@ -144,7 +144,7 @@ impl Transcript {
             AgentEvent::Text { text, .. } => {
                 self.update_running_step(|step| step.reasoning.push_str(&text))
             }
-            AgentEvent::TextEnded(_kind) => {}
+            AgentEvent::TextEnded(_) | AgentEvent::Context(_) => {}
             AgentEvent::ToolCall {
                 id,
                 name,

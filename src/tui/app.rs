@@ -10,7 +10,7 @@ use super::worker::{forward_job_events, send_event};
 use super::{
     ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
-use crate::agent::{AgentEvent, TextKind, describe_call};
+use crate::agent::{AgentEvent, ContextUse, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
@@ -317,6 +317,9 @@ pub(super) struct App {
     pub(super) stream_started_at: Option<Instant>,
     /// Estimated tokens per second based on streaming character rate.
     pub(super) tokens_per_sec: f64,
+    /// How full the context window was at the last agent step, or `None`
+    /// before the first.
+    pub(super) context: Option<ContextUse>,
     /// The background job (agent task, pull or setup) that runs now.
     pub(super) current_task: Option<RunningJob>,
     /// How many jobs this session has started; the newest job's number.
@@ -409,6 +412,7 @@ impl App {
             stream_chars: 0,
             stream_started_at: None,
             tokens_per_sec: 0.0,
+            context: None,
             current_task: None,
             jobs_started: 0,
             last_chat_area: None,
@@ -755,6 +759,7 @@ impl App {
             AgentEvent::AskUser { question } => self.on_question(question),
             AgentEvent::StepLimitReached { max_steps } => self.on_step_limit(*max_steps),
             AgentEvent::Finished { answer, .. } => self.reply = answer.clone(),
+            AgentEvent::Context(context) => self.context = Some(*context),
             AgentEvent::StepStarted { .. }
             | AgentEvent::TextEnded(_)
             | AgentEvent::ToolResult { .. }
@@ -3019,6 +3024,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn the_app_keeps_the_latest_context_report() {
+        let mut app = test_app();
+        let context = ContextUse {
+            used: 1_200,
+            compact_at: 7_000,
+            window: 8_192,
+        };
+
+        app.on_agent_event(AgentEvent::Context(context));
+
+        assert_eq!(app.context, Some(context));
+        assert!(
+            app.transcript.is_empty(),
+            "the report is not shown as a line"
+        );
     }
 
     #[test]

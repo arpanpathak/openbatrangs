@@ -5,6 +5,7 @@
 //! per-device window, older turns are rolled into a short structured note while
 //! the system message, original task, and newest tool exchanges stay verbatim.
 
+use super::ContextUse;
 use crate::constants::agent::{
     CHARS_PER_TOKEN, COMPACT_NOTE_MAX_CHARS, CONTEXT_RESERVE_TOKENS, EARLIER_TURNS_BUDGET_PERCENT,
     EARLIER_TURNS_HEADING, KEEP_RECENT_MESSAGES, MAX_EARLIER_TURN_CHARS, MAX_OUTPUT_TOKENS,
@@ -333,6 +334,18 @@ fn truncate_message(mut message: ChatMessage, max_chars: usize) -> ChatMessage {
     message
 }
 
+/// The context use of a prompt of `prompt_chars` characters in a window of
+/// `num_ctx` tokens; compaction starts at [`max_prompt_chars`].
+pub(crate) fn context_use(prompt_chars: usize, num_ctx: u64) -> ContextUse {
+    let tokens = |chars: usize| (chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
+
+    ContextUse {
+        used: tokens(prompt_chars),
+        compact_at: tokens(max_prompt_chars(num_ctx)),
+        window: num_ctx,
+    }
+}
+
 /// Estimated token count for one string.
 fn estimate_tokens(text: &str) -> u64 {
     ((text.chars().count() as f64) / CHARS_PER_TOKEN).ceil() as u64
@@ -611,5 +624,18 @@ mod tests {
             .collect();
 
         assert_eq!(labels, ["System", "User", "Assistant", "Tool"]);
+    }
+
+    #[test]
+    fn context_use_counts_the_prompt_and_the_compaction_point_in_tokens() {
+        let context = context_use(3_000, 8_192);
+
+        assert_eq!(context.window, 8_192);
+        assert_eq!(context.used, (3_000.0 / CHARS_PER_TOKEN).ceil() as u64);
+        assert!(
+            context.compact_at < context.window,
+            "room is left for the reply"
+        );
+        assert!(context.used < context.compact_at);
     }
 }

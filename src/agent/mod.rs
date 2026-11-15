@@ -52,11 +52,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
-pub(crate) use context::{compact_context, earlier_turns_section, max_output_tokens};
+pub(crate) use context::{compact_context, context_use, earlier_turns_section, max_output_tokens};
 pub(crate) use native::tools_schema;
 pub use reporter::{
-    AgentEvent, LoopKind, Reporter, StdoutReporter, TextKind, step_limit, step_limit_notice,
-    step_number,
+    AgentEvent, ContextUse, LoopKind, Reporter, StdoutReporter, TextKind, step_limit,
+    step_limit_notice, step_number,
 };
 pub(crate) use tool::describe_call;
 

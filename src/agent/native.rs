@@ -16,7 +16,7 @@
 //! - OpenAI function calling: <https://platform.openai.com/docs/guides/function-calling>
 //! - llama.cpp server, router mode: <https://github.com/ggml-org/llama.cpp/tree/master/tools/server>
 
-use super::context::{max_prompt_chars, truncate_chars};
+use super::context::{context_use, max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
 use super::execute::{absolute_paths, run_tool_call};
 use super::quality::{FinishGate, command_succeeded};
@@ -510,6 +510,10 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         });
         trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
         fit_to_budget(&mut self.messages, self.prompt_budget);
+
+        let prompt_chars = total_chars(&self.messages) + tools_schema().to_string().len();
+        self.reporter
+            .report(AgentEvent::Context(context_use(prompt_chars, self.num_ctx)));
 
         State::Stream
     }
@@ -1527,6 +1531,54 @@ mod tests {
         assert_eq!(requests.len(), 46);
         assert!(output.contains("── step 46 ──"));
         assert!(!output.contains("Reached max steps"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_step_reports_how_full_the_context_is() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-context");
+        let config = test_config(&root, 3);
+        let arguments = json!({ "path": "missing.rs" });
+        let url = serve_replies(vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "read_file", &arguments)]),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ])
+        .await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "read it",
+            None,
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let reported: Vec<crate::agent::ContextUse> = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Context(context) => Some(*context),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported.len(), 2, "one report per step");
+        assert!(
+            reported[1].used > reported[0].used,
+            "the tool result adds to the prompt"
+        );
+        assert!(
+            reported
+                .iter()
+                .all(|context| context.used < context.compact_at)
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

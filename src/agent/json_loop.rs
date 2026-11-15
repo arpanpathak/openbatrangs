@@ -23,8 +23,8 @@ use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
 use super::{
     AgentConfig, AgentEvent, Confirmer, HistorySink, LoopKind, Reporter, RunContinuation,
-    compact_context, earlier_turns_section, effective_context, ensure_workspace_exists,
-    max_output_tokens,
+    compact_context, context_use, earlier_turns_section, effective_context,
+    ensure_workspace_exists, max_output_tokens,
 };
 use crate::constants::agent::{
     INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
@@ -279,6 +279,14 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
         // newest tool exchange verbatim; older tool calls/output are rolled into a
         // short note so the prompt always fits the safe per-device `num_ctx`.
         compact_context(&mut self.messages, self.num_ctx);
+
+        let prompt_chars = self
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        self.reporter
+            .report(AgentEvent::Context(context_use(prompt_chars, self.num_ctx)));
 
         State::Stream
     }
@@ -658,6 +666,36 @@ mod tests {
 
         std::fs::remove_dir_all(root)?;
         Ok((reporter.output, result))
+    }
+
+    #[tokio::test]
+    async fn the_json_loop_reports_how_full_the_context_is() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-json-context");
+        let url = serve_replies(vec![Reply::ollama_stream(r#"{"answer":"done"}"#)]).await?;
+        let client = OllamaClient::new(&url)?;
+        let config = test_config(&root, 2);
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_json_agent(
+            &config,
+            &client,
+            "m",
+            "hi",
+            None,
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        let context = reporter.events.iter().find_map(|event| match event {
+            AgentEvent::Context(context) => Some(*context),
+            _ => None,
+        });
+        assert!(context.is_some_and(|context| context.used > 0 && context.window > 0));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     /// A chat message with `role` and `content`.
