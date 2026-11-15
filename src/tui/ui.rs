@@ -109,15 +109,10 @@ fn layout_chunks(area: Rect, app: &App, panel_rows: u16) -> Vec<Rect> {
         .to_vec()
 }
 
-/// The panel's lines: the model line with the generation speed, the context
-/// line once an agent step has reported it, then the stats table while the
-/// stats are on screen.
+/// The panel's lines: the model line, the context line once an agent step
+/// has reported it, then the stats table while the stats are on screen.
 fn panel_lines(app: &App, perf_on_screen: bool) -> Vec<Line<'static>> {
-    let model = format!(
-        "{} · speed: {:>5.1} tok/s",
-        app.model_info_line(),
-        app.tokens_per_sec
-    );
+    let model = app.model_info_line();
     let table = match perf_on_screen {
         true => app.stats_table().lines(),
         false => Vec::new(),

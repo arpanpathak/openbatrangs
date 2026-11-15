@@ -532,22 +532,21 @@ impl App {
         self.modal = self.waiting_update.take().map(ActiveModal::Confirm);
     }
 
-    /// Build a one-line summary of the current model, mode, and server for the banner.
-    ///
-    /// # Returns
-    ///
-    /// A formatted string like `"model: qwen2.5-coder:7b · 7.6 GB · agent · server http://localhost:11434"`.
+    /// The panel's model line: the model, the mode, the generation speed and
+    /// the server, such as `model: qwen2.5-coder:7b · size: 4.7 GB · mode:
+    /// agent · speed:  42.0 tok/s · server: http://localhost:11434`. The server
+    /// comes last, so a narrow screen cuts its address, not the speed.
     pub(super) fn model_info_line(&self) -> String {
         let mode = mode_name(self.run_config.mode);
+        let model = self
+            .model_info
+            .clone()
+            .unwrap_or_else(|| format!("model: {}", self.model.as_deref().unwrap_or("auto")));
 
-        match &self.model_info {
-            Some(info) => format!("{info} · mode: {mode} · server: {}", self.server_url),
-            None => format!(
-                "model: {} · mode: {mode} · server: {}",
-                self.model.as_deref().unwrap_or("auto"),
-                self.server_url
-            ),
-        }
+        format!(
+            "{model} · mode: {mode} · speed: {:>5.1} tok/s · server: {}",
+            self.tokens_per_sec, self.server_url
+        )
     }
 
     /// Re-query the server for the current model's metadata and update
@@ -3005,7 +3004,7 @@ mod tests {
 
         assert_eq!(
             app.model_info_line(),
-            "model: chosen · mode: agent · server: http://thor:11434"
+            "model: chosen · mode: agent · speed:   0.0 tok/s · server: http://thor:11434"
         );
 
         Ok(())
