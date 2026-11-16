@@ -19,9 +19,10 @@
 use super::Question;
 use super::context::{context_use, max_prompt_chars, truncate_chars};
 use super::environment::{environment_facts, project_has_build_manifest};
-use super::execute::{absolute_paths, run_tool_call};
+use super::execute::{absolute_paths, command_sandbox, run_tool_call};
 use super::file_log::FileLog;
 use super::gemma_call::{has_raw_call_marker, parse_gemma_call};
+use super::project_checks::ProjectChecks;
 use super::quality::{FinishGate, command_succeeded};
 use super::repeats::RepeatGuard;
 use super::research::task_with_documentation;
@@ -492,6 +493,8 @@ struct Run<'a, R, C> {
     files: FileLog,
     /// Gate that rejects a finish before changed files are checked.
     finish_gate: FinishGate,
+    /// The workspace's own checks, run when the model finishes.
+    project_checks: ProjectChecks,
     /// Stops a model that repeats the same tool call.
     repeat_guard: RepeatGuard,
     /// Sink receiving conversation snapshots, so an interrupted run can resume.
@@ -519,8 +522,8 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
                 State::Cut => self.cut_turn(),
                 State::Runaway => self.runaway_turn(),
                 State::BrokenCall => self.broken_call(),
-                State::Answer(text) => self.answer(&text),
-                State::Finish(summary) => self.finish(&summary),
+                State::Answer(text) => self.answer(&text).await,
+                State::Finish(summary) => self.finish(&summary).await,
                 State::AskUser(question) => self.ask_user(question),
                 State::GiveUp => self.give_up(),
                 State::Done => return Ok(()),
@@ -665,7 +668,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// End the run with the reply text, unless the finish gate rejects it; a
     /// rejected answer stays in the conversation with the feedback after it.
-    fn answer(&mut self, text: &str) -> State {
+    async fn answer(&mut self, text: &str) -> State {
         let answer = text.trim();
         self.empty_retries = 0;
         self.cut_retries = 0;
@@ -678,11 +681,11 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             calls: Vec::new(),
         });
 
-        let Some(feedback) = self.finish_feedback() else {
+        let Some(feedback) = self.finish_feedback().await else {
             return self.report_done(answer, true);
         };
 
-        self.reject_finish(feedback)
+        self.reject_finish(&feedback)
     }
 
     /// Run every tool call of the turn, then finish, ask the user, or take
@@ -706,12 +709,12 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
     }
 
     /// End the run with the `finish` summary, unless the finish gate rejects it.
-    fn finish(&mut self, summary: &str) -> State {
-        let Some(feedback) = self.finish_feedback() else {
+    async fn finish(&mut self, summary: &str) -> State {
+        let Some(feedback) = self.finish_feedback().await else {
             return self.report_done(summary, false);
         };
 
-        self.reject_finish(feedback)
+        self.reject_finish(&feedback)
     }
 
     /// Show the question and end the run; the user's answer resumes it.
@@ -836,10 +839,21 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         });
     }
 
-    /// The finish gate's feedback when a finish now would be premature;
-    /// `None` when the finish may pass.
-    fn finish_feedback(&mut self) -> Option<&'static str> {
-        self.finish_gate.reject_finish(self.needs_check)
+    /// The feedback when a finish now would be premature: the finish gate's,
+    /// or the workspace's own checks when the run changed files; `None` when
+    /// the finish may pass.
+    async fn finish_feedback(&mut self) -> Option<String> {
+        if let Some(feedback) = self.finish_gate.reject_finish(self.needs_check) {
+            return Some(feedback.to_string());
+        }
+
+        if self.files.changed.is_empty() {
+            return None;
+        }
+
+        self.project_checks
+            .feedback(&self.config.cwd, command_sandbox(self.config))
+            .await
     }
 
     /// Appends `message` to both the model-facing history and the untrimmed
@@ -948,6 +962,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         messages,
         files,
         finish_gate,
+        project_checks: ProjectChecks::load(&config.cwd),
         repeat_guard: RepeatGuard::default(),
         sink,
         transcript,
@@ -2457,6 +2472,33 @@ mod tests {
         assert!(output.contains("🔧 write_file → a.txt"));
         assert!(output.contains("✅ wrote it"));
         assert_eq!(std::fs::read_to_string(root.join("a.txt"))?, "hello");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_project_check_sends_the_model_back_to_work() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-checks");
+        std::fs::create_dir_all(root.join(".openbatrangs"))?;
+        std::fs::write(root.join(".openbatrangs/checks"), "test -f tests.txt\n")?;
+        let write = |path: &str| json!({"path": path, "content": "done"});
+        let finish = json!({"summary": "done"});
+        let replies = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "write_file", &write("code.txt"))]),
+            Reply::openai_stream(&[tool_call_delta("c2", "finish", &finish)]),
+            Reply::openai_stream(&[tool_call_delta("c3", "write_file", &write("tests.txt"))]),
+            Reply::openai_stream(&[tool_call_delta("c4", "finish", &finish)]),
+        ];
+
+        let config = test_config(&root, 6);
+        let (requests, output) = requests_of_run(&config, "m", "write the code", replies).await?;
+
+        assert_eq!(requests.len(), 4, "the second finish passes");
+        assert!(requests[2].contains("The project's checks failed"));
+        assert!(requests[2].contains("$ test -f tests.txt"));
+        assert!(output.contains("Finish rejected"));
+        assert!(output.contains("✅ done"));
 
         std::fs::remove_dir_all(root)?;
         Ok(())

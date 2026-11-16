@@ -263,7 +263,7 @@ async fn run_command<C: Confirmer>(
 
 /// The sandbox commands run in: the one this machine supports, or none
 /// when `--no-sandbox` turned it off.
-fn command_sandbox(config: &AgentConfig) -> Sandbox {
+pub(super) fn command_sandbox(config: &AgentConfig) -> Sandbox {
     if !config.use_sandbox {
         return Sandbox::Off;
     }

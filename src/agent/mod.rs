@@ -39,6 +39,7 @@ mod file_log;
 mod gemma_call;
 mod json_loop;
 mod native;
+mod project_checks;
 mod quality;
 mod repeats;
 mod reporter;
