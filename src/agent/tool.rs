@@ -81,6 +81,13 @@ pub(super) enum Tool {
         /// Full file contents.
         content: String,
     },
+    /// Add text to the end of a file, for a file too long for one reply.
+    AppendFile {
+        /// Relative file path inside the workspace.
+        path: String,
+        /// Text to add.
+        content: String,
+    },
     /// Replace a literal string inside an existing file.
     EditFile {
         /// Relative file path inside the workspace.
@@ -153,6 +160,7 @@ impl Tool {
             Self::WebSearch { query } => format!("web_search → {query}"),
             Self::WebRead { url } => format!("web_read → {url}"),
             Self::WriteFile { path, .. } => format!("write_file → {path}"),
+            Self::AppendFile { path, .. } => format!("append_file → {path}"),
             Self::EditFile { path, .. } => format!("edit_file → {path}"),
             Self::RunCommand { command } => format!("run_command → {command}"),
             Self::Finish { .. } => "finish".to_string(),
@@ -165,13 +173,14 @@ impl Tool {
 type ToolParser = fn(&Value) -> Result<Tool>;
 
 /// The parser for each tool name the model may call.
-const TOOL_PARSERS: [(&str, ToolParser); 10] = [
+const TOOL_PARSERS: [(&str, ToolParser); 11] = [
     ("list_files", list_files_tool),
     ("read_file", read_file_tool),
     ("grep_files", grep_files_tool),
     ("web_search", web_search_tool),
     ("web_read", web_read_tool),
     ("write_file", write_file_tool),
+    ("append_file", append_file_tool),
     ("edit_file", edit_file_tool),
     ("run_command", run_command_tool),
     ("finish", finish_tool),
@@ -230,6 +239,14 @@ fn write_file_tool(args: &Value) -> Result<Tool> {
     Ok(Tool::WriteFile {
         path: required_path_arg(args, "write_file")?.to_string(),
         content: required_string_arg(args, "content", "write_file")?.to_string(),
+    })
+}
+
+/// `append_file`: a required path and the text to add.
+fn append_file_tool(args: &Value) -> Result<Tool> {
+    Ok(Tool::AppendFile {
+        path: required_path_arg(args, "append_file")?.to_string(),
+        content: required_string_arg(args, "content", "append_file")?.to_string(),
     })
 }
 
@@ -574,6 +591,11 @@ mod tests {
                 "write_file",
                 json!({"path": "a", "content": ""}),
                 "write_file → a",
+            ),
+            (
+                "append_file",
+                json!({"path": "a", "content": "more"}),
+                "append_file → a",
             ),
             (
                 "edit_file",

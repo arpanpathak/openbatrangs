@@ -19,6 +19,7 @@ use crate::constants::tools::{
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
@@ -311,6 +312,33 @@ fn continuation(text: &str, last: usize, total: usize) -> String {
     )
 }
 
+/// Add `content` to the end of a file, creating it and its parent
+/// directories when it does not exist yet. A long file is written in parts
+/// this way when one reply cannot hold all of it.
+///
+/// # Returns
+/// A confirmation string with the absolute path, the bytes added and the
+/// file's new size.
+pub(crate) fn append_file(root: &Path, path: &str, content: &str) -> Result<String> {
+    let file = resolve_in_root(root, path)?;
+    let file = write_target(root, file)?;
+
+    let mut opened = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+        .with_context(|| format!("failed to open {}", file.display()))?;
+    opened
+        .write_all(content.as_bytes())
+        .with_context(|| format!("failed to append to {}", file.display()))?;
+    let size = opened.metadata()?.len();
+
+    Ok(format!(
+        "✅ appended {} bytes to {path} ({size} bytes now)",
+        content.len()
+    ))
+}
+
 /// Write (or overwrite) a file, creating parent directories as needed.
 ///
 /// # Arguments
@@ -419,7 +447,10 @@ fn editable_file(root: &Path, path: &str) -> Result<PathBuf> {
 /// An error when `old_string` is empty, which would match everywhere.
 fn refuse_empty_old_string(old_string: &str) -> Result<()> {
     if old_string.is_empty() {
-        bail!("old_string must not be empty; use write_file to create or rewrite a file");
+        bail!(
+            "old_string must not be empty: copy the lines to change from read_file; use \
+             write_file only to create a new file"
+        );
     }
 
     Ok(())
@@ -901,6 +932,29 @@ mod tests {
         let root = temp_dir();
 
         assert!(read_file(&root, "nope.rs", LineRange::default(), 100).is_err());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn append_file_creates_a_file_then_adds_to_its_end() -> Result<()> {
+        let root = temp_dir();
+
+        let created = append_file(&root, "docs/ch1.md", "# Part 1\n")?;
+        let appended = append_file(&root, "docs/ch1.md", "# Part 2\n")?;
+
+        assert!(created.contains("appended 9 bytes") && created.contains("(9 bytes now)"));
+        assert!(appended.contains("(18 bytes now)"));
+        assert_eq!(
+            fs::read_to_string(root.join("docs/ch1.md"))?,
+            "# Part 1\n# Part 2\n"
+        );
+        assert!(append_file(&root, "../outside.md", "x").is_err());
+        assert!(
+            append_file(&root, "docs", "x").is_err(),
+            "a directory cannot be opened"
+        );
 
         fs::remove_dir_all(root)?;
         Ok(())

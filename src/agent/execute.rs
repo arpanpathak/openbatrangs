@@ -27,7 +27,7 @@ use super::quality::command_succeeded;
 use super::quality::placeholder_reason;
 use super::summary::result_summary;
 use super::tool::Tool;
-use crate::constants::agent::COMMAND_TIMEOUT_SECONDS;
+use crate::constants::agent::{COMMAND_TIMEOUT_SECONDS, MAX_OVERWRITE_LINES};
 use crate::constants::ansi::ANSI_GREEN_CHECK;
 use crate::constants::tools::{
     DEFAULT_LIST_DEPTH, DESTRUCTIVE_COMMAND_PATTERNS, MAX_TOOL_OUTPUT, UNSANDBOXED_COMMAND_WARNING,
@@ -121,6 +121,9 @@ pub(super) async fn execute_tool<C: Confirmer>(
         Tool::WriteFile { path, content } => {
             write_file(config, cwd, path, content, files, confirmer).await
         }
+        Tool::AppendFile { path, content } => {
+            append_file(config, cwd, path, content, files, confirmer).await
+        }
         Tool::EditFile {
             path,
             old_string,
@@ -186,9 +189,32 @@ async fn write_file<C: Confirmer>(
     ensure_not_read_only(config)?;
     ensure_not_placeholder(path, content)?;
     files.ensure_known(cwd, path)?;
+    ensure_not_long_overwrite(cwd, path)?;
     confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
 
     let result = tools::write_file(cwd, path, content)?;
+    files.wrote(cwd, path);
+
+    Ok(result)
+}
+
+/// Add `content` to the end of `path` after the read-only, placeholder,
+/// known-file and confirmation checks, and record the path as changed. The
+/// file must be one the run wrote or read, or a new one.
+async fn append_file<C: Confirmer>(
+    config: &AgentConfig,
+    cwd: &Path,
+    path: &str,
+    content: &str,
+    files: &mut FileLog,
+    confirmer: &mut C,
+) -> Result<String> {
+    ensure_not_read_only(config)?;
+    ensure_not_placeholder(path, content)?;
+    files.ensure_known(cwd, path)?;
+    confirm_or_abort(config, confirmer, &format!("append to file '{path}'?")).await?;
+
+    let result = tools::append_file(cwd, path, content)?;
     files.wrote(cwd, path);
 
     Ok(result)
@@ -311,6 +337,20 @@ fn ensure_not_read_only(config: &AgentConfig) -> Result<()> {
     ensure!(
         !config.is_read_only,
         "this tool is disabled in read-only mode"
+    );
+
+    Ok(())
+}
+
+/// Bail if `path` is an existing file longer than [`MAX_OVERWRITE_LINES`]:
+/// rewriting it whole loses the parts the model does not repeat.
+fn ensure_not_long_overwrite(cwd: &Path, path: &str) -> Result<()> {
+    let lines = std::fs::read_to_string(cwd.join(path)).map_or(0, |text| text.lines().count());
+
+    ensure!(
+        lines <= MAX_OVERWRITE_LINES,
+        "{path} already has {lines} lines, so write_file will not overwrite it: change it with \
+         edit_file, one edit per change, or write the new version to a new file"
     );
 
     Ok(())
@@ -441,6 +481,53 @@ mod tests {
 
         assert!(!link.contains("\x1b]8;;http://evil"));
         assert!(link.contains("file.txt"));
+    }
+
+    #[tokio::test]
+    async fn append_file_adds_to_a_known_file_and_refuses_an_unread_one() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
+        let mut files = FileLog::default();
+        let mut confirmer = FixedConfirmer::new(true);
+        std::fs::write(root.join("old.md"), "unread\n")?;
+        let append = |path: &str, content: &str| Tool::AppendFile {
+            path: path.to_string(),
+            content: content.to_string(),
+        };
+
+        let refused = run(
+            &config,
+            append("old.md", "more\n"),
+            &mut files,
+            &mut confirmer,
+        )
+        .await;
+        assert!(format!("{refused:?}").contains("read it with read_file"));
+
+        run(
+            &config,
+            append("new.md", "part 1\n"),
+            &mut files,
+            &mut confirmer,
+        )
+        .await?;
+        let added = run(
+            &config,
+            append("new.md", "part 2\n"),
+            &mut files,
+            &mut confirmer,
+        )
+        .await?;
+
+        assert_eq!(added, "✅ appended 7 bytes to new.md (14 bytes now)");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.md"))?,
+            "part 1\npart 2\n"
+        );
+        assert_eq!(files.changed, vec!["new.md", "new.md"]);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -668,6 +755,38 @@ mod tests {
         .await;
         assert!(passing.success);
         assert_eq!(passing.summary, "exit 0");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_file_will_not_overwrite_a_long_file_it_has_read() -> Result<()> {
+        let root = temp_root();
+        let config = test_config(&root, 1);
+        let mut files = FileLog::default();
+        let mut confirmer = FixedConfirmer::new(true);
+        let chapter: String = (1..=600).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(root.join("chapter.md"), &chapter)?;
+        std::fs::write(root.join("short.md"), "one\ntwo\n")?;
+        files.saw(&root, "chapter.md");
+        files.saw(&root, "short.md");
+        let write = |path: &str| Tool::WriteFile {
+            path: path.to_string(),
+            content: "# Shorter\n".to_string(),
+        };
+
+        let refused = run(&config, write("chapter.md"), &mut files, &mut confirmer).await;
+        run(&config, write("short.md"), &mut files, &mut confirmer).await?;
+
+        let prompt_rule = format!("files longer than {MAX_OVERWRITE_LINES} lines are refused");
+        assert!(crate::constants::agent::NATIVE_SYSTEM_PROMPT.contains(&prompt_rule));
+        assert!(format!("{refused:?}").contains("already has 600 lines"));
+        assert_eq!(std::fs::read_to_string(root.join("chapter.md"))?, chapter);
+        assert_eq!(
+            std::fs::read_to_string(root.join("short.md"))?,
+            "# Shorter\n"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())

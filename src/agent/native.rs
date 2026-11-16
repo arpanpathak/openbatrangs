@@ -556,7 +556,10 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
 
     /// Stream the model's reply; a reply with tool calls runs them.
     async fn stream(&mut self) -> Result<State> {
-        let mut body = request_body(self.model, &self.messages, self.num_ctx, self.think);
+        // After a reply cut off at the output limit, the retry spends the
+        // whole budget on the answer instead of thinking first.
+        let think = self.think && self.cut_retries == 0;
+        let mut body = request_body(self.model, &self.messages, self.num_ctx, think);
         Sampling::for_model(self.model, self.config.temperature).write_to(&mut body);
 
         let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
@@ -1061,7 +1064,10 @@ fn add_once(files: &mut Vec<String>, path: String) {
 
 /// The file an invocation writes, when it is a `write_file` or `edit_file` call.
 fn written_path(call: &Invocation) -> Option<String> {
-    let is_file_writer = matches!(call.name.as_str(), "write_file" | "edit_file");
+    let is_file_writer = matches!(
+        call.name.as_str(),
+        "write_file" | "append_file" | "edit_file"
+    );
 
     if !is_file_writer {
         return None;
@@ -1467,12 +1473,27 @@ pub(crate) fn tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create a new file, or overwrite a file you have read in this run and that has not changed since. Parent directories are created as needed.",
+                "description": "Create a new file. To change an existing file use edit_file instead. Write a file longer than about 200 lines in parts: the first part here, then each next part with append_file. Overwriting is allowed only for a file you have read in this run and that has not changed since. Parent directories are created as needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "File path relative to the workspace root." },
                         "content": { "type": "string", "description": "Complete file contents." }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "append_file",
+                "description": "Add text to the end of a file you created or read in this run. Write a long file in parts: write_file with the first part, then append_file with each next part.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to the workspace root." },
+                        "content": { "type": "string", "description": "Text to add at the end of the file." }
                     },
                     "required": ["path", "content"]
                 }
@@ -1714,6 +1735,11 @@ mod tests {
             "the cut-off reply is not sent back"
         );
         assert!(output.contains("cut off; asking for smaller parts"));
+        assert!(requests[0].contains(r#""enable_thinking":true"#));
+        assert!(
+            requests[1].contains(r#""enable_thinking":false"#),
+            "the retry spends its budget on the answer"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
