@@ -39,8 +39,14 @@ pub const API_CHAT_PATH: &str = "/api/chat";
 /// API path for pulling a model from the Ollama registry (`POST /api/pull`).
 pub const API_PULL_PATH: &str = "/api/pull";
 
-/// Gemma's channel markers. Gemma wraps its reasoning in `<|channel>thought` and
-/// `<channel|>`, and some servers pass the markers through in the reply text
-/// when they do not split the reasoning out. Each marker is one token, so it
-/// always arrives whole inside a single streamed delta.
-pub const GEMMA_CHANNEL_MARKERS: [&str; 3] = ["<|channel>thought", "<|channel>", "<channel|>"];
+/// The token that opens one of Gemma's channels. The channel name follows
+/// it as ordinary text, which a server may stream in a delta of its own.
+pub const GEMMA_CHANNEL_START: &str = "<|channel>";
+/// The token that closes a Gemma channel; the reply follows it.
+pub const GEMMA_CHANNEL_END: &str = "<channel|>";
+/// The name of the channel Gemma reasons in.
+pub const GEMMA_THOUGHT_CHANNEL: &str = "thought";
+/// Gemma's channel markers, removed from reasoning text when a server
+/// passes them through there.
+pub const GEMMA_CHANNEL_MARKERS: [&str; 3] =
+    ["<|channel>thought", GEMMA_CHANNEL_START, GEMMA_CHANNEL_END];

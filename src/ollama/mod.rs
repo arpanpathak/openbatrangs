@@ -18,6 +18,7 @@
 //! - `reqwest` streaming responses: <https://docs.rs/reqwest/latest/reqwest/struct.Response.html#method.bytes_stream>
 //! - NDJSON (newline-delimited JSON): <https://ndjson.org/>
 
+mod gemma_channel;
 mod openai;
 mod reader;
 mod stream;
@@ -342,7 +343,9 @@ impl OllamaClient {
             .with_context(|| format!("failed to call {url}"))?;
         let response = require_success_with_body(response, &url).await?;
 
-        Ok(reader::delta_stream(response, openai::drain_events))
+        let deltas = reader::delta_stream(response, openai::drain_events);
+
+        Ok(gemma_channel::split_thought_channel(deltas))
     }
 
     /// Download a model from the Ollama registry.
@@ -915,6 +918,40 @@ mod tests {
             vec![
                 Delta::Thinking("hmm".to_string()),
                 Delta::Content("hi".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openai_chat_stream_moves_gemma_thought_channel_into_thinking() -> Result<()> {
+        let base_url = spawn_mock_server(|_path| {
+            MockResponse::json(
+                "200 OK",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"<|channel>\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"thought\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"\\nWrite lib.rs.\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"<channel|>\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            )
+        })
+        .await;
+        let client = OllamaClient::openai(&base_url, None, true)?;
+
+        let parts: Vec<Delta> = client
+            .chat_stream(sample_request())
+            .await?
+            .try_collect()
+            .await?;
+
+        assert_eq!(
+            parts,
+            vec![
+                Delta::Thinking("\nWrite lib.rs.".to_string()),
+                Delta::Content("Done.".to_string())
             ]
         );
         Ok(())
