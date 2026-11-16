@@ -11,7 +11,7 @@ use super::worker::{forward_job_events, send_event};
 use super::{
     ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
-use crate::agent::{AgentEvent, ContextUse, Question, TextKind, describe_call};
+use crate::agent::{AgentEvent, ContextUse, Question, SeenFiles, TextKind, describe_call};
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
@@ -298,6 +298,10 @@ pub(super) struct App {
     /// Last conversation snapshot from the native agent loop, kept so an
     /// interrupted run resumes with its context instead of starting over.
     pub(super) agent_conversation: Option<Vec<Value>>,
+    /// The version of each file the session's agent runs have read or
+    /// written, shared with every run so a file read in an earlier task
+    /// stays known while it is unchanged on disk.
+    pub(super) seen_files: SeenFiles,
 
     /// Runtime configuration for the agent loop (mode, limits, safety flags).
     pub(super) run_config: AgentRunConfig,
@@ -394,6 +398,7 @@ impl App {
             current_prompt: None,
             interrupted_task: None,
             agent_conversation: None,
+            seen_files: SeenFiles::default(),
             run_config: AgentRunConfig {
                 cwd: cli.cwd.clone(),
                 max_steps: cli.max_steps,
@@ -630,6 +635,7 @@ impl App {
         let prior = WorkerHistory {
             chat: self.chat_history.clone(),
             resume,
+            seen_files: self.seen_files.clone(),
         };
         let prefs = ModelPrefs {
             model: self.model.clone(),

@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 
 pub use confirm::{Confirmer, StdioConfirmer};
 pub(crate) use context::{compact_context, context_use, earlier_turns_section, max_output_tokens};
+pub use file_log::SeenFiles;
 pub(crate) use native::tools_schema;
 pub use reporter::{
     AgentEvent, ContextUse, LoopKind, Reporter, StdoutReporter, TextKind, step_limit,
@@ -78,8 +79,9 @@ pub trait HistorySink: Send {
 }
 
 /// What a run knows from earlier in the session: the interrupted run it
-/// continues, the earlier tasks and answers, and the sink that keeps the
-/// TUI's resume copy up to date for the next interrupt.
+/// continues, the earlier tasks and answers, the files the session has
+/// read, and the sink that keeps the TUI's resume copy up to date for the
+/// next interrupt.
 ///
 /// Bundling them keeps [`run_agent`]'s signature small.
 #[derive(Default)]
@@ -90,6 +92,10 @@ pub struct RunContinuation<'a> {
     /// Earlier tasks and answers of this session, oldest first. A fresh run
     /// puts them in its first message, so the model knows what was said.
     pub earlier: Vec<ChatMessage>,
+    /// The version of each file the session's runs have read or written, so
+    /// `write_file` and `edit_file` accept a file an earlier run read when
+    /// it has not changed since.
+    pub seen_files: SeenFiles,
     /// Sink receiving conversation snapshots; `None` in one-shot mode.
     pub sink: Option<&'a mut dyn HistorySink>,
     /// Receives the untrimmed conversation once, when the run ends. Used by

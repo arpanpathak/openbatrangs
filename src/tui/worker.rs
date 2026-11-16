@@ -1,8 +1,8 @@
 //! Background agent/chat workers for the TUI.
 
 use crate::agent::{
-    AgentConfig, AgentEvent, Confirmer, HistorySink, Reporter, RunContinuation, TextKind,
-    compact_context, effective_context, max_output_tokens, run_agent,
+    AgentConfig, AgentEvent, Confirmer, HistorySink, Reporter, RunContinuation, SeenFiles,
+    TextKind, compact_context, effective_context, max_output_tokens, run_agent,
 };
 use crate::cli::{AgentMode, AgentRunConfig, ModelPrefs};
 use crate::constants::tui::CHAT_SYSTEM_PROMPT;
@@ -151,8 +151,8 @@ impl HistorySink for ChannelHistorySink {
     }
 }
 
-/// Prior context handed to a worker: the session's turns and the agent-mode
-/// resume snapshot.
+/// Prior context handed to a worker: the session's turns, the agent-mode
+/// resume snapshot and the files the session has read.
 ///
 /// Bundling the two keeps [`run_agent_worker`]'s signature small.
 pub(crate) struct WorkerHistory {
@@ -162,6 +162,8 @@ pub(crate) struct WorkerHistory {
     pub chat: Vec<ChatMessage>,
     /// Prior agent conversation (OpenAI message shape) to resume from.
     pub resume: Option<Vec<Value>>,
+    /// The version of each file the session's runs have read or written.
+    pub seen_files: SeenFiles,
 }
 
 /// Run the agentic coding loop in the background, streaming events to the TUI.
@@ -220,6 +222,7 @@ async fn run_tool_agent(
     let continuation = RunContinuation {
         messages: prior.resume,
         earlier: earlier_turns(prior.chat),
+        seen_files: prior.seen_files,
         sink: Some(&mut history),
         transcript: None,
     };
@@ -529,6 +532,7 @@ mod tests {
         WorkerHistory {
             chat: Vec::new(),
             resume: None,
+            seen_files: SeenFiles::default(),
         }
     }
 

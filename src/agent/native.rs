@@ -898,6 +898,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
     let RunContinuation {
         messages: resume,
         earlier,
+        seen_files,
         sink,
         transcript,
     } = continuation.unwrap_or_default();
@@ -915,8 +916,9 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
     let messages = seed_messages(config, &opening, resume);
 
     // Carry the prior run's state forward so the gate does not demand a
-    // check that already passed before the interrupt.
-    let files = FileLog::with_changed(previously_changed_files(&messages));
+    // check that already passed before the interrupt, and so files read
+    // earlier in the session stay known while they are unchanged.
+    let files = FileLog::with_changed(previously_changed_files(&messages), seen_files);
     let finish_gate = gate_for_run(&messages);
 
     let mut run = Run {
@@ -1534,6 +1536,7 @@ pub(crate) fn tools_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::SeenFiles;
     use crate::agent::fakes::{
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_and_record, serve_replies,
         test_config, text_delta, thinking_delta, tool_call_delta,
@@ -2395,6 +2398,68 @@ mod tests {
         assert!(output.contains("🔧 write_file → a.txt"));
         assert!(output.contains("✅ wrote it"));
         assert_eq!(std::fs::read_to_string(root.join("a.txt"))?, "hello");
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Run a native task in `root` that knows the files in `seen_files`,
+    /// against a server that sends `replies`.
+    async fn run_knowing(root: &Path, seen_files: &SeenFiles, replies: Vec<Reply>) -> Result<()> {
+        let url = serve_replies(replies).await?;
+        let client = OllamaClient::openai(&url, None, true)?;
+        let config = test_config(root, 3);
+        let continuation = RunContinuation {
+            seen_files: seen_files.clone(),
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_native_agent(
+            &config,
+            &client,
+            "m",
+            "change notes.md",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_file_read_in_an_earlier_run_may_be_written_until_it_changes() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-seen");
+        let notes = root.join("notes.md");
+        std::fs::write(&notes, "old")?;
+        let seen_files = SeenFiles::default();
+        let read = json!({"path": "notes.md"});
+        let write = json!({"path": "notes.md", "content": "new"});
+
+        let reading = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "read_file", &read)]),
+            Reply::openai_stream(&[text_delta("read it")]),
+        ];
+        run_knowing(&root, &seen_files, reading).await?;
+
+        let writing = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "write_file", &write)]),
+            Reply::openai_stream(&[text_delta("wrote it")]),
+        ];
+        run_knowing(&root, &seen_files, writing).await?;
+        assert_eq!(std::fs::read_to_string(&notes)?, "new");
+
+        std::fs::write(&notes, "changed in the user's editor")?;
+        let overwriting = vec![
+            Reply::openai_stream(&[tool_call_delta("c1", "write_file", &write)]),
+            Reply::openai_stream(&[text_delta("wrote it")]),
+        ];
+        run_knowing(&root, &seen_files, overwriting).await?;
+        assert_eq!(
+            std::fs::read_to_string(&notes)?,
+            "changed in the user's editor"
+        );
 
         std::fs::remove_dir_all(root)?;
         Ok(())
