@@ -10,9 +10,10 @@
 //! - [`Confirmer`] shows a yes/no prompt before a write/command when confirm
 //!   mode is on.
 //!
-//! Results are also made terminal-friendly: written files become OSC 8
-//! hyperlinks and control characters are stripped so a model cannot inject
-//! escape sequences through a crafted file name.
+//! Tool results go to the model as plain text. The changed-file links of
+//! the final summary are OSC 8 hyperlinks, built by [`clickable_link`] with
+//! control characters stripped so a model cannot inject escape sequences
+//! through a crafted file name.
 //!
 //! ## References
 //!
@@ -188,7 +189,9 @@ async fn write_file<C: Confirmer>(
     confirm_or_abort(config, confirmer, &format!("write file '{path}'?")).await?;
 
     let result = tools::write_file(cwd, path, content)?;
-    Ok(record_change(cwd, path, &result, files))
+    files.wrote(cwd, path);
+
+    Ok(result)
 }
 
 /// Apply `edit` after the read-only, known-file and confirmation checks,
@@ -212,7 +215,9 @@ async fn edit_file<C: Confirmer>(
         edit.new_string,
         edit.replace_all,
     )?;
-    Ok(record_change(cwd, edit.path, &result, files))
+    files.wrote(cwd, edit.path);
+
+    Ok(result)
 }
 
 /// Run `command` in the sandbox after the read-only and approval checks.
@@ -299,14 +304,6 @@ fn is_destructive(command: &str) -> bool {
     DESTRUCTIVE_COMMAND_PATTERNS
         .iter()
         .any(|pattern| normalized.contains(pattern))
-}
-
-/// Add `path` to the changed files and return the tool result followed by a
-/// clickable link to the file.
-fn record_change(cwd: &Path, path: &str, result: &str, files: &mut FileLog) -> String {
-    files.wrote(cwd, path);
-
-    format!("{result}\n📎 {}", clickable_link(&cwd.join(path)))
 }
 
 /// Bail if the agent is in read-only mode.
@@ -434,7 +431,7 @@ mod tests {
             content: "pub fn f() {}".to_string(),
         };
         let written = run(&config, write, &mut files, &mut confirmer).await?;
-        assert!(written.contains("📎"));
+        assert_eq!(written, "✅ wrote src/lib.rs (13 bytes)");
 
         let read = Tool::ReadFile {
             path: "src/lib.rs".to_string(),
@@ -492,7 +489,8 @@ mod tests {
             max_chars: 100,
         };
         run(&config, read, &mut files, &mut confirmer).await?;
-        run(&config, edit(), &mut files, &mut confirmer).await?;
+        let edited = run(&config, edit(), &mut files, &mut confirmer).await?;
+        assert_eq!(edited, "✅ edited notes.txt (1 replacement)");
         assert_eq!(
             std::fs::read_to_string(root.join("notes.txt"))?,
             "gamma\nbeta\n"
