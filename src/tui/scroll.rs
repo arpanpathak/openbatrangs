@@ -41,13 +41,12 @@ impl App {
     /// loaded from the session file and the offset resets to the top of them.
     /// Scrolling down past the bottom loads newer blocks the same way.
     pub(super) fn scroll_chat(&mut self, delta: i32) {
-        // The highlight marks screen cells, so it would stay put while the
-        // text moves under it.
-        self.selection = None;
         self.sync_transcript_scroll();
         self.leave_follow_mode();
 
         if self.reaches_unloaded_history(delta) {
+            // Rows loaded above renumber the rows the selection names.
+            self.selection = None;
             self.transcript.load_older(BLOCK_LOAD_CHUNK);
             self.chat_scroll_offset = 0;
             return;

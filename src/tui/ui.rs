@@ -348,8 +348,7 @@ fn render_chat_area(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     render_selection(frame, app, area);
 }
 
-/// Draw the selected transcript text in reverse video and keep its text for
-/// the clipboard.
+/// Draw the selected transcript text in reverse video.
 fn render_selection(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let Some(selection) = app.selection else {
         return;
@@ -359,8 +358,9 @@ fn render_selection(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         width: chat_text_width(area.width) as u16,
         ..area
     };
+    let top = app.chat_top_row(area);
 
-    app.selected_text = selection::highlight(frame.buffer_mut(), text_area, selection);
+    selection::highlight(frame.buffer_mut(), text_area, top, selection);
 }
 
 /// Re-stick to the bottom when the user scrolls down to the latest line, but
@@ -795,7 +795,7 @@ fn input_height(app: &App, width: u16, area_height: u16) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::selection::Selection;
+    use super::super::selection::{Selection, TextPoint};
     use super::*;
     use crate::agent::AgentEvent;
     use crate::cli::Cli;
@@ -804,7 +804,6 @@ mod tests {
     use clap::Parser;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::layout::Position;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -908,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn the_selection_is_read_from_the_screen() -> anyhow::Result<()> {
+    fn the_selected_transcript_rows_are_drawn_in_reverse_video() -> anyhow::Result<()> {
         let mut app = test_app();
         app.notice("first notice".to_string());
         app.notice("second notice".to_string());
@@ -925,14 +924,28 @@ mod tests {
         let first = row_of("first notice", &screen).context("first row")?;
         let second = row_of("second notice", &screen).context("second row")?;
 
+        let top = app.chat_top_row(area);
         app.selection = Some(Selection {
-            anchor: Position::new(area.x, first),
-            cursor: Position::new(area.x + 5, second),
+            anchor: TextPoint {
+                row: top + first as usize,
+                column: 0,
+            },
+            cursor: TextPoint {
+                row: top + second as usize,
+                column: 5,
+            },
         });
-        draw(&mut app, 60, 30)?;
+        let mut terminal = Terminal::new(TestBackend::new(60, 30))?;
+        terminal.draw(|frame| super::ui(frame, &mut app))?;
+        let buffer = terminal.backend().buffer();
+        let is_reversed = |column: u16, row: u16| {
+            buffer[(area.x + column, row)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
 
-        assert!(app.selected_text.starts_with("first notice"));
-        assert!(app.selected_text.ends_with("\nsecond"));
+        assert!(is_reversed(0, first) && is_reversed(20, first));
+        assert!(is_reversed(5, second) && !is_reversed(6, second));
 
         Ok(())
     }

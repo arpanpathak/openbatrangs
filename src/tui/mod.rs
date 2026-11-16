@@ -221,6 +221,11 @@ async fn run_app<W: Write>(
     let mut app = app::App::new(cli, tegrastats_shared);
     app.server_url = client.base_url.clone();
     app.server_feed = server_poller.as_ref().map(ServerPoller::feed);
+    app.desktop_clipboard = selection::desktop_clipboard(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+        std::env::var_os("SSH_CONNECTION").is_some(),
+    );
     app.refresh_model_info(client).await;
 
     run_loop(terminal, &mut app, events, client, update_check).await
@@ -472,10 +477,12 @@ fn handle_queued_events(
     }
 }
 
-/// Advance the spinner, show an update question that waited for another
+/// Advance the spinner, scroll a drag held at the chat edge, show an update
+/// question that waited for another
 /// dialog to close, and refresh the perf panel when a sample is due.
 fn tick(app: &mut app::App) -> LoopControl {
     app.spinner_frame += 1;
+    app.scroll_at_drag_edge();
     app.open_waiting_update();
 
     if let Some(stats) = app.perf.sample_if_due(Instant::now()) {
