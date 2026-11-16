@@ -1662,6 +1662,43 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_long_run_on_a_large_window_still_sends_its_first_read() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-long-run-context");
+        let mut config = test_config(&root, 1);
+        config.max_steps = None;
+        config.model_context = 262_144;
+
+        for index in 0..60 {
+            std::fs::write(
+                root.join(format!("part-{index}.md")),
+                format!("marker-{index}"),
+            )?;
+        }
+
+        let mut replies: Vec<Reply> = (0..60)
+            .map(|index| {
+                let arguments = json!({ "path": format!("part-{index}.md") });
+                Reply::openai_stream(&[tool_call_delta(
+                    &format!("c{index}"),
+                    "read_file",
+                    &arguments,
+                )])
+            })
+            .collect();
+        replies.push(Reply::openai_stream(&[text_delta("Done.")]));
+
+        let (requests, _output) = requests_of_run(&config, "m", "read every part", replies).await?;
+        let last_request = requests.last().map(String::as_str).unwrap_or_default();
+
+        assert_eq!(requests.len(), 61);
+        assert!(last_request.contains("marker-0"));
+        assert!(last_request.contains("marker-59"));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     /// A `write_file` call for `path` whose JSON arguments stop partway
     /// through the content, as a reply cut at `max_tokens` leaves it.
     fn cut_write_delta(path: &str) -> Value {

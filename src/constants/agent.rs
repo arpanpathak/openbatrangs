@@ -50,9 +50,6 @@ pub const MAX_OVERWRITE_LINES: usize = 100;
 /// conversation may use in a new task's first message.
 pub const EARLIER_TURNS_BUDGET_PERCENT: usize = 25;
 
-/// Maximum characters kept from one earlier turn of the conversation.
-pub const MAX_EARLIER_TURN_CHARS: usize = 2_000;
-
 /// Heading of the earlier turns in a new task's first message.
 pub const EARLIER_TURNS_HEADING: &str = "Earlier in this conversation:";
 
