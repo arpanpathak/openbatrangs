@@ -348,13 +348,22 @@ async fn ask_user<C: Confirmer>(confirmer: &mut C, prompt: &str) -> Result<()> {
     Ok(())
 }
 
-/// `files` as absolute paths under `cwd`.
+/// `files` as absolute paths under `cwd`, each path once, in the order the
+/// run first changed it.
 pub(super) fn absolute_paths(cwd: &Path, files: &[String]) -> Vec<PathBuf> {
-    files
+    let paths = files
         .iter()
         .map(|file| cwd.join(file))
-        .map(|path| std::path::absolute(&path).unwrap_or(path))
-        .collect()
+        .map(|path| std::path::absolute(&path).unwrap_or(path));
+    let mut unique_paths = Vec::new();
+
+    for path in paths {
+        if !unique_paths.contains(&path) {
+            unique_paths.push(path);
+        }
+    }
+
+    unique_paths
 }
 
 /// Terminal-clickable file path (OSC 8 hyperlink). Always emits an absolute path.
@@ -401,6 +410,21 @@ mod tests {
         confirmer: &mut FixedConfirmer,
     ) -> Result<String> {
         execute_tool(config, &config.cwd, &tool, files, confirmer).await
+    }
+
+    #[test]
+    fn absolute_paths_lists_each_file_once_in_first_changed_order() {
+        let changed = ["src/lib.rs", "src/main.rs", "./src/lib.rs", "src/lib.rs"].map(String::from);
+
+        let paths = absolute_paths(Path::new("/work"), &changed);
+
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/work/src/lib.rs"),
+                PathBuf::from("/work/src/main.rs")
+            ]
+        );
     }
 
     #[test]
