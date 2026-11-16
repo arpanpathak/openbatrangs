@@ -319,18 +319,14 @@ fn continuation(text: &str, last: usize, total: usize) -> String {
 /// - `content`: full file contents.
 ///
 /// # Returns
-/// A confirmation string with the absolute path and byte count.
+/// A confirmation string with `path` as given and the byte count.
 pub(crate) fn write_file(root: &Path, path: &str, content: &str) -> Result<String> {
     let file = resolve_in_root(root, path)?;
     let file = write_target(root, file)?;
 
     fs::write(&file, content).with_context(|| format!("failed to write {}", file.display()))?;
 
-    Ok(format!(
-        "✅ wrote {} ({} bytes)",
-        file.display(),
-        content.len()
-    ))
+    Ok(format!("✅ wrote {path} ({} bytes)", content.len()))
 }
 
 /// The path a write goes to: inside the canonical parent directory, which is
@@ -857,7 +853,7 @@ mod tests {
 
         let confirmation = write_file(&root, "src/deep/lib.rs", "pub fn f() {}")?;
 
-        assert!(confirmation.contains("lib.rs"));
+        assert_eq!(confirmation, "✅ wrote src/deep/lib.rs (13 bytes)");
         assert!(root.join("src/deep/lib.rs").exists());
 
         fs::remove_dir_all(root)?;
