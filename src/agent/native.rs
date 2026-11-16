@@ -33,8 +33,8 @@ use super::{
 };
 use crate::constants::agent::{
     BROKEN_CALL_NOTE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
-    MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS,
-    NATIVE_SYSTEM_PROMPT, RUNAWAY_NOTE,
+    MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS, NATIVE_SYSTEM_PROMPT,
+    RUNAWAY_NOTE,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use crate::sampling::Sampling;
@@ -544,7 +544,6 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             model: self.model.to_string(),
             loop_kind: LoopKind::Native,
         });
-        trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
         fit_to_budget(&mut self.messages, self.prompt_budget);
 
         let prompt_chars = total_chars(&self.messages) + tools_schema().to_string().len();
@@ -1256,43 +1255,6 @@ async fn collect_turn<R: Reporter>(
     }
 
     Ok(printer.finish(reporter))
-}
-
-/// Drop the oldest turns whole, keeping the system prompt, the initial task,
-/// and as many complete recent turns as fit in `max` messages.
-///
-/// A turn is an assistant message plus its tool results (and any injected
-/// user feedback). Cutting inside a turn would either strand tool results
-/// without their call or leave an assistant tool call without its results —
-/// both shapes the server rejects — so turns are always dropped as a unit.
-/// With `max` below 2 the messages are left as they are.
-fn trim_messages(messages: &mut Vec<Message>, max: usize) {
-    let Some(room) = max.checked_sub(2) else {
-        return;
-    };
-
-    trim_to_room(messages, room);
-}
-
-/// Keep the system prompt, the task, and at most `room` recent messages.
-fn trim_to_room(messages: &mut Vec<Message>, room: usize) {
-    if messages.len() <= room + 2 {
-        return;
-    }
-
-    let mut recent = messages.split_off(2);
-    drop_oldest_turns(&mut recent, room);
-    drop_orphan_results(&mut recent);
-
-    messages.append(&mut recent);
-}
-
-/// Drop whole turns from the front until at most `room` messages are left.
-fn drop_oldest_turns(messages: &mut Vec<Message>, room: usize) {
-    while messages.len() > room {
-        let turn_length = first_turn_length(messages);
-        messages.drain(..turn_length);
-    }
 }
 
 /// Length of the first turn: its first message and the tool results after it.
@@ -2042,84 +2004,40 @@ mod tests {
     }
 
     #[test]
-    fn trim_keeps_system_and_task_and_drops_orphan_results() {
+    fn a_long_conversation_within_the_budget_keeps_every_turn() {
         let mut messages = opening();
 
-        for index in 0..30 {
+        for index in 0..60 {
             messages.push(assistant_call(&format!("c{index}")));
             messages.push(tool_result(&format!("c{index}")));
         }
 
-        trim_messages(&mut messages, 6);
+        fit_to_budget(&mut messages, prompt_budget(262_144));
 
-        assert!(matches!(messages[0], Message::System(_)));
-        assert!(matches!(messages[1], Message::User(_)));
-        assert!(matches!(messages[2], Message::Assistant { .. }));
-        assert!(messages.len() <= 6);
+        assert_eq!(messages.len(), 122);
     }
 
     #[test]
-    fn trim_leaves_messages_alone_below_a_limit_of_two() {
+    fn the_budget_drops_whole_turns_and_orphan_results() {
         let mut messages = opening();
-        messages.push(assistant_call("c1"));
-
-        trim_messages(&mut messages, 1);
-
-        assert_eq!(messages.len(), 3);
-    }
-
-    #[test]
-    fn trims_whole_turns_without_splitting_a_call_from_its_result() {
-        let mut messages = opening();
-        messages.extend([
-            assistant_call("c1"),
-            tool_result("c1"),
-            tool_result("c1b"),
-            assistant_call("c2"),
-            tool_result("c2"),
-        ]);
-
-        trim_messages(&mut messages, 4);
-
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(messages[0], Message::System(_)));
-        assert!(matches!(messages[1], Message::User(_)));
-        assert_eq!(
-            messages[2].calls().map(|calls| calls[0].id.as_str()),
-            Some("c2")
-        );
-        assert!(messages[3].is_tool_result());
-    }
-
-    #[test]
-    fn trims_never_leave_a_call_without_its_results() {
-        let mut messages = opening();
+        messages.push(tool_result("lost"));
 
         for index in 0..6 {
             messages.push(assistant_call(&format!("c{index}")));
             messages.push(tool_result(&format!("c{index}")));
+            messages.push(tool_result(&format!("c{index}b")));
         }
 
-        trim_messages(&mut messages, 4);
+        let budget = total_chars(&messages[..2]) + total_chars(&messages[messages.len() - 3..]);
+        fit_to_budget(&mut messages, budget);
 
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
         assert_eq!(
             messages[2].calls().map(|calls| calls[0].id.as_str()),
             Some("c5")
         );
         assert!(messages[3].is_tool_result());
-    }
-
-    #[test]
-    fn trims_strip_orphan_tool_results() {
-        let mut messages = opening();
-        messages.extend([tool_result("lost"), assistant_call("c1"), tool_result("c1")]);
-
-        trim_messages(&mut messages, 4);
-
-        assert_eq!(messages.len(), 4);
-        assert!(matches!(messages[2], Message::Assistant { .. }));
-        assert!(messages[3].is_tool_result());
+        assert!(messages[4].is_tool_result());
     }
 
     #[test]
@@ -2968,7 +2886,6 @@ mod tests {
         }
 
         let budget = prompt_budget(8_192);
-        trim_messages(&mut messages, MAX_HISTORY_MESSAGES);
         fit_to_budget(&mut messages, budget);
 
         let body = request_body("m", &messages, 8_192, true);
