@@ -399,6 +399,7 @@ pub(crate) fn edit_file(
     let file = editable_file(root, path)?;
     let content = fs::read_to_string(&file).context("failed to read file (may be binary)")?;
     let (old_string, new_string) = with_file_line_endings(&content, old_string, new_string);
+    refuse_applied_edit(&content, &old_string, &new_string, path)?;
     let replacements = replacement_count(&content, &old_string, path, replace_all)?;
 
     let updated = replaced_text(&content, &old_string, &new_string, replace_all);
@@ -466,6 +467,32 @@ fn replacement_count(
             "old_string appears {occurrences} times in {path}; add surrounding context or pass replace_all=true"
         ),
     }
+}
+
+/// Shortest `new_string`, in characters, that counts as proof an edit was
+/// already made; shorter text such as `}` appears in many files by chance.
+const MIN_APPLIED_EDIT_CHARS: usize = 20;
+
+/// An error when the edit is already in `content`: the file holds
+/// `new_string` and no longer holds `old_string`, as after the same edit ran
+/// twice. Without it, the model is shown the closest text elsewhere in the
+/// file and goes looking for a change it already made.
+fn refuse_applied_edit(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    path: &str,
+) -> Result<()> {
+    let is_distinct = new_string.trim().len() >= MIN_APPLIED_EDIT_CHARS;
+    let is_applied = is_distinct && !content.contains(old_string) && content.contains(new_string);
+
+    ensure!(
+        !is_applied,
+        "this edit is already in {path}: the file holds new_string and no longer holds \
+         old_string, so nothing was changed; do not repeat it"
+    );
+
+    Ok(())
 }
 
 /// The error for an `old_string` that `content` does not hold: the closest
@@ -665,6 +692,38 @@ mod tests {
     /// A new empty directory to use as the workspace of one test.
     fn temp_dir() -> PathBuf {
         crate::test_support::unique_temp_dir("openbatrangs-tools-test")
+    }
+
+    #[test]
+    fn an_edit_made_twice_is_reported_as_already_done() -> Result<()> {
+        let root = temp_dir();
+        fs::write(
+            root.join("guide.md"),
+            "## Bird 12\n\nThe bird number 12 lives in parks.\n",
+        )?;
+        let edit = |root: &Path| {
+            edit_file(
+                root,
+                "guide.md",
+                "The bird number 12 lives in",
+                "Bird 12 makes its home in",
+                false,
+            )
+        };
+
+        edit(&root)?;
+        let repeated = edit(&root);
+
+        assert!(format!("{repeated:?}").contains("this edit is already in guide.md"));
+        let short = edit_file(&root, "guide.md", "missing text", "Bird", false);
+        assert!(format!("{short:?}").contains("old_string was not found"));
+        assert_eq!(
+            fs::read_to_string(root.join("guide.md"))?,
+            "## Bird 12\n\nBird 12 makes its home in parks.\n"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
