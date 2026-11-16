@@ -8,8 +8,8 @@
 use super::ContextUse;
 use crate::constants::agent::{
     CHARS_PER_TOKEN, COMPACT_NOTE_MAX_CHARS, CONTEXT_RESERVE_TOKENS, EARLIER_TURNS_BUDGET_PERCENT,
-    EARLIER_TURNS_HEADING, KEEP_RECENT_MESSAGES, MAX_EARLIER_TURN_CHARS, MAX_OUTPUT_TOKENS,
-    MAX_RECENT_MESSAGE_CHARS, MIN_OUTPUT_TOKENS, TOOL_RESULT_PREFIX,
+    EARLIER_TURNS_HEADING, KEEP_RECENT_MESSAGES, MAX_OUTPUT_TOKENS, MAX_RECENT_MESSAGE_CHARS,
+    MIN_OUTPUT_TOKENS, TOOL_RESULT_PREFIX,
 };
 use crate::ollama::{ChatMessage, Role};
 use serde_json::Value;
@@ -265,7 +265,10 @@ pub(crate) fn earlier_turns_section(turns: &[ChatMessage], num_ctx: u64) -> Stri
     }
 
     let budget = max_prompt_chars(num_ctx) * EARLIER_TURNS_BUDGET_PERCENT / 100;
-    let lines: Vec<String> = turns.iter().map(earlier_turn_line).collect();
+    let lines: Vec<String> = turns
+        .iter()
+        .map(|turn| earlier_turn_line(turn, budget))
+        .collect();
     let first_kept = first_line_that_fits(&lines, budget);
 
     format!(
@@ -274,10 +277,10 @@ pub(crate) fn earlier_turns_section(turns: &[ChatMessage], num_ctx: u64) -> Stri
     )
 }
 
-/// One earlier turn as `User: …` or `Assistant: …`, shortened to
-/// [`MAX_EARLIER_TURN_CHARS`].
-fn earlier_turn_line(turn: &ChatMessage) -> String {
-    let text = truncate_chars(turn.content.trim(), MAX_EARLIER_TURN_CHARS);
+/// One earlier turn as `User: …` or `Assistant: …`, shortened to the
+/// section's `budget` so that one long answer cannot take the whole section.
+fn earlier_turn_line(turn: &ChatMessage, budget: usize) -> String {
+    let text = truncate_chars(turn.content.trim(), budget);
 
     format!("{}: {text}", role_label(&turn.role))
 }

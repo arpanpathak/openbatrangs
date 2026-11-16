@@ -78,9 +78,6 @@ pub const INPUT_BOX_PADDING: usize = 2;
 /// Minimum input box height (border + one line).
 pub const MIN_INPUT_BOX_HEIGHT: usize = 3;
 
-/// Maximum chat messages kept in memory for conversational context.
-pub const MAX_CHAT_HISTORY_MESSAGES: usize = 40;
-
 /// Redraw interval in milliseconds (drives the spinner).
 pub const TICK_MILLIS: u64 = 80;
 

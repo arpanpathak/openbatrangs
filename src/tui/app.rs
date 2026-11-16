@@ -15,8 +15,8 @@ use crate::agent::{AgentEvent, ContextUse, Question, SeenFiles, TextKind, descri
 use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
-    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_CHAT_HISTORY_MESSAGES, MAX_TRANSCRIPT_BLOCKS, SPINNER,
-    STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_TRANSCRIPT_BLOCKS, SPINNER, STREAM_GAP,
+    TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
 use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host};
@@ -447,16 +447,10 @@ impl App {
         }
     }
 
-    /// Add one chat turn, dropping the oldest turns beyond
-    /// [`MAX_CHAT_HISTORY_MESSAGES`] so the newest question is always kept.
+    /// Add one chat turn. The context budget decides how much of the
+    /// history each request carries.
     pub(super) fn remember_chat(&mut self, message: ChatMessage) {
         self.chat_history.push(message);
-
-        let excess = self
-            .chat_history
-            .len()
-            .saturating_sub(MAX_CHAT_HISTORY_MESSAGES);
-        self.chat_history.drain(..excess);
     }
 
     /// True when a tool-confirmation dialog is displayed.
@@ -636,6 +630,7 @@ impl App {
         self.reply.clear();
         self.remember_chat_turn(Role::User, task.clone());
 
+        let resume = resume.or_else(|| self.carried_conversation());
         let prior = WorkerHistory {
             chat: self.chat_history.clone(),
             resume,
@@ -870,7 +865,6 @@ impl App {
     ) {
         self.keep_failed_run(&result);
         self.current_task = None;
-        self.forget_conversation_unless_asked();
         self.transcript.finish_running_step();
 
         self.save_assistant_reply();
@@ -896,12 +890,17 @@ impl App {
         self.reply = format!("{}\n\n{note}", self.reply).trim_start().to_string();
     }
 
-    /// Drop the stored conversation, unless the run asked the user a
-    /// question: then the next message answers it and continues the run.
-    fn forget_conversation_unless_asked(&mut self) {
-        if self.interrupted_task.is_none() {
-            self.agent_conversation = None;
+    /// The previous agent run's conversation, which a new agent task
+    /// continues so the model keeps the files it read and the commands it
+    /// ran. The context budget drops its oldest turns when it no longer
+    /// fits. Chat mode sends the session's messages instead and leaves the
+    /// conversation stored.
+    fn carried_conversation(&mut self) -> Option<Vec<Value>> {
+        if self.run_config.mode == AgentMode::Chat {
+            return None;
         }
+
+        self.agent_conversation.take()
     }
 
     /// Keep the reply in the session's history: the streamed chat reply, or
@@ -2311,23 +2310,35 @@ mod tests {
     }
 
     #[test]
-    fn a_full_chat_history_keeps_the_newest_turn() {
+    fn a_new_agent_task_continues_the_previous_conversation() {
+        let mut app = test_app();
+        let conversation = vec![serde_json::json!({"role": "user", "content": "first task"})];
+
+        app.run_config.mode = AgentMode::Chat;
+        app.agent_conversation = Some(conversation);
+        assert_eq!(app.carried_conversation(), None);
+        assert!(app.agent_conversation.is_some());
+
+        app.run_config.mode = AgentMode::Agent;
+        let carried = app.carried_conversation();
+        assert_eq!(carried.map(|messages| messages.len()), Some(1));
+        assert!(app.agent_conversation.is_none());
+    }
+
+    #[test]
+    fn a_long_chat_history_keeps_every_turn() {
         let mut app = test_app();
         let turn = |index: usize| ChatMessage {
             role: crate::ollama::Role::User,
             content: format!("turn {index}"),
         };
 
-        (0..=MAX_CHAT_HISTORY_MESSAGES).for_each(|index| app.remember_chat(turn(index)));
+        (0..60).for_each(|index| app.remember_chat(turn(index)));
 
-        assert_eq!(app.chat_history.len(), MAX_CHAT_HISTORY_MESSAGES);
+        assert_eq!(app.chat_history.len(), 60);
         assert_eq!(
             app.chat_history.first().map(|m| m.content.as_str()),
-            Some("turn 1")
-        );
-        assert_eq!(
-            app.chat_history.last().map(|m| m.content.clone()),
-            Some(format!("turn {MAX_CHAT_HISTORY_MESSAGES}"))
+            Some("turn 0")
         );
     }
 
@@ -2473,17 +2484,17 @@ mod tests {
     }
 
     #[test]
-    fn history_snapshot_is_stored_and_cleared_on_done() {
+    fn history_snapshot_is_stored_and_kept_after_done() {
         let client = crate::ollama::OllamaClient::new("http://localhost:11434").unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = test_app();
         let snapshot = vec![serde_json::json!({"role": "user", "content": "task"})];
 
         app.handle_event(UiEvent::History(snapshot.clone()), &client, &tx);
-        assert_eq!(app.agent_conversation, Some(snapshot));
+        assert_eq!(app.agent_conversation.as_ref(), Some(&snapshot));
 
         app.handle_event(UiEvent::Done(Ok(())), &client, &tx);
-        assert_eq!(app.agent_conversation, None);
+        assert_eq!(app.agent_conversation, Some(snapshot));
     }
 
     #[tokio::test]
@@ -3831,7 +3842,7 @@ mod tests {
         );
         assert!(app.transcript.text().contains("Fixed main.rs"));
         assert!(app.interrupted_task.is_none());
-        assert!(app.agent_conversation.is_none());
+        assert!(app.agent_conversation.is_some());
 
         std::fs::remove_dir_all(workspace)?;
         Ok(())
