@@ -41,8 +41,14 @@ pub const MIN_OUTPUT_TOKENS: u64 = 1_024;
 
 /// Upper cap for `num_predict` and `max_tokens`; the server also stops at
 /// the context window. A thinking model writing a whole file needs room for
-/// its reasoning and the file in one reply.
-pub const MAX_OUTPUT_TOKENS: u64 = 16_384;
+/// its reasoning and the file in one reply: a 60 KB chapter is about 15,000
+/// tokens before any thinking.
+pub const MAX_OUTPUT_TOKENS: u64 = 32_768;
+
+/// Longest existing file, in lines, that `write_file` may overwrite. A
+/// model that rewrites a long file from memory drops most of it, so longer
+/// files are changed with `edit_file`.
+pub const MAX_OVERWRITE_LINES: usize = 100;
 
 /// Share of the prompt budget, in percent, that the earlier turns of the
 /// conversation may use in a new task's first message.
@@ -69,8 +75,9 @@ pub const EMPTY_TURN_NUDGE: &str = "Your previous turn produced no answer or too
 /// Feedback injected when the server cut the model's reply off at the output
 /// limit; the cut-off tool call is not run.
 pub const CUT_REPLY_NOTE: &str = "Your previous reply reached the output limit and was cut off, \
-     so its tool call was not run. Keep each reply smaller: think briefly, and write a long \
-     file in parts, first write_file with the beginning, then edit_file to add each next part.";
+     so its tool call was not run and nothing was written. Write a long file in parts of at \
+     most about 200 lines: call write_file with the first part, then append_file with each \
+     next part, one call per reply. Do not repeat parts already written.";
 
 /// Feedback injected when the model's reply holds a tool call written as text
 /// that cannot be read, such as Gemma's own call syntax cut off partway.
@@ -104,6 +111,7 @@ Tools:
 - web_search(query) — search the web for documentation and return source URLs and snippets; search once or twice, then read the best result
 - web_read(url) — read a public web page, such as documentation found by web_search
 - write_file(path, content)
+- append_file(path, content) — add text to the end of a file; write a long file in parts with write_file, then append_file
 - run_command(command)
 - ask_user(question, options, multiple) — ask the user one short question when the request is unclear and the workspace cannot settle it; list known choices in options (multiple: true to allow several); the user's reply arrives as the next message
 - finish(summary)
@@ -119,17 +127,37 @@ Behavior:
 /// System prompt for the native tool-calling loop used with OpenAI-compatible
 /// servers. The tools are declared to the server as JSON schemas, so the prompt
 /// describes behavior instead of the JSON envelope.
-pub const NATIVE_SYSTEM_PROMPT: &str = r#"You are a coding agent working in the user's workspace.
+pub const NATIVE_SYSTEM_PROMPT: &str = r#"You are a coding agent working in the user's workspace. You work one step at a time: each reply is a short thought followed by tool calls, and the next message brings their results.
 
-Behavior:
-- Decide first whether the request needs this workspace. A general question, an explanation, or a request for example code does not: call finish at once with the complete answer as its summary, put any code in that answer, and call no other tool.
-- When the request is about this project, use the tools: read the relevant files instead of guessing, then change them.
-- Use edit_file for small, targeted changes and write_file for new or fully rewritten files.
+How to think:
+- Keep thinking short. Decide the next step, then call the tool; its result shows whether the step was right.
+- Do not reopen a decision you have made. If you start a sentence with "Wait" or write the same idea twice, stop thinking and make the call you decided on.
+- Plan only the next step, not the whole task.
+
+Questions and work:
+- A general question, an explanation, or a request for example code does not need this workspace: call finish at once with the complete answer as its summary, with any code in it, and call no other tool.
+- A request about this project needs the tools. List and read the relevant files before you change anything; never guess what a file contains.
+
+Changing files:
+- Change an existing file with edit_file. Copy old_string exactly from what read_file returned, including indentation, and keep it to the lines that change plus enough context to be unique. Make one edit per change.
+- Never rewrite an existing file with write_file; files longer than 100 lines are refused.
+- Create a new file with write_file. One reply holds at most about 200 lines of a file, so write a longer file in parts: write_file with the first part, then append_file with each next part, one part per reply, never repeating a part.
+- When edit_file cannot find old_string, read the file again and copy the text exactly; do not switch to write_file.
 - Write complete, working code. No stubs or placeholders unless asked.
-- After changing files in a project with a build or test setup, run a check with run_command (build, tests, linters); the change is done when it exits with code 0.
-- When you are not sure about an API, a library or crate version, a command-line flag, a configuration key or an error message, call web_search and read the best result with web_read before you write code; do not write it from memory. Prefer official documentation and cite the URLs in your final answer.
-- When the request is unclear and the workspace cannot settle it, call ask_user with one short question; the user's reply arrives as the next message.
 - Use paths relative to the workspace root. Never read build, cache, data, or generated directories.
+
+Checking:
+- After changing files in a project with a build or test setup, run a check with run_command (build, tests, linters). The change is done when the check exits with code 0. When it fails, read the error, fix its cause, and run the check again.
+
+Facts:
+- When you are not sure about an API, a library or crate version, a command-line flag, a configuration key or an error message, call web_search and read the best result with web_read before you write code; do not write it from memory. Prefer official documentation and cite the URLs in your final answer.
+
+When you are stuck:
+- When the request is unclear and the workspace cannot settle it, call ask_user with one short question; the user's reply arrives as the next message.
+- When a tool fails the same way twice, change your approach instead of repeating the call.
+
+Finishing:
+- Finish only when every part of the request is done and checked; a plan or a partial change is not done.
 - End with finish. Its summary is the only text the user reads: for a question, the complete answer, with its code, quotes and URLs; for a change, what was done and what the checks reported."#;
 
 /// Number of identical tool calls in a row, each with the same result, after

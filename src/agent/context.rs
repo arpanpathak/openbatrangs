@@ -231,6 +231,7 @@ fn tool_line(name: &str, args: &Value, content: &str) -> String {
         ),
         // Written content lives on disk; repeating it would waste the window.
         "write_file" => format!("write_file(path={})", arg(args, "path")),
+        "append_file" => format!("append_file(path={})", arg(args, "path")),
         "run_command" => format!("run_command({})", arg(args, "command")),
         "finish" => format!(
             "finish(summary={})",

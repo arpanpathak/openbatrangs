@@ -14,7 +14,9 @@ use std::sync::OnceLock;
 pub(super) fn result_summary(tool: &Tool, output: &str) -> String {
     match tool {
         Tool::RunCommand { .. } => command_summary(output),
-        Tool::WriteFile { content, .. } => line_change_summary(content, ""),
+        Tool::WriteFile { content, .. } | Tool::AppendFile { content, .. } => {
+            line_change_summary(content, "")
+        }
         Tool::EditFile {
             old_string,
             new_string,
@@ -111,7 +113,13 @@ mod tests {
             replace_all: false,
         };
 
+        let append = Tool::AppendFile {
+            path: "a.rs".to_string(),
+            content: "d\ne".to_string(),
+        };
+
         assert_eq!(result_summary(&write, "wrote"), "+3 −0");
+        assert_eq!(result_summary(&append, "appended"), "+2 −0");
         assert_eq!(result_summary(&edit, "edited"), "+2 −1");
     }
 
