@@ -6,11 +6,17 @@
 //! setting, ← and → change it, `a` sets the temperature back to the model
 //! card's, and Esc or Enter closes the dialog. A change applies from the next
 //! request on.
+//!
+//! The mouse works too. A left click on the thinking row chooses it and turns
+//! thinking off or on; a left click on the temperature row chooses it, and on
+//! the slider track also moves the knob to the clicked cell. The wheel over
+//! the dialog chooses the row above or below. Mouse events outside the dialog
+//! do nothing while it is open.
 
 use super::app::{ActiveModal, App};
 use crate::sampling::Sampling;
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -64,6 +70,16 @@ const SLIDER_CELLS: usize = 20;
 /// Width and height of the dialog, borders included.
 const DIALOG_SIZE: (u16, u16) = (60, 8);
 
+/// Line of the temperature row, counted from the dialog's top border.
+const TEMPERATURE_LINE: u16 = 2;
+
+/// Line of the thinking row, counted from the dialog's top border.
+const THINKING_LINE: u16 = 3;
+
+/// Column of the slider's first cell, counted from the dialog's left border:
+/// the border, then the 16-cell label.
+const SLIDER_COLUMN: u16 = 17;
+
 /// The action of `key` in the dialog.
 fn settings_key(key: &KeyEvent) -> SettingsKey {
     match key.code {
@@ -92,6 +108,55 @@ impl App {
             SettingsKey::Close => self.modal = None,
             SettingsKey::Nothing => {}
         }
+    }
+
+    /// Apply a mouse event while the settings dialog is open: a left click
+    /// chooses and changes the row under it, and the wheel chooses the row
+    /// above or below. Events outside the dialog do nothing.
+    pub(super) fn handle_settings_mouse(&mut self, event: MouseEvent) {
+        let area = self.last_settings_area.unwrap_or_default();
+        let cell = Position::new(event.column, event.row);
+
+        match (area.contains(cell), event.kind) {
+            (false, _) => {}
+            (true, MouseEventKind::ScrollUp) => self.choose_settings_row(SettingsRow::Temperature),
+            (true, MouseEventKind::ScrollDown) => self.choose_settings_row(SettingsRow::Thinking),
+            (true, MouseEventKind::Down(MouseButton::Left)) => self.click_settings(area, cell),
+            (true, _) => {}
+        }
+    }
+
+    /// Choose and change the row under `cell` of the dialog drawn in `area`:
+    /// flip thinking, or move the temperature to the slider cell clicked.
+    fn click_settings(&mut self, area: Rect, cell: Position) {
+        match cell.y - area.y {
+            TEMPERATURE_LINE => self.click_temperature(cell.x - area.x),
+            THINKING_LINE => {
+                self.choose_settings_row(SettingsRow::Thinking);
+                self.run_config.think = !self.run_config.think;
+            }
+            _ => {}
+        }
+    }
+
+    /// Choose the temperature row and, when `column` of the dialog is on the
+    /// slider track, set the temperature that puts the knob there.
+    fn click_temperature(&mut self, column: u16) {
+        self.choose_settings_row(SettingsRow::Temperature);
+
+        let Some(knob) = column.checked_sub(SLIDER_COLUMN) else {
+            return;
+        };
+
+        if usize::from(knob) <= SLIDER_CELLS {
+            self.run_config.temperature =
+                Some(f64::from(knob) * MAX_TEMPERATURE / SLIDER_CELLS as f64);
+        }
+    }
+
+    /// Choose `row` in the open dialog.
+    fn choose_settings_row(&mut self, row: SettingsRow) {
+        self.modal = Some(ActiveModal::Settings(row));
     }
 
     /// The row the dialog has chosen, or `None` when it is closed.
@@ -135,13 +200,15 @@ impl App {
     }
 }
 
-/// Draw the settings dialog in the middle of the screen while it is open.
-pub(super) fn render_settings(frame: &mut ratatui::Frame, app: &App) {
+/// Draw the settings dialog in the middle of the screen while it is open,
+/// and record where it went for mouse clicks.
+pub(super) fn render_settings(frame: &mut ratatui::Frame, app: &mut App) {
     let Some(row) = app.settings_row() else {
         return;
     };
 
     let area = centered(frame.area(), DIALOG_SIZE);
+    app.last_settings_area = Some(area);
     let lines = vec![
         Line::default(),
         temperature_line(app, row == SettingsRow::Temperature),
@@ -335,11 +402,11 @@ mod tests {
         let mut app = app_with_model("gemma-4-26b");
         let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
 
-        terminal.draw(|frame| render_settings(frame, &app))?;
+        terminal.draw(|frame| render_settings(frame, &mut app))?;
         let closed: String = screen(&terminal);
 
         app.open_settings();
-        terminal.draw(|frame| render_settings(frame, &app))?;
+        terminal.draw(|frame| render_settings(frame, &mut app))?;
         let open = screen(&terminal);
 
         assert!(!closed.contains("settings"));
@@ -349,7 +416,7 @@ mod tests {
 
         app.run_config.think = false;
         app.run_config.temperature = Some(0.4);
-        terminal.draw(|frame| render_settings(frame, &app))?;
+        terminal.draw(|frame| render_settings(frame, &mut app))?;
         let changed = screen(&terminal);
 
         assert!(changed.contains("○ on   ● off"));
@@ -358,6 +425,116 @@ mod tests {
             !changed.contains("0.4  model card"),
             "a value the user set is not labeled as the model card's"
         );
+
+        Ok(())
+    }
+
+    /// A mouse event of `kind` at `column`, `row` of the screen.
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// An app with the settings dialog open and drawn on an 80 by 24
+    /// screen, where the dialog spans columns 10 to 69 and rows 8 to 15:
+    /// the temperature row is screen row 10, the thinking row 11, and the
+    /// slider track starts at column 27.
+    fn app_with_drawn_dialog() -> anyhow::Result<App> {
+        let mut app = app_with_model("gemma-4-26b");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+
+        app.open_settings();
+        terminal.draw(|frame| render_settings(frame, &mut app))?;
+
+        Ok(app)
+    }
+
+    #[test]
+    fn a_click_on_the_thinking_row_chooses_it_and_flips_thinking() -> anyhow::Result<()> {
+        let mut app = app_with_drawn_dialog()?;
+        let was_thinking = app.run_config.think;
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 11);
+
+        assert_eq!(app.settings_row(), Some(SettingsRow::Thinking));
+        assert_eq!(app.run_config.think, !was_thinking);
+
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 40, 11);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 12, 11);
+
+        assert_eq!(
+            app.run_config.think, was_thinking,
+            "a second click flips it back"
+        );
+        assert_eq!(
+            app.run_config.temperature, None,
+            "the temperature is untouched"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_click_on_the_slider_track_moves_the_knob_there() -> anyhow::Result<()> {
+        let mut app = app_with_drawn_dialog()?;
+        app.modal = Some(ActiveModal::Settings(SettingsRow::Thinking));
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 14, 10);
+
+        assert_eq!(app.settings_row(), Some(SettingsRow::Temperature));
+        assert_eq!(
+            app.run_config.temperature, None,
+            "a click on the label only chooses the row"
+        );
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 27, 10);
+        assert_eq!(app.run_config.temperature, Some(0.0));
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 30, 10);
+        assert_eq!(app.run_config.temperature, Some(0.3));
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 47, 10);
+        assert_eq!(app.run_config.temperature, Some(2.0));
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 50, 10);
+        assert_eq!(
+            app.run_config.temperature,
+            Some(2.0),
+            "a click right of the track changes nothing"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_wheel_chooses_a_row_and_the_mouse_outside_does_nothing() -> anyhow::Result<()> {
+        let mut app = app_with_drawn_dialog()?;
+        for index in 0..100 {
+            app.notice(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 80, 20));
+        let was_thinking = app.run_config.think;
+
+        mouse(&mut app, MouseEventKind::ScrollDown, 40, 9);
+        assert_eq!(app.settings_row(), Some(SettingsRow::Thinking));
+
+        mouse(&mut app, MouseEventKind::ScrollUp, 40, 14);
+        assert_eq!(app.settings_row(), Some(SettingsRow::Temperature));
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 40, 8);
+        mouse(&mut app, MouseEventKind::Moved, 40, 11);
+        mouse(&mut app, MouseEventKind::ScrollDown, 5, 5);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5, 11);
+
+        assert_eq!(app.settings_row(), Some(SettingsRow::Temperature));
+        assert_eq!(app.run_config.think, was_thinking);
+        assert_eq!(app.run_config.temperature, None);
+        assert_eq!(app.chat_scroll_offset, 0, "the chat behind does not scroll");
+        assert!(app.press.is_none(), "and no click starts in it");
 
         Ok(())
     }

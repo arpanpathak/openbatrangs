@@ -331,6 +331,9 @@ pub(super) struct App {
     pub(super) jobs_started: u64,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
+    /// Where the settings dialog was last drawn, borders included, used to
+    /// find the row under a click.
+    pub(super) last_settings_area: Option<Rect>,
     /// Where the left button went down in the transcript text, until it is
     /// released. A press on the scrollbar is not recorded.
     pub(super) press: Option<Press>,
@@ -425,6 +428,7 @@ impl App {
             current_task: None,
             jobs_started: 0,
             last_chat_area: None,
+            last_settings_area: None,
             press: None,
             selection: None,
             drag_edge: None,
@@ -1253,17 +1257,18 @@ impl App {
     /// Handle a mouse event: scroll, scrollbar drag, or click-to-open file.
     ///
     /// Mouse events are ignored while a confirmation dialog is open to prevent
-    /// accidental interactions with the chat behind the modal.
+    /// accidental interactions with the chat behind the modal. While the
+    /// settings dialog is open, they go to the dialog instead of the chat.
     ///
     /// # Parameters
     ///
     /// - `event`: the crossterm mouse event to process.
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.is_confirming() {
-            return;
+        match self.modal {
+            Some(ActiveModal::Confirm(_)) => {}
+            Some(ActiveModal::Settings(_)) => self.handle_settings_mouse(event),
+            _ => self.apply_mouse_event(event),
         }
-
-        self.apply_mouse_event(event);
     }
 
     /// Scroll on the wheel, drag the scrollbar, select text, or act on a
