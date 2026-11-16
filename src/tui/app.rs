@@ -3,7 +3,7 @@
 use super::block::BlockContent;
 use super::choice::ChoiceState;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
-use super::selection::{Selection, load_tmux_buffer};
+use super::selection::{ClipboardProgram, Selection, TextPoint, pipe_text, selected_text};
 use super::settings::SettingsRow;
 use super::stats::{RemoteServer, StatsTable};
 use super::transcript::{Focus, RowHit, Transcript};
@@ -331,13 +331,17 @@ pub(super) struct App {
     pub(super) jobs_started: u64,
     /// Last measured chat area rectangle, used for scrollbar and click math.
     pub(super) last_chat_area: Option<Rect>,
-    /// Cell where the left button went down in the transcript text, until it
-    /// is released. A press on the scrollbar is not recorded.
-    pub(super) press: Option<Position>,
-    /// Transcript text selected by a left-button drag.
+    /// Where the left button went down in the transcript text, until it is
+    /// released. A press on the scrollbar is not recorded.
+    pub(super) press: Option<Press>,
+    /// Transcript text selected by a left-button drag. It stays highlighted
+    /// after the release, until the next press.
     pub(super) selection: Option<Selection>,
-    /// Text of [`Self::selection`] as drawn in the last frame.
-    pub(super) selected_text: String,
+    /// Direction to scroll while a drag holds the pointer on the top (-1) or
+    /// bottom (1) row of the chat, and the cell it holds.
+    pub(super) drag_edge: Option<(i32, Position)>,
+    /// Program that puts copied text on the desktop clipboard, if any.
+    pub(super) desktop_clipboard: Option<ClipboardProgram>,
     /// Text to put on the clipboard before the next frame is drawn.
     pub(super) clipboard: Option<String>,
     /// Characters accumulated in the current rate-measurement window.
@@ -423,7 +427,8 @@ impl App {
             last_chat_area: None,
             press: None,
             selection: None,
-            selected_text: String::new(),
+            drag_edge: None,
+            desktop_clipboard: None,
             clipboard: None,
             rate_window_chars: 0,
             rate_window_start: None,
@@ -1286,48 +1291,111 @@ impl App {
             return;
         }
 
-        self.press = Some(cell);
+        self.press = Some(Press {
+            cell,
+            point: self.text_point(cell),
+        });
     }
 
     /// A left drag selects text from the press, or moves the scrollbar when
-    /// the press was on it.
+    /// the press was on it. Holding the pointer on the top or bottom row of
+    /// the chat scrolls it, see [`Self::scroll_at_drag_edge`].
     fn drag_to(&mut self, cell: Position) {
-        let Some(anchor) = self.press else {
+        let Some(press) = self.press else {
             self.handle_scrollbar_click(cell.x, cell.y);
             return;
         };
 
-        self.selection = (cell != anchor).then_some(Selection {
-            anchor,
-            cursor: cell,
-        });
+        let area = self.last_chat_area.unwrap_or_default();
+        self.drag_edge = edge_direction(area, cell).map(|direction| (direction, cell));
+
+        self.select_to(press.point, cell);
+    }
+
+    /// Scroll one row while a drag holds the pointer on the top or bottom
+    /// row of the chat, and extend the selection to the row that scrolled in.
+    /// Called on every tick.
+    pub(super) fn scroll_at_drag_edge(&mut self) {
+        let (Some((direction, cell)), Some(press)) = (self.drag_edge, self.press) else {
+            return;
+        };
+
+        self.scroll_chat(direction);
+        self.select_to(press.point, cell);
+    }
+
+    /// Select the text from `anchor` to the transcript point under `cell`.
+    fn select_to(&mut self, anchor: TextPoint, cell: Position) {
+        let cursor = self.text_point(cell);
+
+        self.selection = (cursor != anchor).then_some(Selection { anchor, cursor });
+    }
+
+    /// The transcript point under screen `cell`. A cell above or below the
+    /// chat counts as its top or bottom row.
+    fn text_point(&mut self, cell: Position) -> TextPoint {
+        let area = self.last_chat_area.unwrap_or_default();
+        let top = self.chat_top_row(area);
+        let row_on_screen = cell
+            .y
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1));
+
+        TextPoint {
+            row: top + row_on_screen as usize,
+            column: cell.x.saturating_sub(area.x),
+        }
+    }
+
+    /// The transcript row drawn on the first row of `area`.
+    pub(super) fn chat_top_row(&mut self, area: Rect) -> usize {
+        let content_height = self.transcript.layout(chat_text_width(area.width));
+
+        self.chat_scroll_for(area, content_height)
     }
 
     /// Releasing the left button copies the selection, or acts on the row
     /// of a press that did not move.
     fn release(&mut self) {
-        let Some(anchor) = self.press.take() else {
+        self.drag_edge = None;
+
+        let Some(press) = self.press.take() else {
             return;
         };
 
         match self.selection {
-            Some(_) => self.copy_selection(),
-            None => self.click_transcript(anchor.y),
+            Some(selection) => self.copy_selection(selection),
+            None => self.click_transcript(press.cell.y),
         }
     }
 
-    /// Queue the selected text for the clipboard, also put it in tmux's
-    /// buffer when running inside tmux, and say how much was copied. The
-    /// highlight is cleared: it marks screen cells, so new output would
-    /// scroll text under it.
-    fn copy_selection(&mut self) {
-        let text = std::mem::take(&mut self.selected_text);
+    /// Queue the text of `selection` for the terminal's clipboard, also put
+    /// it on the desktop clipboard and in tmux's buffer when they are there,
+    /// and say how much was copied. The highlight stays until the next press.
+    fn copy_selection(&mut self, selection: Selection) {
+        let text = self.selection_text(selection);
         let count = text.chars().count();
-        let is_in_tmux = std::env::var_os("TMUX").is_some() && load_tmux_buffer("tmux", &text);
+        let is_on_desktop = self
+            .desktop_clipboard
+            .as_ref()
+            .is_some_and(|clipboard| pipe_text(&clipboard.program, clipboard.args, &text));
+        let is_in_tmux = std::env::var_os("TMUX").is_some() && pipe_text("tmux", TMUX, &text);
 
-        self.status = copy_status(count, is_in_tmux);
-        self.selection = None;
+        self.status = copy_status(count, is_on_desktop, is_in_tmux);
         self.clipboard = Some(text);
+    }
+
+    /// The text of `selection`, read from the transcript, so rows that are
+    /// scrolled off screen are included.
+    fn selection_text(&mut self, selection: Selection) -> String {
+        let width = chat_text_width(self.last_chat_area.unwrap_or_default().width);
+        let first = selection.anchor.min(selection.cursor).row;
+        let last = selection.anchor.max(selection.cursor).row;
+        let lines = self
+            .transcript
+            .visible_lines(width, first, last - first + 1, false);
+
+        selected_text(lines, first, width as u16, selection)
     }
 
     /// Fold or unfold the block part at terminal row `row`; a row that does
@@ -1384,11 +1452,14 @@ impl App {
     }
 
     /// Apply what the transcript did to the rows above the view: rows that
-    /// left memory shift the offset up, and a jump back to the newest
-    /// blocks follows the output again.
+    /// left memory shift the offset and the selection up, and a jump back to
+    /// the newest blocks follows the output again.
     pub(super) fn sync_transcript_scroll(&mut self) {
         let dropped_rows = self.transcript.take_dropped_rows();
         self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(dropped_rows);
+        self.selection = self
+            .selection
+            .map(|selection| selection.moved_up(dropped_rows));
 
         if self.transcript.take_reattached() {
             self.scroll_mode = ScrollMode::Follow;
@@ -1789,10 +1860,34 @@ fn corrected_task_prompt(previous: &str, correction: &str) -> String {
 
 /// The status line after copying `count` characters, which name the tmux
 /// buffer when the text went there too.
-fn copy_status(count: usize, is_in_tmux: bool) -> String {
-    match is_in_tmux {
-        true => format!("copied {count} characters, also to the tmux buffer"),
-        false => format!("copied {count} characters"),
+fn copy_status(count: usize, is_on_desktop: bool, is_in_tmux: bool) -> String {
+    match (is_on_desktop, is_in_tmux) {
+        (true, _) => format!("copied {count} characters to the clipboard"),
+        (false, true) => format!("copied {count} characters, also to the tmux buffer"),
+        (false, false) => format!("copied {count} characters"),
+    }
+}
+
+/// Arguments that make tmux keep its standard input as a paste buffer and
+/// pass it to the outer terminal's clipboard.
+const TMUX: &[&str] = &["load-buffer", "-w", "-"];
+
+/// Where the left button went down in the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Press {
+    /// Screen cell of the press.
+    pub(super) cell: Position,
+    /// Transcript point under that cell when it was pressed.
+    pub(super) point: TextPoint,
+}
+
+/// The direction to scroll for a drag at `cell`: up on the top row of the
+/// chat `area` or above it, down on its bottom row or below it.
+fn edge_direction(area: Rect, cell: Position) -> Option<i32> {
+    match (cell.y <= area.y, cell.y + 1 >= area.bottom()) {
+        (true, _) => Some(-1),
+        (false, true) => Some(1),
+        (false, false) => None,
     }
 }
 
@@ -1925,11 +2020,15 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_status_names_the_tmux_buffer_inside_tmux() {
-        assert_eq!(copy_status(12, false), "copied 12 characters");
+    fn the_copy_status_names_where_the_text_went() {
+        assert_eq!(copy_status(12, false, false), "copied 12 characters");
         assert_eq!(
-            copy_status(12, true),
+            copy_status(12, false, true),
             "copied 12 characters, also to the tmux buffer"
+        );
+        assert_eq!(
+            copy_status(12, true, true),
+            "copied 12 characters to the clipboard"
         );
     }
 
@@ -3258,45 +3357,123 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_in_the_text_selects_and_the_release_copies() {
+    fn a_drag_in_the_text_selects_and_the_release_copies() -> anyhow::Result<()> {
+        let directory = crate::test_support::unique_temp_dir("openbatrangs-fake-xclip");
+        let received = directory.join("received.txt");
+        let fake_xclip = directory.join("xclip");
+        std::fs::write(
+            &fake_xclip,
+            format!("#!/bin/sh\ncat > '{}'\n", received.display()),
+        )?;
+        std::fs::set_permissions(
+            &fake_xclip,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )?;
+
         let mut app = test_app();
         app.notice("some text".to_string());
         app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+        app.desktop_clipboard = Some(ClipboardProgram {
+            program: fake_xclip.to_string_lossy().into_owned(),
+            args: &[],
+        });
+        let row = app
+            .transcript
+            .visible_lines(38, 0, 20, false)
+            .iter()
+            .position(|line| line.to_string().contains("some text"))
+            .context("the notice is on screen")?;
+        let column = app.transcript.visible_lines(38, row, 1, false)[0]
+            .to_string()
+            .find("some text")
+            .context("the notice's column")? as u16;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 1));
-
-        assert_eq!(
-            app.selection,
-            Some(Selection {
-                anchor: Position::new(2, 1),
-                cursor: Position::new(9, 1)
-            })
-        );
-
-        app.selected_text = "some text".to_string();
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9, 1));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column,
+            row as u16,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            column + 8,
+            row as u16,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            column + 8,
+            row as u16,
+        ));
 
         assert_eq!(app.clipboard.as_deref(), Some("some text"));
-        assert_eq!(app.status, "copied 9 characters");
-        assert_eq!(app.selection, None, "the copy clears the highlight");
+        assert_eq!(app.status, "copied 9 characters to the clipboard");
+        assert_eq!(std::fs::read_to_string(&received)?, "some text");
+        assert!(
+            app.selection.is_some(),
+            "the highlight stays after the copy"
+        );
+
+        click(&mut app, column, row as u16);
+        assert_eq!(app.selection, None, "the next press clears it");
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
-    fn scrolling_clears_the_highlight() {
+    fn a_selection_keeps_its_text_while_the_chat_scrolls() {
         let mut app = test_app();
         for index in 0..100 {
             app.notice(format!("line {index}"));
         }
         app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+        app.scroll_chat(-1_000);
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 1));
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 1));
-        assert!(app.selection.is_some());
+        let selected = app.selection;
 
-        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 5));
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 5));
 
-        assert_eq!(app.selection, None);
+        assert_eq!(
+            app.selection, selected,
+            "the selection names transcript rows"
+        );
+    }
+
+    #[test]
+    fn a_drag_held_on_the_bottom_row_scrolls_and_extends_the_selection() {
+        let mut app = test_app();
+        for index in 0..100 {
+            app.notice(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+        app.scroll_chat(-1_000);
+
+        app.scroll_at_drag_edge();
+        assert_eq!(app.chat_scroll_offset, 0, "no drag, no scroll");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 25));
+        let before = app.selection.map(|selection| selection.cursor.row);
+
+        app.scroll_at_drag_edge();
+        app.scroll_at_drag_edge();
+
+        assert_eq!(app.chat_scroll_offset, 2);
+        assert_eq!(
+            app.selection.map(|selection| selection.cursor.row),
+            before.map(|row| row + 2)
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 0));
+        assert_eq!(app.drag_edge, Some((-1, Position::new(9, 0))));
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 10));
+        assert_eq!(app.drag_edge, None);
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9, 10));
+        app.scroll_at_drag_edge();
+        assert_eq!(app.chat_scroll_offset, 2, "the release stops the scrolling");
     }
 
     #[test]
