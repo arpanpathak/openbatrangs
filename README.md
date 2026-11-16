@@ -261,6 +261,68 @@ to it:
 Installing vLLM replaces Colab's PyTorch with its own version, so use a fresh
 runtime for it.
 
+#### Gemma 4 31B with its draft model
+
+Gemma 4 31B is a dense model, so every parameter takes part in every token. It
+keeps track of long, multi-step tasks better than Gemma 4 26B-A4B, a
+mixture-of-experts model that activates about 4B parameters per token and
+tends to declare a task done early. Its *draft model*,
+`google/gemma-4-31B-it-assistant`, proposes several tokens for the main model
+to verify in one pass. On a Jetson AGX Thor, the draft model raises
+generation from 7.5 to 17.0 tokens per second on the same 400-token reply.
+
+The checkpoint depends on the GPU. NVFP4 weights need a Blackwell GPU, which
+Colab offers as the G4. The A100 predates NVFP4, so it takes the 16-bit
+weights, which alone occupy 62 GB and leave room for a shorter context.
+
+| GPU | Memory | Checkpoint | `--max-model-len` |
+| --- | --- | --- | --- |
+| G4 (RTX PRO 6000) | 96 GB | `nvidia/Gemma-4-31B-IT-NVFP4` | `262144` |
+| A100 | 80 GB | `google/gemma-4-31B-it` | `32768` |
+
+Start the server in a fresh runtime. This cell is for the G4; on an A100,
+change the checkpoint and the context length to the second row.
+
+```python
+!pip -q install vllm
+
+import json, subprocess
+
+draft = {"method": "mtp", "model": "google/gemma-4-31B-it-assistant", "num_speculative_tokens": 3}
+
+subprocess.Popen(
+    ["vllm", "serve", "nvidia/Gemma-4-31B-IT-NVFP4",
+     "--speculative-config", json.dumps(draft),
+     "--max-model-len", "262144",
+     "--enable-chunked-prefill", "--enable-prefix-caching",
+     "--reasoning-parser", "gemma4",
+     "--enable-auto-tool-choice", "--tool-call-parser", "gemma4"],
+    stdout=open("/content/vllm.log", "w"), stderr=subprocess.STDOUT,
+    start_new_session=True,
+)
+```
+
+Each option serves the agent loop. `--max-model-len 262144` is Gemma 4's full
+context. Chunked prefill reads a long prompt in pieces, so no prompt length
+is fixed in advance. openbatrangs sends the whole conversation on every step,
+and prefix caching keeps the part the server has already processed, so each
+step processes only its new messages. The two `gemma4` parsers return the
+model's reasoning and its tool calls in the fields openbatrangs reads.
+
+openbatrangs runs on the same machine as the server, so it connects through
+`localhost`. When `/content/vllm.log` shows that the server is listening on
+port 8000, run a task from a cell, or start the terminal UI from Colab's
+terminal:
+
+```sh
+!openbatrangs --no-sandbox --openai-url http://localhost:8000/v1 --model nvidia/Gemma-4-31B-IT-NVFP4 --cwd /content/project "your task"
+```
+
+```sh
+cd /content/project
+openbatrangs --no-sandbox --openai-url http://localhost:8000/v1 --model nvidia/Gemma-4-31B-IT-NVFP4
+```
+
 ## Usage
 
 ```sh
