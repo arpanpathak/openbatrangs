@@ -1964,6 +1964,23 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_model_without_a_known_card_gets_the_server_defaults() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-no-sampling");
+        let config = test_config(&root, 2);
+        let answer = vec![Reply::openai_stream(&[text_delta("Done.")])];
+
+        let (requests, _output) = requests_of_run(&config, "llama3.2", "hi", answer).await?;
+        let request: Value = serde_json::from_str(&requests[0])?;
+
+        assert!(request.get("temperature").is_none());
+        assert!(request.get("top_p").is_none());
+        assert!(request.get("top_k").is_none());
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     /// Like [`run_in`], in a new empty workspace that is removed afterwards.
     async fn run_with_replies(
         task: &str,

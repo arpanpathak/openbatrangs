@@ -64,6 +64,10 @@ const MAX_TEMPERATURE: f64 = 2.0;
 /// Change of one slider step.
 const TEMPERATURE_STEP: f64 = 0.1;
 
+/// Where the slider starts for a model whose card is unknown: 1.0, the
+/// default of OpenAI-compatible servers when a request sends no temperature.
+const SERVER_TEMPERATURE: f64 = 1.0;
+
 /// Cells of the slider track, one per step.
 const SLIDER_CELLS: usize = 20;
 
@@ -186,14 +190,16 @@ impl App {
     /// Move the temperature by `step`, starting from the one in use, within
     /// 0 to [`MAX_TEMPERATURE`] and rounded to a tenth.
     fn step_temperature(&mut self, step: f64) {
-        let next = (self.temperature_in_use() + step).clamp(0.0, MAX_TEMPERATURE);
+        let start = self.temperature_in_use().unwrap_or(SERVER_TEMPERATURE);
+        let next = (start + step).clamp(0.0, MAX_TEMPERATURE);
 
         self.run_config.temperature = Some((next * 10.0).round() / 10.0);
     }
 
-    /// The temperature the next request uses: the user's, else the model
-    /// card's for the selected model.
-    pub(super) fn temperature_in_use(&self) -> f64 {
+    /// The temperature the next request sends: the user's, else the model
+    /// card's for the selected model, or `None` when it sends none and the
+    /// server uses the model's default.
+    pub(super) fn temperature_in_use(&self) -> Option<f64> {
         let model = self.model.as_deref().unwrap_or_default();
 
         Sampling::for_model(model, self.run_config.temperature).temperature
@@ -230,21 +236,22 @@ pub(super) fn render_settings(frame: &mut ratatui::Frame, app: &mut App) {
 }
 
 /// The temperature row: the slider, then the value, marked `model card`
-/// while the user has not set one.
+/// while the user has not set one. A model without a known card shows
+/// `server default` and the slider at [`SERVER_TEMPERATURE`].
 fn temperature_line(app: &App, is_chosen: bool) -> Line<'static> {
-    let temperature = app.temperature_in_use();
-    let source = match app.run_config.temperature {
-        Some(_) => "",
-        None => "  model card",
+    let in_use = app.temperature_in_use();
+    let value = in_use.map_or_else(String::new, |temperature| format!("  {temperature:.1}"));
+    let source = match (app.run_config.temperature, in_use) {
+        (Some(_), _) => "",
+        (None, Some(_)) => "  model card",
+        (None, None) => "  server default",
     };
+    let knob = in_use.unwrap_or(SERVER_TEMPERATURE);
 
     Line::from(vec![
         label("Temperature", is_chosen),
-        Span::styled(slider(temperature), Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!("  {temperature:.1}"),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(slider(knob), Style::default().fg(Color::Cyan)),
+        Span::styled(value, Style::default().fg(Color::White)),
         Span::styled(source, Style::default().fg(Color::DarkGray)),
     ])
 }
@@ -328,7 +335,7 @@ mod tests {
         let mut app = app_with_model("gemma-4-26b");
         app.open_settings();
 
-        assert_eq!(app.temperature_in_use(), 1.0);
+        assert_eq!(app.temperature_in_use(), Some(1.0));
 
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Left);
@@ -426,6 +433,24 @@ mod tests {
             "a value the user set is not labeled as the model card's"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_without_a_card_shows_the_server_default() -> anyhow::Result<()> {
+        let mut app = app_with_model("llama3.2");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        app.open_settings();
+
+        terminal.draw(|frame| render_settings(frame, &mut app))?;
+        let open = screen(&terminal);
+
+        assert_eq!(app.temperature_in_use(), None);
+        assert!(open.contains(&format!("{}  server default", slider(1.0))));
+
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.run_config.temperature, Some(1.1), "steps from 1.0");
         Ok(())
     }
 

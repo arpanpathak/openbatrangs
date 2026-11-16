@@ -5,7 +5,9 @@
 //! weights. Gemma 4 ships with temperature 1.0, top-p 0.95 and top-k 64; at a
 //! low temperature its reasoning tends to loop on phrases such as "wait, I
 //! should". Requests therefore use the family's settings, and a temperature
-//! the user sets replaces only the temperature.
+//! the user sets replaces only the temperature. A model outside the known
+//! families gets no sampling fields, so the server applies the model's own
+//! `generation_config.json`; Claude models also reject a temperature below 1.
 //!
 //! ## References
 //!
@@ -17,8 +19,8 @@ use serde_json::{Value, json};
 /// The sampling fields of one chat request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Sampling {
-    /// Softmax temperature.
-    pub(crate) temperature: f64,
+    /// Softmax temperature, or `None` to leave the server's default.
+    pub(crate) temperature: Option<f64>,
     /// Nucleus sampling threshold, or `None` to leave the server's default.
     pub(crate) top_p: Option<f64>,
     /// Number of most likely tokens kept, or `None` to leave the server's
@@ -32,7 +34,7 @@ const FAMILY_SAMPLING: [(&str, Sampling); 2] = [
     (
         "gemma",
         Sampling {
-            temperature: 1.0,
+            temperature: Some(1.0),
             top_p: Some(0.95),
             top_k: Some(64),
         },
@@ -40,17 +42,17 @@ const FAMILY_SAMPLING: [(&str, Sampling); 2] = [
     (
         "qwen",
         Sampling {
-            temperature: 0.6,
+            temperature: Some(0.6),
             top_p: Some(0.95),
             top_k: Some(20),
         },
     ),
 ];
 
-/// Sampling for a model outside [`FAMILY_SAMPLING`]: a low temperature, which
-/// keeps tool calls well formed.
+/// Sampling for a model outside [`FAMILY_SAMPLING`]: none of the fields, so
+/// the server uses the defaults the model ships with.
 const OTHER_SAMPLING: Sampling = Sampling {
-    temperature: 0.2,
+    temperature: None,
     top_p: None,
     top_k: None,
 };
@@ -66,7 +68,7 @@ impl Sampling {
             .map_or(OTHER_SAMPLING, |(_, sampling)| *sampling);
 
         Self {
-            temperature: temperature.unwrap_or(family.temperature),
+            temperature: temperature.or(family.temperature),
             ..family
         }
     }
@@ -74,7 +76,9 @@ impl Sampling {
     /// Writes the fields into `target`: an OpenAI request body or an Ollama
     /// `options` object, which use the same names.
     pub(crate) fn write_to(self, target: &mut Value) {
-        target["temperature"] = json!(self.temperature);
+        if let Some(temperature) = self.temperature {
+            target["temperature"] = json!(temperature);
+        }
 
         if let Some(top_p) = self.top_p {
             target["top_p"] = json!(top_p);
@@ -96,8 +100,8 @@ mod tests {
         let qwen = Sampling::for_model("qwen3.6:35b", None);
         let other = Sampling::for_model("llama3.2", None);
 
-        assert_eq!((gemma.temperature, gemma.top_k), (1.0, Some(64)));
-        assert_eq!((qwen.temperature, qwen.top_k), (0.6, Some(20)));
+        assert_eq!((gemma.temperature, gemma.top_k), (Some(1.0), Some(64)));
+        assert_eq!((qwen.temperature, qwen.top_k), (Some(0.6), Some(20)));
         assert_eq!(other, OTHER_SAMPLING);
     }
 
@@ -105,7 +109,7 @@ mod tests {
     fn a_user_temperature_replaces_only_the_temperature() {
         let sampling = Sampling::for_model("gemma4:31b", Some(0.4));
 
-        assert_eq!(sampling.temperature, 0.4);
+        assert_eq!(sampling.temperature, Some(0.4));
         assert_eq!(sampling.top_p, Some(0.95));
         assert_eq!(sampling.top_k, Some(64));
     }
@@ -122,6 +126,15 @@ mod tests {
             gemma,
             json!({"temperature": 1.0, "top_p": 0.95, "top_k": 64})
         );
-        assert_eq!(other, json!({"temperature": 0.2}));
+        assert_eq!(other, json!({}));
+    }
+
+    #[test]
+    fn a_user_temperature_is_sent_for_any_model() {
+        let mut body = json!({});
+
+        Sampling::for_model("claude-sonnet-5-5", Some(1.0)).write_to(&mut body);
+
+        assert_eq!(body, json!({"temperature": 1.0}));
     }
 }
