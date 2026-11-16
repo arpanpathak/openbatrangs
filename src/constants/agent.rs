@@ -19,10 +19,6 @@ pub const DEFAULT_GREP_MAX_RESULTS: usize = 200;
 /// Timeout for shell commands launched by the agent, in seconds.
 pub const COMMAND_TIMEOUT_SECONDS: u64 = 120;
 
-/// Conversation trimming keeps the system message, the initial task, and this
-/// many recent messages.
-pub const MAX_HISTORY_MESSAGES: usize = 40;
-
 /// Number of the most recent messages kept verbatim before older tool
 /// exchanges are rolled into the compacted context note.
 pub const KEEP_RECENT_MESSAGES: usize = 4;

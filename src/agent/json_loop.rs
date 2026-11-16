@@ -28,9 +28,7 @@ use super::{
     compact_context, context_use, earlier_turns_section, effective_context,
     ensure_workspace_exists, max_output_tokens,
 };
-use crate::constants::agent::{
-    INITIAL_LIST_DEPTH, MAX_HISTORY_MESSAGES, SYSTEM_PROMPT, TOOL_RESULT_PREFIX,
-};
+use crate::constants::agent::{INITIAL_LIST_DEPTH, SYSTEM_PROMPT, TOOL_RESULT_PREFIX};
 use crate::constants::ansi::{COLOR_DIM, COLOR_RESET};
 use crate::ollama::{ChatMessage, ChatRequest, OllamaClient, Role};
 use crate::sampling::Sampling;
@@ -402,7 +400,6 @@ impl<R: Reporter, C: Confirmer> JsonRun<'_, R, C> {
             output: report.output,
         });
         self.messages.push(message(Role::User, &tool_result));
-        trim_messages(&mut self.messages, MAX_HISTORY_MESSAGES);
 
         self.repeat_guard.allow(State::Ask)
     }
@@ -594,30 +591,6 @@ fn chat_request(
         options: Some(options),
         think: None,
     }
-}
-
-/// Trim conversation history to `max` messages, preserving system and first user turn.
-fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
-    if messages.len() <= max {
-        return;
-    }
-
-    // Always keep the system message and the initial task message,
-    // then the most recent exchanges.
-    let system = messages.remove(0);
-    let first_user = messages.remove(0);
-    let tail = messages.split_off(messages.len().saturating_sub(max - 2));
-
-    // A trimmed tail may start with a tool result whose assistant JSON was
-    // cut off; drop the orphan so the conversation still makes sense.
-    let tail = tail
-        .into_iter()
-        .skip_while(|message| message.content.starts_with(TOOL_RESULT_PREFIX));
-
-    messages.clear();
-    messages.push(system);
-    messages.push(first_user);
-    messages.extend(tail);
 }
 
 #[cfg(test)]
@@ -1072,79 +1045,6 @@ mod tests {
 
         warn_when_resume_is_unsupported(Some(&continuation), &mut reporter);
         assert!(reporter.output.contains("cannot be resumed"));
-    }
-
-    #[test]
-    fn trims_messages_but_keeps_system_and_first_user() {
-        let mut messages = vec![
-            chat(Role::System, "system"),
-            chat(Role::User, "task"),
-            chat(Role::Assistant, "a1"),
-            chat(Role::User, "u1"),
-            chat(Role::Assistant, "a2"),
-        ];
-
-        trim_messages(&mut messages, 3);
-
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[1].content, "task");
-        assert_eq!(messages[2].content, "a2");
-    }
-
-    #[test]
-    fn trim_messages_does_nothing_when_at_or_under_limit() {
-        let mut messages = vec![
-            chat(Role::System, "system"),
-            chat(Role::User, "task"),
-            chat(Role::Assistant, "answer"),
-        ];
-
-        trim_messages(&mut messages, 10);
-        trim_messages(&mut messages, 3);
-
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[2].content, "answer");
-    }
-
-    #[test]
-    fn trim_messages_keeps_most_recent_exchanges() {
-        let mut messages = vec![
-            chat(Role::System, "system"),
-            chat(Role::User, "task"),
-            chat(Role::Assistant, "a1"),
-            chat(Role::User, "u1"),
-            chat(Role::Assistant, "a2"),
-            chat(Role::User, "u2"),
-            chat(Role::Assistant, "a3"),
-        ];
-
-        // max=4: system + first_user + 2 most recent
-        trim_messages(&mut messages, 4);
-
-        let contents: Vec<&str> = messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect();
-        assert_eq!(contents, ["system", "task", "u2", "a3"]);
-    }
-
-    #[test]
-    fn trim_drops_orphan_tool_results_from_the_tail() {
-        let mut messages = vec![
-            chat(Role::System, "system"),
-            chat(Role::User, "task"),
-            chat(Role::Assistant, r#"{"tool":{"name":"read_file"}}"#),
-            chat(Role::User, "Tool result:\nold output"),
-            chat(Role::User, "Tool result:\nolder output"),
-            chat(Role::Assistant, r#"{"answer":"done"}"#),
-        ];
-
-        trim_messages(&mut messages, 4);
-
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].content, "task");
-        assert_eq!(messages[2].content, r#"{"answer":"done"}"#);
     }
 
     #[test]
