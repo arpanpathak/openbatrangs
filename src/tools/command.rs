@@ -146,7 +146,7 @@ fn sandboxed_shell(root: &Path, command: &str, sandbox: Sandbox) -> tokio::proce
         // does not outlive it.
         .kill_on_drop(true)
         .envs(agent_sandbox_env(root))
-        .envs(host_tool_env());
+        .envs(tool_env(root));
 
     shell
 }
@@ -228,30 +228,49 @@ fn stderr_section(stderr: &[u8]) -> String {
 /// model then tries to install Rust again (1.6 GB per workspace). This puts
 /// the real `~/.cargo/bin` and `~/.local/bin` first on `PATH` and points
 /// `RUSTUP_HOME` at the real `~/.rustup`, so installed tools just work while
-/// caches and new installs still land in the sandbox. Without `$HOME` there is
-/// nothing to add.
-fn host_tool_env() -> Vec<(&'static str, OsString)> {
-    std::env::var_os("HOME")
-        .map(|home| tool_env_for_home(Path::new(&home)))
-        .unwrap_or_default()
+/// caches and new installs still land in the sandbox.
+///
+/// Tools the model installs land in the workspace's own `bin` folders (see
+/// [`sandbox_bin_dirs`]), which come first on `PATH`, so a tool installed in
+/// one step is found by name in the next.
+fn tool_env(root: &Path) -> Vec<(&'static str, OsString)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+
+    tool_env_for_home(root, &home)
 }
 
-/// The `PATH` and `RUSTUP_HOME` overrides for the real home directory `home`.
-fn tool_env_for_home(home: &Path) -> Vec<(&'static str, OsString)> {
-    let path = host_path(home).map(|path| ("PATH", path));
+/// The `PATH` and `RUSTUP_HOME` overrides for workspace `root` and the real
+/// home directory `home`.
+fn tool_env_for_home(root: &Path, home: &Path) -> Vec<(&'static str, OsString)> {
+    let path = command_path(root, home).map(|path| ("PATH", path));
     let rustup = rustup_home(home).map(|rustup| ("RUSTUP_HOME", rustup));
 
     path.into_iter().chain(rustup).collect()
 }
 
-/// The current `PATH` with `home`'s `.cargo/bin` and `.local/bin` in front,
-/// for those of them that exist; `None` when the result cannot be joined.
-fn host_path(home: &Path) -> Option<OsString> {
-    let mut paths: Vec<PathBuf> = [".cargo/bin", ".local/bin"]
-        .iter()
-        .map(|dir| home.join(dir))
-        .filter(|dir| dir.is_dir())
-        .collect();
+/// The `bin` folders where `pip install --user`, `cargo install` and
+/// `npm install -g` put tools inside the sandbox of workspace `root`.
+fn sandbox_bin_dirs(root: &Path) -> [PathBuf; 3] {
+    let agent_dir = std::path::absolute(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(".agent");
+
+    [
+        agent_dir.join("home/.local/bin"),
+        agent_dir.join("cargo/bin"),
+        agent_dir.join("npm/bin"),
+    ]
+}
+
+/// The current `PATH` with the sandbox's `bin` folders first, then `home`'s
+/// `.cargo/bin` and `.local/bin` for those of them that exist; `None` when
+/// the result cannot be joined.
+fn command_path(root: &Path, home: &Path) -> Option<OsString> {
+    let mut paths: Vec<PathBuf> = sandbox_bin_dirs(root).to_vec();
+    let host_dirs = [".cargo/bin", ".local/bin"].map(|dir| home.join(dir));
+    paths.extend(host_dirs.into_iter().filter(|dir| dir.is_dir()));
 
     let current = std::env::var_os("PATH");
     paths.extend(current.iter().flat_map(std::env::split_paths));
@@ -297,6 +316,7 @@ fn agent_sandbox_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
         ("XDG_DATA_HOME", agent_dir.join("data")),
         ("TMPDIR", agent_dir.join("tmp")),
         ("CARGO_HOME", agent_dir.join("cargo")),
+        ("NPM_CONFIG_PREFIX", agent_dir.join("npm")),
         ("PIP_CACHE_DIR", agent_dir.join("cache/pip")),
         ("NPM_CONFIG_CACHE", agent_dir.join("cache/npm")),
         ("UV_CACHE_DIR", agent_dir.join("cache/uv")),
@@ -536,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn the_host_rustup_home_reaches_the_sandbox() -> Result<()> {
         let root = temp_dir();
-        let rustup = host_tool_env()
+        let rustup = tool_env(&root)
             .into_iter()
             .find(|(variable, _value)| *variable == "RUSTUP_HOME")
             .map(|(_variable, value)| value.to_string_lossy().into_owned())
@@ -557,24 +577,32 @@ mod tests {
     }
 
     #[test]
-    fn installed_tools_come_first_on_the_path() -> Result<()> {
+    fn sandbox_tools_then_installed_tools_come_first_on_the_path() -> Result<()> {
+        let root = temp_dir();
         let home = temp_dir();
         fs::create_dir_all(home.join(".cargo/bin"))?;
         fs::create_dir_all(home.join(".local/bin"))?;
         fs::create_dir_all(home.join(".rustup"))?;
 
-        let env = tool_env_for_home(&home);
+        let env = tool_env_for_home(&root, &home);
         let path = env.iter().find(|(variable, _value)| *variable == "PATH");
         let first_dirs: Vec<PathBuf> = path
-            .map(|(_variable, value)| std::env::split_paths(value).take(2).collect())
+            .map(|(_variable, value)| std::env::split_paths(value).take(5).collect())
             .unwrap_or_default();
 
         assert_eq!(
             first_dirs,
-            [home.join(".cargo/bin"), home.join(".local/bin")]
+            [
+                root.join(".agent/home/.local/bin"),
+                root.join(".agent/cargo/bin"),
+                root.join(".agent/npm/bin"),
+                home.join(".cargo/bin"),
+                home.join(".local/bin"),
+            ]
         );
         assert!(env.contains(&("RUSTUP_HOME", home.join(".rustup").into_os_string())));
 
+        fs::remove_dir_all(root)?;
         fs::remove_dir_all(home)?;
         Ok(())
     }
@@ -583,7 +611,7 @@ mod tests {
     fn a_home_without_toolchains_adds_no_rustup_home() -> Result<()> {
         let home = temp_dir();
 
-        let env = tool_env_for_home(&home);
+        let env = tool_env_for_home(&home, &home);
 
         assert!(
             env.iter()
