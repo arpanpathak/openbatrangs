@@ -157,6 +157,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
     let num_ctx = effective_context(config.model_context, context_cap);
     let RunContinuation {
         earlier,
+        seen_files,
         transcript,
         ..
     } = continuation.unwrap_or_default();
@@ -174,7 +175,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         needs_check: project_has_build_manifest(&config.cwd),
         step: 0,
         messages: initial_messages(&config.cwd, &opening),
-        files: FileLog::default(),
+        files: FileLog::with_changed(Vec::new(), seen_files),
         finish_gate: FinishGate::default(),
         repeat_guard: RepeatGuard::default(),
         transcript,
@@ -622,6 +623,7 @@ fn trim_messages(messages: &mut Vec<ChatMessage>, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::SeenFiles;
     use crate::agent::fakes::{
         FixedConfirmer, RecordingReporter, RecordingSink, Reply, serve_replies, test_config,
     };
@@ -771,6 +773,47 @@ mod tests {
         assert!(output.contains("neither an answer nor a tool call"));
         assert!(!output.contains("the window was"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_file_read_in_an_earlier_run_may_be_written() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-json-seen");
+        let notes = root.join("notes.md");
+        std::fs::write(&notes, "old")?;
+        let seen_files = SeenFiles::default();
+        let mut earlier_run = FileLog::with_changed(Vec::new(), seen_files.clone());
+        earlier_run.saw(&root, "notes.md");
+
+        let replies = [
+            r#"{"tool":{"name":"write_file","arguments":{"path":"notes.md","content":"new"}}}"#,
+            r#"{"answer":"done"}"#,
+        ];
+        let replies = replies.iter().map(|reply| Reply::ollama_stream(reply));
+        let url = serve_replies(replies.collect()).await?;
+        let client = OllamaClient::new(&url)?;
+        let config = test_config(&root, 2);
+        let continuation = RunContinuation {
+            seen_files,
+            ..RunContinuation::default()
+        };
+        let mut reporter = RecordingReporter::default();
+        let mut confirmer = FixedConfirmer::new(true);
+
+        run_json_agent(
+            &config,
+            &client,
+            "m",
+            "change notes.md",
+            Some(continuation),
+            &mut reporter,
+            &mut confirmer,
+        )
+        .await?;
+
+        assert_eq!(std::fs::read_to_string(&notes)?, "new");
+
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

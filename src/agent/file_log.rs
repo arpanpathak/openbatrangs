@@ -9,34 +9,44 @@
 //!
 //! A version is the file's size and modification time, which every write
 //! changes, so checking it costs one `stat` call and no read.
+//!
+//! The versions live in [`SeenFiles`], which the runs of one TUI session
+//! share: a file read in an earlier task stays known while it is unchanged
+//! on disk.
 
 use anyhow::{Result, ensure};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 /// The size and modification time of a file.
 type Version = (u64, Option<SystemTime>);
 
-/// The files one run changed, and the version of each file it last read or
-/// wrote.
+/// The version of each file a session's runs last read or wrote, by
+/// canonical path.
+///
+/// Clones share one map, so a run started later in the session knows the
+/// files that earlier runs read.
+#[derive(Debug, Default, Clone)]
+pub struct SeenFiles(Arc<Mutex<HashMap<PathBuf, Version>>>);
+
+/// The files one run changed, and the version of each file the session last
+/// read or wrote.
 #[derive(Debug, Default)]
 pub(super) struct FileLog {
     /// Paths the run wrote or edited, as the model gave them, in order.
     pub(super) changed: Vec<String>,
-    /// The version the run last read or wrote, by canonical path.
-    seen: HashMap<PathBuf, Version>,
+    /// The version the session last read or wrote, by canonical path.
+    seen: SeenFiles,
 }
 
 impl FileLog {
     /// A log whose changed files are `changed`, as a resumed run finds
-    /// them in its history; it has seen no file yet.
-    pub(super) fn with_changed(changed: Vec<String>) -> Self {
-        Self {
-            changed,
-            seen: HashMap::new(),
-        }
+    /// them in its history, and whose known versions are `seen`.
+    pub(super) fn with_changed(changed: Vec<String>, seen: SeenFiles) -> Self {
+        Self { changed, seen }
     }
 
     /// Record that the run now knows `path` under `cwd` as it is on disk.
@@ -45,7 +55,8 @@ impl FileLog {
             return;
         };
 
-        self.seen.insert(file, version);
+        let mut versions = self.seen.0.lock().unwrap_or_else(PoisonError::into_inner);
+        versions.insert(file, version);
     }
 
     /// Record that the run wrote or edited `path`, which it now knows.
@@ -61,8 +72,10 @@ impl FileLog {
             return Ok(());
         };
 
+        let versions = self.seen.0.lock().unwrap_or_else(PoisonError::into_inner);
+
         ensure!(
-            self.seen.get(&file) == Some(&version),
+            versions.get(&file) == Some(&version),
             "{path} already exists and you have not read it since it last changed; \
              read it with read_file, then change it with edit_file"
         );
