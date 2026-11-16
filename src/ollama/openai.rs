@@ -145,8 +145,13 @@ fn tool_calls_delta(delta: &Value) -> Option<Delta> {
 
 /// The reply text of a streamed delta, or else its reasoning: llama-server
 /// sends `reasoning_content` and vLLM sends `reasoning`.
+///
+/// Reply text keeps Gemma's channel markers, which
+/// [`split_thought_channel`](super::gemma_channel::split_thought_channel)
+/// needs to find the reasoning inside it.
 fn text_delta(delta: &Value) -> Option<Delta> {
-    shown_text(delta, "content")
+    string_at(delta, "content")
+        .filter(|text| !text.is_empty())
         .map(Delta::Content)
         .or_else(|| shown_text(delta, "reasoning_content").map(Delta::Thinking))
         .or_else(|| shown_text(delta, "reasoning").map(Delta::Thinking))
@@ -369,19 +374,20 @@ mod tests {
     }
 
     #[test]
-    fn removes_gemma_channel_markers_from_the_reply() {
+    fn keeps_gemma_channel_markers_in_the_reply() {
         let delta =
             parse_event(r#"{"choices":[{"delta":{"content":"to verify.<channel|>I will add"}}]}"#);
 
         assert_eq!(
             delta,
-            Some(Delta::Content("to verify.I will add".to_string()))
+            Some(Delta::Content("to verify.<channel|>I will add".to_string()))
         );
     }
 
     #[test]
-    fn drops_a_delta_that_holds_only_a_channel_marker() {
-        let delta = parse_event(r#"{"choices":[{"delta":{"content":"<|channel>thought"}}]}"#);
+    fn removes_gemma_channel_markers_from_reasoning() {
+        let delta =
+            parse_event(r#"{"choices":[{"delta":{"reasoning_content":"<|channel>thought"}}]}"#);
 
         assert!(delta.is_none());
     }
