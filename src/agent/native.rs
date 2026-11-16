@@ -236,11 +236,15 @@ impl Message {
 }
 
 /// An assistant message in the OpenAI shape; `tool_calls` is present only
-/// when the turn calls tools.
+/// when the turn calls tools, and `reasoning_content` only when the
+/// reasoning has visible text.
+///
+/// Gemma's chat template renders `reasoning_content` as a thought block, so
+/// reasoning that is only whitespace would put empty thoughts in the prompt.
 fn assistant_json(content: &str, reasoning: &str, calls: &[Invocation]) -> Value {
     let mut message = json!({ "role": "assistant", "content": content });
 
-    if !reasoning.is_empty() {
+    if !reasoning.trim().is_empty() {
         message["reasoning_content"] = json!(reasoning);
     }
 
@@ -397,12 +401,17 @@ impl TurnPrinter {
     }
 
     /// Keep reasoning text for the conversation and print it, when
-    /// reasoning is shown.
+    /// reasoning is shown and has visible text.
+    ///
+    /// With thinking off, Gemma on the Thor still streams reasoning that is
+    /// only newlines; printing it would show an empty reasoning line.
     fn think<R: Reporter>(&mut self, text: &str, reporter: &mut R) {
         self.turn.reasoning.push_str(text);
         self.turn.is_runaway = ends_in_a_loop(&self.turn.reasoning);
 
-        if !self.show_thinking {
+        let is_hidden = !self.show_thinking || self.turn.reasoning.trim().is_empty();
+
+        if is_hidden {
             return;
         }
 
@@ -2176,12 +2185,18 @@ mod tests {
             reasoning: String::new(),
             calls: Vec::new(),
         };
+        let blank = Message::Assistant {
+            content: String::new(),
+            reasoning: "\n\n\n".to_string(),
+            calls: vec![read_call("call_2")],
+        };
 
         assert_eq!(
             thought.to_json()["reasoning_content"],
             "Read the file first."
         );
         assert!(silent.to_json().get("reasoning_content").is_none());
+        assert!(blank.to_json().get("reasoning_content").is_none());
     }
 
     #[test]
@@ -2375,6 +2390,24 @@ mod tests {
         let turn = collect_turn(deltas(), &mut hidden, false).await?;
         assert!(hidden.output.ends_with(" m\nHi"));
         assert_eq!(turn.reasoning, "plan moreagainlast");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blank_reasoning_opens_no_reasoning_line() -> Result<()> {
+        let deltas = futures_util::stream::iter([
+            Ok(Delta::Thinking("\n".to_string())),
+            Ok(Delta::Thinking("\n".to_string())),
+            Ok(Delta::ToolCalls(vec![ToolCallDelta::default()])),
+        ]);
+        let mut reporter = RecordingReporter::default();
+
+        let turn = collect_turn(deltas, &mut reporter, true).await?;
+
+        assert_eq!(reporter.output, "");
+        assert_eq!(turn.reasoning, "\n\n");
+        assert_eq!(turn.calls.len(), 1);
 
         Ok(())
     }
