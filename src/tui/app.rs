@@ -3215,7 +3215,7 @@ mod tests {
         ollama_app.refresh_model_info(&ollama).await;
 
         assert_eq!(app.model.as_deref(), Some("Gemma-4-26B-A4B-NVFP4"));
-        assert_eq!(app.temperature_in_use(), 1.0, "Gemma's model card");
+        assert_eq!(app.temperature_in_use(), Some(1.0), "Gemma's model card");
         assert_eq!(
             ollama_app.model, None,
             "Ollama picks its model on the first task"
