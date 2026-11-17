@@ -1,6 +1,6 @@
 //! Clap argument definitions and default values.
 
-use crate::constants::cli::{DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
+use crate::constants::cli::DEFAULT_MIN_CONTEXT;
 use clap::builder::FalseyValueParser;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -18,21 +18,32 @@ pub(crate) struct Cli {
     #[arg(value_name = "TASK")]
     pub(crate) task: Vec<String>,
 
-    /// Ollama server URL.
-    #[arg(long, global = true, default_value = DEFAULT_OLLAMA_URL)]
-    pub(crate) ollama_url: String,
+    /// Ollama server URL. Without it, a provider from the config file or the
+    /// local Ollama at http://localhost:11434 is used.
+    #[arg(long, global = true, value_name = "URL")]
+    pub(crate) ollama_url: Option<String>,
 
     /// Use the models on the Thor over Tailscale: same as
     /// `--openai-url https://arpanpathak.taildb9a39.ts.net/v1 --api-key-file ~/.config/thor-chat/api-key`.
     #[arg(long, global = true)]
     pub(crate) thor: bool,
 
+    /// Use the provider named NAME in `~/.config/openbatrangs/config.toml`.
+    #[arg(
+        long,
+        global = true,
+        env = "OPENBATRANGS_PROVIDER",
+        value_name = "NAME"
+    )]
+    pub(crate) provider: Option<String>,
+
     /// Use an OpenAI-compatible server (llama-server, vLLM, trtllm-serve)
     /// instead of Ollama, e.g. `http://127.0.0.1:8079/v1`.
     #[arg(long, global = true, value_name = "URL")]
     pub(crate) openai_url: Option<String>,
 
-    /// File holding the bearer key for `--openai-url`.
+    /// File holding the bearer key for `--openai-url`, or for the provider
+    /// in place of its `api_key`.
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) api_key_file: Option<PathBuf>,
 
@@ -106,7 +117,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) is_update_check_disabled: bool,
 
-    /// Optional subcommand (agent, list-models, doctor, setup, pull, update).
+    /// Optional subcommand (agent, list-models, doctor, setup, pull, update,
+    /// provider).
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -134,19 +146,50 @@ pub(crate) enum Commands {
     },
     /// Check for a newer release now and install it when there is one.
     Update,
+    /// List, add or remove the providers in the config file.
+    Provider {
+        /// What to do with the providers.
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
+}
+
+/// What `openbatrangs provider` does.
+#[derive(Subcommand)]
+pub(crate) enum ProviderAction {
+    /// List the providers and whether each has a key.
+    List,
+    /// Add a provider, or change its URL and key. The key is read from the
+    /// terminal without echo, or from standard input when it is piped.
+    Add {
+        /// Provider name: anthropic, deepseek, openai, or a name of your own.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Server address; needed for a name of your own.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// Remove a provider.
+    Remove {
+        /// Provider name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::cli::{DEFAULT_MIN_CONTEXT, DEFAULT_OLLAMA_URL};
+    use crate::constants::cli::DEFAULT_MIN_CONTEXT;
+    use clap::CommandFactory;
 
     #[test]
     fn parses_defaults_without_arguments() {
         let cli = Cli::parse_from(["openbatrangs"]);
 
         assert!(cli.task.is_empty());
-        assert_eq!(cli.ollama_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(cli.ollama_url, None);
+        assert_eq!(cli.provider, None);
         assert_eq!(cli.max_steps, None);
         assert_eq!(cli.min_context, DEFAULT_MIN_CONTEXT);
         assert_eq!(cli.max_ctx, None);
@@ -221,6 +264,51 @@ mod tests {
 
         assert!(matches!(cli.command, Some(Commands::Update)));
         assert!(cli.is_update_check_disabled);
+    }
+
+    #[test]
+    fn parses_the_provider_flag_and_subcommands() {
+        let flagged = Cli::parse_from(["openbatrangs", "--provider", "deepseek"]);
+        let add = Cli::parse_from([
+            "openbatrangs",
+            "provider",
+            "add",
+            "box",
+            "--url",
+            "http://box/v1",
+        ]);
+        let remove = Cli::parse_from(["openbatrangs", "provider", "remove", "box"]);
+        let list = Cli::parse_from(["openbatrangs", "provider", "list"]);
+
+        assert_eq!(flagged.provider.as_deref(), Some("deepseek"));
+        assert!(matches!(
+            add.command,
+            Some(Commands::Provider { action: ProviderAction::Add { name, url } })
+                if name == "box" && url.as_deref() == Some("http://box/v1")
+        ));
+        assert!(matches!(
+            remove.command,
+            Some(Commands::Provider { action: ProviderAction::Remove { name } }) if name == "box"
+        ));
+        assert!(matches!(
+            list.command,
+            Some(Commands::Provider {
+                action: ProviderAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_reads_its_environment_variable() {
+        let command = Cli::command();
+        let provider = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "provider");
+
+        assert_eq!(
+            provider.and_then(|argument| argument.get_env()),
+            Some(std::ffi::OsStr::new("OPENBATRANGS_PROVIDER"))
+        );
     }
 
     #[test]

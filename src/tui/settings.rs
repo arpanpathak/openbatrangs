@@ -5,7 +5,8 @@
 //! 0.1, and whether the model thinks before it answers. ↑ and ↓ choose a
 //! setting, ← and → change it, `a` sets the temperature back to the model
 //! card's, and Esc or Enter closes the dialog. A change applies from the next
-//! request on.
+//! request on. When a provider from the config file is in use, closing the
+//! dialog saves both settings to its table.
 //!
 //! The mouse works too. A left click on the thinking row chooses it and turns
 //! thinking off or on; a left click on the temperature row chooses it, and on
@@ -109,9 +110,15 @@ impl App {
             SettingsKey::Lower => self.change_setting(-TEMPERATURE_STEP),
             SettingsKey::Raise => self.change_setting(TEMPERATURE_STEP),
             SettingsKey::Auto => self.run_config.temperature = None,
-            SettingsKey::Close => self.modal = None,
+            SettingsKey::Close => self.close_settings(),
             SettingsKey::Nothing => {}
         }
+    }
+
+    /// Close the dialog and save its settings to the provider in use.
+    fn close_settings(&mut self) {
+        self.modal = None;
+        self.save_provider_settings();
     }
 
     /// Apply a mouse event while the settings dialog is open: a left click

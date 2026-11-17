@@ -30,7 +30,8 @@ impl App {
     ///
     /// # Returns
     ///
-    /// `Ok(())` on success, or the network error of `/models`, `/model` or `/doctor`.
+    /// `Ok(())` on success, the network error of `/models`, `/model` or
+    /// `/doctor`, or the config file error of `/provider`.
     pub(super) async fn run_slash_command(
         &mut self,
         client: &OllamaClient,
@@ -45,6 +46,7 @@ impl App {
             "exit" | "quit" => self.should_quit = true,
             "models" => self.show_model_picker(client).await?,
             "model" => self.handle_model_command(client, arg).await?,
+            "provider" => self.handle_provider_command(arg).await?,
             "pull" => self.handle_pull_command(client, arg, tx),
             "read-only" => self.toggle_read_only(),
             "confirm" => self.toggle_confirm(),
@@ -203,6 +205,21 @@ impl App {
         self.model = Some(name.to_string());
         self.notice(format!("✅ Model set to {name}"));
         self.refresh_model_info(client).await;
+    }
+
+    /// Open the provider picker, or switch to the provider `name` for every
+    /// later task and command.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: provider name, or empty to open the picker.
+    async fn handle_provider_command(&mut self, name: &str) -> anyhow::Result<()> {
+        if name.is_empty() {
+            self.open_provider_picker();
+            return Ok(());
+        }
+
+        self.switch_provider(name).await
     }
 
     /// Start downloading a model from the Ollama registry in the background.

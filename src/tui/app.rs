@@ -2,6 +2,7 @@
 
 use super::block::BlockContent;
 use super::choice::ChoiceState;
+use super::provider::ProviderForm;
 use super::scroll::{chat_text_width, chat_visible_height, is_inside_track};
 use super::selection::{ClipboardProgram, Selection, TextPoint, pipe_text, selected_text};
 use super::settings::SettingsRow;
@@ -12,7 +13,10 @@ use super::{
     ScrollMode, UiEvent, WorkerHistory, extract_path_from_line, open_in_vim, run_agent_worker,
 };
 use crate::agent::{AgentEvent, ContextUse, Question, SeenFiles, TextKind, describe_call};
-use crate::cli::{AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url};
+use crate::cli::{
+    AgentMode, AgentRunConfig, Cli, ModelPrefs, search_key, searxng_url, user_config_path,
+};
+use crate::constants::cli::DEFAULT_OLLAMA_URL;
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
     CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_TRANSCRIPT_BLOCKS, SPINNER, STREAM_GAP,
@@ -26,33 +30,54 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Model picker popup state.
+/// Picker popup state: a list of rows, one of them highlighted.
 pub(super) struct PickerState {
-    /// Available model tags to choose from.
-    pub(super) models: Vec<String>,
-    /// Index of the currently highlighted model.
+    /// The rows shown, one per choice.
+    pub(super) rows: Vec<String>,
+    /// Index of the currently highlighted row.
     pub(super) selected: usize,
+    /// What the rows are, and what choosing one does.
+    pub(super) purpose: PickerPurpose,
+}
+
+/// What a picker chooses.
+pub(super) enum PickerPurpose {
+    /// A model; each row is a model tag.
+    Model,
+    /// A provider, or a step of adding one; one choice per row.
+    Provider(Vec<ProviderChoice>),
+}
+
+/// A row of the provider picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ProviderChoice {
+    /// A provider in the config file, by name.
+    Named(String),
+    /// Add a provider: ask what kind first.
+    Add,
+    /// The local Ollama, without writing the config file.
+    LocalOllama,
+    /// Add the built-in provider with this name; only a key is asked for.
+    BuiltIn(&'static str),
+    /// Add a server of your own: a name, a URL and a key are asked for.
+    Own,
 }
 
 impl PickerState {
-    /// Highlight the model above the current one.
+    /// Highlight the row above the current one.
     fn select_previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// Highlight the model below the current one, stopping at the last.
+    /// Highlight the row below the current one, stopping at the last.
     fn select_next(&mut self) {
-        self.selected = (self.selected + 1).min(self.models.len().saturating_sub(1));
-    }
-
-    /// The highlighted model tag, or `None` when the list is empty.
-    fn highlighted_model(&self) -> Option<String> {
-        self.models.get(self.selected).cloned()
+        self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
     }
 }
 
@@ -289,6 +314,16 @@ pub(super) struct App {
     pub(super) model: Option<String>,
     /// URL of the Ollama server this app is connected to.
     pub(super) server_url: String,
+    /// The config file that holds the providers.
+    pub(super) config_path: PathBuf,
+    /// The provider in use, or `None` when a flag names the server or no
+    /// provider is chosen; `/settings` changes are saved to its table.
+    pub(super) provider: Option<String>,
+    /// The client of a newly chosen provider, until the event loop takes it
+    /// and uses it for every later task and command.
+    pub(super) switched_client: Option<OllamaClient>,
+    /// The step of adding a provider that the next input line answers.
+    pub(super) provider_form: Option<ProviderForm>,
     /// Pre-formatted model metadata line (size, params, quant, context).
     pub(super) model_info: Option<String>,
     /// The user's original task prompt, displayed in the banner area.
@@ -396,7 +431,11 @@ impl App {
             modal: None,
             should_quit: false,
             model: cli.model.clone(),
-            server_url: cli.ollama_url.clone(),
+            server_url: DEFAULT_OLLAMA_URL.to_string(),
+            config_path: user_config_path(),
+            provider: cli.provider.clone(),
+            switched_client: None,
+            provider_form: None,
             model_info: None,
             current_prompt: None,
             interrupted_task: None,
@@ -497,9 +536,15 @@ impl App {
 
     /// Open the model picker, replacing any active modal.
     pub(super) fn open_picker(&mut self, models: Vec<String>) {
+        self.open_picker_for(models, PickerPurpose::Model);
+    }
+
+    /// Open a picker on `rows` for `purpose`, replacing any active modal.
+    pub(super) fn open_picker_for(&mut self, rows: Vec<String>, purpose: PickerPurpose) {
         self.modal = Some(ActiveModal::Picker(PickerState {
-            models,
+            rows,
             selected: 0,
+            purpose,
         }));
     }
 
@@ -1170,6 +1215,7 @@ impl App {
 
         self.input.clear();
         self.cursor = 0;
+        self.provider_form = None;
     }
 
     /// Whether a task is running or waiting in the queue.
@@ -1524,7 +1570,7 @@ impl App {
         match picker_key(&key) {
             PickerKey::Up => self.update_picker(PickerState::select_previous),
             PickerKey::Down => self.update_picker(PickerState::select_next),
-            PickerKey::Choose => self.choose_highlighted_model(client).await,
+            PickerKey::Choose => self.choose_highlighted(client).await,
             PickerKey::Close => self.close_modal(),
             PickerKey::Ignore => {}
         }
@@ -1537,13 +1583,28 @@ impl App {
         }
     }
 
-    /// Close the picker and switch to the model it highlighted.
-    async fn choose_highlighted_model(&mut self, client: &OllamaClient) {
-        let chosen = self.picker().and_then(PickerState::highlighted_model);
-        self.close_modal();
+    /// Close the picker and act on the row it highlighted: switch to that
+    /// model, or choose that provider.
+    async fn choose_highlighted(&mut self, client: &OllamaClient) {
+        let picker = match self.modal.take() {
+            Some(ActiveModal::Picker(picker)) => picker,
+            other => {
+                self.modal = other;
+                return;
+            }
+        };
+        let selected = picker.selected;
 
-        if let Some(name) = chosen {
-            self.activate_model(client, &name).await;
+        match picker.purpose {
+            PickerPurpose::Model => self.activate_row(client, &picker.rows, selected).await,
+            PickerPurpose::Provider(choices) => self.choose_provider(choices, selected).await,
+        }
+    }
+
+    /// Switch to the model in row `selected` of `rows`, if there is one.
+    async fn activate_row(&mut self, client: &OllamaClient, rows: &[String], selected: usize) {
+        if let Some(name) = rows.get(selected) {
+            self.activate_model(client, name).await;
         }
     }
 
@@ -1583,6 +1644,11 @@ impl App {
         tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let submitted = self.take_input();
+
+        if let Some(step) = self.provider_form.take() {
+            self.answer_provider_form(step, submitted).await;
+            return;
+        }
 
         let Some((task, resume)) = self.task_for_submission(submitted) else {
             return;
@@ -3125,6 +3191,19 @@ mod tests {
         app.answer_confirmation(false);
 
         assert!(app.transcript.is_empty());
+    }
+
+    #[tokio::test]
+    async fn choosing_without_a_picker_keeps_the_open_dialog() -> anyhow::Result<()> {
+        let client = refused_client()?;
+        let mut app = test_app();
+        app.open_settings();
+
+        app.choose_highlighted(&client).await;
+
+        assert!(matches!(app.modal, Some(ActiveModal::Settings(_))));
+        assert!(app.model.is_none());
+        Ok(())
     }
 
     #[tokio::test]

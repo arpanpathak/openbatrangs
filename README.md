@@ -179,7 +179,8 @@ ollama pull qwen3-coder:30b
 openbatrangs --model qwen3-coder:30b
 ```
 
-Without `--openai-url`, you connect to Ollama at `http://localhost:11434`. If
+Without a server flag or a provider, a task runs on Ollama at
+`http://localhost:11434`, and the terminal UI offers it in its provider list. If
 Ollama is installed but not running, `ollama serve` is started for you. To
 install Ollama and download a coding model, run `openbatrangs setup`. With
 `openbatrangs list-models`, you see a score for agentic coding on your hardware
@@ -338,6 +339,7 @@ openbatrangs update                                                      # insta
 |---|---|
 | `--openai-url <url>` | the server's base URL, including `/v1` |
 | `--api-key-file <path>` | a file whose contents are sent as a bearer token |
+| `--provider <name>` | a provider from the config file, for this run |
 | `--model <name>` | the model to use, instead of the first one the server lists |
 | `--cwd <path>` | the project folder, instead of the current one |
 | `--confirm` | a prompt before each file write and shell command |
@@ -361,6 +363,72 @@ ssh -fN -L 18888:127.0.0.1:8888 gpu-vm      # forward SearXNG from a remote mach
 openbatrangs --searxng-url http://127.0.0.1:18888
 ```
 
+### Providers
+
+Run `openbatrangs` with no flags, and the terminal UI lists your providers.
+Choose one, or choose "Add a provider…" to add Anthropic, DeepSeek, OpenAI or a
+server of your own. For your own server, you type a name and a URL. Then you
+type the API key, which the input line shows as dots. openbatrangs writes the
+provider to `~/.config/openbatrangs/config.toml` (or under `$XDG_CONFIG_HOME`),
+readable only by you, and uses it right away. With one provider in the file,
+openbatrangs uses it without asking.
+
+Each provider is one table named after the provider. Anthropic, DeepSeek and
+OpenAI need only a key, because openbatrangs knows their URLs. Anthropic is
+reached through its OpenAI-compatible endpoint; a native Anthropic backend comes
+in a later release.
+
+```toml
+search_engine_url = "http://localhost:8888"
+
+[anthropic]
+api_key = "sk-ant-..."
+think = true
+temperature = "auto"
+
+[deepseek]
+api_key = "sk-..."
+think = false
+
+[openai]
+api_key = "sk-..."
+
+[home-gpu]
+url = "http://192.168.1.20:8000/v1"
+temperature = 0.7
+
+[colab]
+url = "http://localhost:8000/v1"
+api_key = "..."
+```
+
+| Key | Meaning |
+|---|---|
+| `url` | the server's address; a URL that ends in `/v1` is an OpenAI-compatible server, any other is Ollama. Needed for a name of your own |
+| `api_key` | the key sent as a bearer token |
+| `think` | whether thinking models reason before they answer; on by default |
+| `temperature` | a number, or `"auto"` for each model card's temperature |
+| `search_engine_url` | the SearXNG instance for web search, outside any table |
+
+When a provider is in use, the changes you make in `/settings` are saved to its
+table. Flags such as `--temperature`, `--no-think`, `--searxng-url` and
+`--api-key-file` apply to one run and take precedence over the file. A server
+flag (`--openai-url` or `--ollama-url`) takes precedence over every provider.
+
+For scripts, the same changes are available as commands:
+
+```sh
+openbatrangs provider list                                   # names, URLs, and whether each has a key
+echo "$DEEPSEEK_API_KEY" | openbatrangs provider add deepseek
+openbatrangs provider add home-gpu --url http://192.168.1.20:8000/v1
+openbatrangs provider remove home-gpu
+openbatrangs --provider deepseek "fix the failing test"
+```
+
+`provider add` asks for the key without showing it, or reads it from standard
+input when you pipe it. A task run with several providers in the file needs
+`--provider` or `OPENBATRANGS_PROVIDER`.
+
 ## Terminal UI commands
 
 | Command | Effect |
@@ -370,6 +438,7 @@ openbatrangs --searxng-url http://127.0.0.1:18888
 | `/mode agent\|plan\|chat` | switch between every tool, read-only planning and plain chat |
 | `/model <name>` | switch to another model |
 | `/models` | open the model picker |
+| `/provider [name]` | switch to a provider, or open the list to choose or add one |
 | `/read-only` | turn read-only mode on or off |
 | `/confirm` | turn the prompt before writes and commands on or off |
 | `/yolo` | turn off every prompt |
