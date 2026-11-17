@@ -39,6 +39,16 @@ impl Reply {
         }
     }
 
+    /// A bad-request reply with a JSON body, as a server sends for a field
+    /// it does not accept.
+    pub(super) fn bad_request(body: &Value) -> Self {
+        Self {
+            status: "400 Bad Request",
+            content_type: "application/json",
+            body: body.to_string(),
+        }
+    }
+
     /// An Ollama `/api/chat` stream that sends `content` as one message and
     /// then the `done` line.
     pub(super) fn ollama_stream(content: &str) -> Self {
