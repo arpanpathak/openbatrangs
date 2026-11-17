@@ -50,3 +50,10 @@ pub const GEMMA_THOUGHT_CHANNEL: &str = "thought";
 /// passes them through there.
 pub const GEMMA_CHANNEL_MARKERS: [&str; 3] =
     ["<|channel>thought", GEMMA_CHANNEL_START, GEMMA_CHANNEL_END];
+
+/// Version of Anthropic's API sent in the `anthropic-version` header.
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Host of Anthropic's API. A provider at this host sends its key the way
+/// that API reads it.
+pub const ANTHROPIC_API_HOST: &str = "api.anthropic.com";

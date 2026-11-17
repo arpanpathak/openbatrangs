@@ -29,8 +29,8 @@ pub(crate) use types::{
 };
 
 use crate::constants::ollama::{
-    API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH, CONNECT_TIMEOUT_SECONDS,
-    DEFAULT_OLLAMA_CONTEXT_CAP, READ_TIMEOUT,
+    ANTHROPIC_VERSION, API_CHAT_PATH, API_PULL_PATH, API_SHOW_PATH, API_TAGS_PATH,
+    CONNECT_TIMEOUT_SECONDS, DEFAULT_OLLAMA_CONTEXT_CAP, READ_TIMEOUT,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use reader::DeltaStream;
@@ -56,12 +56,25 @@ enum Api {
     Ollama,
     /// An OpenAI-compatible server such as llama-server.
     OpenAi {
-        /// Bearer token sent with every request, if the server needs one.
+        /// Access key sent with every request, if the server needs one.
         key: Option<String>,
+        /// The headers that carry `key`.
+        key_headers: KeyHeaders,
         /// Send `enable_thinking: true` with each chat request, so thinking
         /// models reason before the reply.
         think: bool,
     },
+}
+
+/// The headers an OpenAI-compatible server reads the access key from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyHeaders {
+    /// `Authorization: Bearer KEY`, as OpenAI and most servers expect.
+    Bearer,
+    /// `x-api-key: KEY` with `anthropic-version`, which every endpoint of
+    /// Anthropic's API accepts, its model list included. That list does not
+    /// accept the bearer header alone.
+    Anthropic,
 }
 
 impl OllamaClient {
@@ -94,14 +107,46 @@ impl OllamaClient {
     /// connection can be closed between agent steps, and the next request
     /// would fail with "connection closed before message completed".
     pub fn openai(base_url: &str, key: Option<String>, think: bool) -> Result<Self> {
+        Self::openai_with(base_url, key, KeyHeaders::Bearer, think)
+    }
+
+    /// Create a client for Anthropic's OpenAI-compatible API, which reads
+    /// the key from `x-api-key`. Arguments as for [`OllamaClient::openai`].
+    pub fn anthropic(base_url: &str, key: Option<String>, think: bool) -> Result<Self> {
+        Self::openai_with(base_url, key, KeyHeaders::Anthropic, think)
+    }
+
+    /// An OpenAI-compatible client that sends `key` in `key_headers`.
+    fn openai_with(
+        base_url: &str,
+        key: Option<String>,
+        key_headers: KeyHeaders,
+        think: bool,
+    ) -> Result<Self> {
         let builder = reqwest::Client::builder().pool_max_idle_per_host(0);
         let http = http_client(builder, READ_TIMEOUT)?;
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
-            api: Api::OpenAi { key, think },
+            api: Api::OpenAi {
+                key,
+                key_headers,
+                think,
+            },
         })
+    }
+
+    /// Whether this client sends its key in Anthropic's headers.
+    #[cfg(test)]
+    pub(crate) fn sends_anthropic_headers(&self) -> bool {
+        matches!(
+            self.api,
+            Api::OpenAi {
+                key_headers: KeyHeaders::Anthropic,
+                ..
+            }
+        )
     }
 
     /// Whether this client talks to an OpenAI-compatible server.
@@ -121,10 +166,21 @@ impl OllamaClient {
         }
     }
 
-    /// Attach the bearer token, if any.
+    /// Attach the access key, if any, in the headers the server reads.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.api {
-            Api::OpenAi { key: Some(key), .. } => request.bearer_auth(key),
+            Api::OpenAi {
+                key: Some(key),
+                key_headers: KeyHeaders::Bearer,
+                ..
+            } => request.bearer_auth(key),
+            Api::OpenAi {
+                key: Some(key),
+                key_headers: KeyHeaders::Anthropic,
+                ..
+            } => request
+                .header("x-api-key", key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
             Api::Ollama | Api::OpenAi { key: None, .. } => request,
         }
     }
@@ -136,8 +192,7 @@ impl OllamaClient {
             .send()
             .await
             .with_context(|| format!("failed to reach {url}"))?;
-        let response =
-            require_success(response).map_err(|status| anyhow!("{url} returned HTTP {status}"))?;
+        let response = require_success_with_body(response, &url).await?;
 
         response
             .json()
@@ -993,12 +1048,31 @@ mod tests {
 
     #[tokio::test]
     async fn openai_tags_report_an_http_failure() -> Result<()> {
-        let base_url = spawn_mock_server(|_path| MockResponse::text("401 Unauthorized", "")).await;
+        let base_url =
+            spawn_mock_server(|_path| MockResponse::text("401 Unauthorized", "invalid key")).await;
         let client = OllamaClient::openai(&base_url, Some("wrong".to_string()), false)?;
 
         let tags = client.tags().await;
 
-        assert!(format!("{tags:?}").contains("/models returned HTTP 401 Unauthorized"));
+        assert!(
+            format!("{tags:?}").contains("/models returned HTTP 401 Unauthorized: invalid key")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_client_sends_its_key_in_anthropic_headers() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}/v1", listener.local_addr()?);
+        tokio::spawn(echo_one_request(listener));
+        let client = OllamaClient::anthropic(&base_url, Some("secret".to_string()), true)?;
+
+        let request = client.server_text("/metrics").await.unwrap_or_default();
+        let request = request.to_lowercase();
+
+        assert!(request.contains("x-api-key: secret"));
+        assert!(request.contains("anthropic-version: 2023-06-01"));
+        assert!(!request.contains("authorization:"));
         Ok(())
     }
 
