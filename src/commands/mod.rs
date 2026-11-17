@@ -7,6 +7,7 @@
 //! - [`agent`]: one-shot agent/TUI dispatch.
 //! - [`update`]: release check and install (`update`).
 //! - [`transcript`]: the `--transcript-out` file of a one-shot run.
+//! - [`provider`]: the providers in the config file (`provider`).
 //!
 //! [`ensure_ollama`] is the shared bootstrap: it probes the server, starts
 //! `ollama serve` when the binary exists, and polls until the server responds.
@@ -19,6 +20,7 @@
 mod agent;
 mod doctor;
 mod models;
+mod provider;
 mod pull;
 mod setup;
 mod transcript;
@@ -27,6 +29,7 @@ mod update;
 pub(crate) use agent::run_agent_or_tui;
 pub(crate) use doctor::{doctor, doctor_lines};
 pub(crate) use models::list_models;
+pub(crate) use provider::provider;
 pub(crate) use pull::pull;
 pub(crate) use setup::{setup, setup_with_status};
 pub(crate) use update::update;

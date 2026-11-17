@@ -4,7 +4,7 @@
 //! - a chat scrollback area with wrapping,
 //! - a fixed bottom input box,
 //! - slash-command suggestions,
-//! - a model picker,
+//! - a model picker, also used to choose and add providers,
 //! - a live spinner and current agent action,
 //! - background agent workers with a task queue,
 //! - a live system/GPU performance panel.
@@ -16,6 +16,7 @@
 //! - `markdown`: Markdown to styled terminal rows.
 //! - `session`: the session file that holds blocks outside the window.
 //! - `commands`: slash-command handlers.
+//! - `provider`: choosing and adding providers.
 //! - `text`: ANSI stripping, wrapping, path extraction, and editor launch.
 //! - `worker`: background agent/chat workers.
 //! - `ui`: ratatui rendering.
@@ -27,6 +28,7 @@ mod choice;
 mod commands;
 mod input;
 mod markdown;
+mod provider;
 mod scroll;
 mod selection;
 mod session;
@@ -227,6 +229,7 @@ async fn run_app<W: Write>(
         std::env::var_os("SSH_CONNECTION").is_some(),
     );
     app.refresh_model_info(client).await;
+    app.offer_providers(cli);
 
     run_loop(terminal, &mut app, events, client, update_check).await
 }
@@ -270,11 +273,14 @@ async fn run_loop<W: Write>(
         ticker: redraw_ticker(),
     };
     let mut outcome = Ok(LoopControl::Continue);
+    let mut client = client.clone();
 
     start_update_worker(update_check, &tx);
 
     while let Ok(LoopControl::Continue) = outcome {
-        outcome = step(terminal, app, events, &mut rx, client, &tx, &mut state).await;
+        // A provider chosen in the last step brings its own client.
+        client = app.switched_client.take().unwrap_or(client);
+        outcome = step(terminal, app, events, &mut rx, &client, &tx, &mut state).await;
     }
 
     // `Ok(Exit)` ends the loop normally; an error ends it with that error.
@@ -573,7 +579,8 @@ mod tests {
         script.push(key(event::KeyCode::Enter));
         script.extend(typed("never typed"));
         let mut events = futures_util::stream::iter(script);
-        let cli = Cli::parse_from(["openbatrangs"]);
+        // A named server, so no provider picker opens at launch.
+        let cli = Cli::parse_from(["openbatrangs", "--ollama-url", "http://127.0.0.1:1"]);
 
         run_app(&mut terminal, &mut events, &cli, &refused_client()?, None).await?;
 
@@ -585,6 +592,38 @@ mod tests {
             output.contains("\x1b[?1000l"),
             "/mouse off must turn it off"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commands_after_a_provider_switch_use_its_server() -> anyhow::Result<()> {
+        let server_url = crate::test_support::served_model_server().await;
+        let mut output = Vec::new();
+        let mut terminal = memory_terminal(&mut output)?;
+        let mut app = test_app();
+        app.config_path =
+            crate::test_support::config_file_with(&format!("[box]\nurl = \"{server_url}\""))?;
+        let mut script = typed("/provider box");
+        script.push(key(event::KeyCode::Enter));
+        script.extend(typed("/models"));
+        script.push(key(event::KeyCode::Enter));
+        let mut events = futures_util::stream::iter(script);
+
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &mut events,
+            &refused_client()?,
+            None,
+        )
+        .await?;
+
+        assert!(
+            app.is_showing_picker(),
+            "/models must list the new server's models"
+        );
+        assert!(app.switched_client.is_none());
 
         Ok(())
     }

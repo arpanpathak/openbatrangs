@@ -32,17 +32,60 @@ mod test_support;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, ConfigFile};
+use constants::cli::DEFAULT_OLLAMA_URL;
 use ollama::OllamaClient;
 use std::path::{Path, PathBuf};
 
-/// Parse the arguments, connect to the model server and run the command.
+/// Parse the arguments, read the config file, connect to the model server
+/// and run the command. `provider` only reads or changes the config file,
+/// so it runs before any client is built.
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = build_client(&cli)?;
+    let config_path = cli::user_config_path();
+
+    if let Some(warning) = cli::permission_warning(&config_path) {
+        eprintln!("{warning}");
+    }
+
+    if let Some(Commands::Provider { action }) = &cli.command {
+        return commands::provider(action, &config_path);
+    }
+
+    let config = ConfigFile::load(&config_path)?;
+    let (cli, client) = connect(cli, config)?;
 
     run_command(&cli, &client).await
+}
+
+/// The model client for this run, and the arguments with the chosen
+/// provider's settings filled in where no flag sets them. After this,
+/// `cli.provider` names the provider in use, or is `None` when none is.
+fn connect(mut cli: Cli, mut config: ConfigFile) -> Result<(Cli, OllamaClient)> {
+    // `--thor` searches through the Thor unless a flag or the environment
+    // names a SearXNG instance, as before the config file existed.
+    let file_search_url = config.search_engine_url.take().filter(|_url| !cli.thor);
+    cli.searxng_url = cli.searxng_url.or(file_search_url);
+    let chosen = cli::chosen_provider(&cli, config)?;
+    cli.provider = None;
+
+    let Some((name, mut provider)) = chosen else {
+        let client = build_client(&cli)?;
+        return Ok((cli, client));
+    };
+
+    let key = match &cli.api_key_file {
+        Some(key_file) => Some(read_key(key_file)?),
+        None => provider.api_key.take(),
+    };
+    cli.temperature = cli.temperature.or(provider.temperature);
+    cli.is_thinking_disabled = cli.is_thinking_disabled || provider.think == Some(false);
+    cli.provider = Some(name);
+
+    let client = provider.client(key, !cli.is_thinking_disabled)?;
+
+    Ok((cli, client))
 }
 
 /// Run the subcommand named on the command line, or the agent when none is named.
@@ -54,6 +97,8 @@ async fn run_command(cli: &Cli, client: &OllamaClient) -> Result<()> {
         Some(Commands::Agent { task }) => run_agent(cli, client, task).await,
         Some(Commands::Pull { model }) => pull(client, model).await,
         Some(Commands::Update) => commands::update(&update::UpdateCheck::for_this_process()).await,
+        // `main` runs `provider` before a client exists.
+        Some(Commands::Provider { .. }) => Ok(()),
         None => run_agent(cli, client, &cli.task).await,
     }
 }
@@ -91,7 +136,7 @@ async fn pull(client: &OllamaClient, model: &str) -> Result<()> {
 fn build_client(cli: &Cli) -> Result<OllamaClient> {
     match openai_server(cli, crate::cli::home_directory()) {
         Some((url, key_file)) => openai_client(cli, &url, key_file),
-        None => OllamaClient::new(&cli.ollama_url),
+        None => OllamaClient::new(cli.ollama_url.as_deref().unwrap_or(DEFAULT_OLLAMA_URL)),
     }
 }
 
@@ -194,5 +239,170 @@ mod tests {
 
         assert!(build_client(&cli)?.is_openai());
         Ok(())
+    }
+
+    /// A config file with two providers: an OpenAI-compatible server with
+    /// settings, and an Ollama server.
+    const TWO_PROVIDERS: &str = "search_engine_url = \"http://search:8888\"\n\
+        [box]\nurl = \"http://box:8000/v1\"\napi_key = \"box-key\"\nthink = false\ntemperature = 0.4\n\
+        [local]\nurl = \"http://localhost:11434\"\n";
+
+    /// The config file holding `text`.
+    fn config(text: &str) -> Result<ConfigFile> {
+        ConfigFile::load(&test_support::config_file_with(text)?)
+    }
+
+    /// A key file holding `secret`, and its path as an argument.
+    fn key_file_argument() -> Result<String> {
+        let key_file = test_support::unique_temp_dir("openbatrangs-key").join("api-key");
+        std::fs::write(&key_file, "secret")?;
+
+        Ok(key_file.display().to_string())
+    }
+
+    #[test]
+    fn without_providers_the_local_ollama_is_used() -> Result<()> {
+        let (cli, client) = connect(Cli::parse_from(["openbatrangs"]), config("")?)?;
+
+        assert!(!client.is_openai());
+        assert_eq!(client.base_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(cli.provider, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_named_provider_brings_its_settings() -> Result<()> {
+        let cli = Cli::parse_from(["openbatrangs", "--provider", "box"]);
+
+        let (cli, client) = connect(cli, config(TWO_PROVIDERS)?)?;
+
+        assert!(client.is_openai());
+        assert_eq!(client.base_url, "http://box:8000/v1");
+        assert_eq!(cli.provider.as_deref(), Some("box"));
+        assert_eq!(cli.temperature, Some(0.4));
+        assert!(cli.is_thinking_disabled);
+        assert_eq!(cli.searxng_url.as_deref(), Some("http://search:8888"));
+        Ok(())
+    }
+
+    #[test]
+    fn flags_win_over_the_provider_settings() -> Result<()> {
+        let cli = Cli::parse_from([
+            "openbatrangs",
+            "--provider",
+            "box",
+            "--temperature",
+            "1.2",
+            "--searxng-url",
+            "http://other:8888",
+        ]);
+
+        let (cli, _client) = connect(cli, config(TWO_PROVIDERS)?)?;
+
+        assert_eq!(cli.temperature, Some(1.2));
+        assert_eq!(cli.searxng_url.as_deref(), Some("http://other:8888"));
+        Ok(())
+    }
+
+    #[test]
+    fn no_think_wins_over_a_provider_that_thinks() -> Result<()> {
+        let cli = Cli::parse_from(["openbatrangs", "--no-think"]);
+
+        let (cli, _client) = connect(cli, config("[box]\nurl = \"http://box/v1\"\nthink = true")?)?;
+
+        assert!(cli.is_thinking_disabled);
+        assert_eq!(cli.provider.as_deref(), Some("box"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_api_key_file_replaces_the_provider_key() -> Result<()> {
+        let key_arg = key_file_argument()?;
+        let flagged = Cli::parse_from([
+            "openbatrangs",
+            "--provider",
+            "box",
+            "--api-key-file",
+            &key_arg,
+        ]);
+        let missing = Cli::parse_from([
+            "openbatrangs",
+            "--provider",
+            "box",
+            "--api-key-file",
+            "/nonexistent/openbatrangs/api-key",
+        ]);
+
+        let (_cli, client) = connect(flagged, config(TWO_PROVIDERS)?)?;
+        let outcome = connect(missing, config(TWO_PROVIDERS)?);
+
+        assert_eq!(client.base_url, "http://box:8000/v1");
+        assert!(format!("{:?}", outcome.err()).contains("cannot read the access key"));
+        Ok(())
+    }
+
+    #[test]
+    fn several_providers_and_no_name_leave_the_choice_to_the_tui() -> Result<()> {
+        let (tui, client) = connect(Cli::parse_from(["openbatrangs"]), config(TWO_PROVIDERS)?)?;
+        let task = connect(
+            Cli::parse_from(["openbatrangs", "fix", "it"]),
+            config(TWO_PROVIDERS)?,
+        );
+
+        assert_eq!(tui.provider, None);
+        assert_eq!(client.base_url, DEFAULT_OLLAMA_URL);
+        assert!(format!("{:?}", task.err()).contains("box, local"));
+        Ok(())
+    }
+
+    #[test]
+    fn server_flags_and_thor_win_over_the_providers() -> Result<()> {
+        let key_arg = key_file_argument()?;
+        let ollama = Cli::parse_from([
+            "openbatrangs",
+            "--provider",
+            "box",
+            "--ollama-url",
+            "http://other:11434",
+        ]);
+        let thor = Cli::parse_from([
+            "openbatrangs",
+            "--provider",
+            "box",
+            "--thor",
+            "--api-key-file",
+            &key_arg,
+        ]);
+
+        let (ollama_cli, ollama_client) = connect(ollama, config(TWO_PROVIDERS)?)?;
+        let (_thor_cli, thor_client) = connect(thor, config(TWO_PROVIDERS)?)?;
+
+        assert_eq!(ollama_client.base_url, "http://other:11434");
+        assert_eq!(ollama_cli.provider, None);
+        assert_eq!(thor_client.base_url, constants::cli::THOR_OPENAI_URL);
+        Ok(())
+    }
+
+    #[test]
+    fn thor_searches_through_the_thor_despite_the_file() -> Result<()> {
+        let key_arg = key_file_argument()?;
+        let cli = Cli::parse_from(["openbatrangs", "--thor", "--api-key-file", &key_arg]);
+
+        let (cli, _client) = connect(cli, config(TWO_PROVIDERS)?)?;
+        let run_config = cli::agent_run_config(&cli);
+
+        assert_eq!(cli.searxng_url, None);
+        assert_eq!(run_config.searxng_url, constants::cli::THOR_OPENAI_URL);
+        assert_eq!(run_config.search_key.as_deref(), Some("secret"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_command_leaves_the_provider_command_to_main() -> Result<()> {
+        // Every other command would fail on a server that refuses connections.
+        let cli = Cli::parse_from(["openbatrangs", "provider", "list"]);
+        let client = OllamaClient::new("http://127.0.0.1:1")?;
+
+        run_command(&cli, &client).await
     }
 }

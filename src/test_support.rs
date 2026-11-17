@@ -185,6 +185,24 @@ pub(crate) fn sample_model(
 /// A status callback for tests that do not check the messages.
 pub(crate) fn ignore_status(_message: &str) {}
 
+/// The path of a `config.toml` holding `text`, in a new temporary folder.
+pub(crate) fn config_file_with(text: &str) -> std::io::Result<PathBuf> {
+    let path = unique_temp_dir("openbatrangs-config").join("config.toml");
+    std::fs::write(&path, text)?;
+
+    Ok(path)
+}
+
+/// The base URL, `/v1` included, of a mock OpenAI-compatible server that
+/// serves one model, `served`.
+pub(crate) async fn served_model_server() -> String {
+    let base_url =
+        spawn_mock_server(|_path| MockResponse::json("200 OK", r#"{"data":[{"id":"served"}]}"#))
+            .await;
+
+    format!("{base_url}/v1")
+}
+
 /// Status messages collected from a status callback, so a test can check them.
 #[derive(Default)]
 pub(crate) struct StatusLog {

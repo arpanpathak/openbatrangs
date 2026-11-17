@@ -14,7 +14,7 @@
 //! - Ratatui `Paragraph`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Paragraph.html>
 //! - Ratatui `Scrollbar`: <https://docs.rs/ratatui/latest/ratatui/widgets/struct.Scrollbar.html>
 
-use super::app::{App, FocusArea};
+use super::app::{App, FocusArea, PickerPurpose};
 use super::choice;
 use super::scroll::{chat_text_width, chat_visible_height};
 use super::selection;
@@ -579,7 +579,7 @@ fn suggestion_style(is_selected: bool) -> Style {
 
 /// Render the user input box with wrapped text and scrolling.
 fn render_input_box(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = wrap_text_to_lines(&app.input, input_inner_width(area.width))
+    let lines: Vec<Line> = wrap_text_to_lines(&app.shown_input(), input_inner_width(area.width))
         .into_iter()
         .map(Line::from)
         .collect();
@@ -664,7 +664,7 @@ fn cursor_cell(app: &App, area: Rect) -> Option<(u16, u16)> {
     (cursor_y < area.y + area.height).then_some((cursor_x, cursor_y))
 }
 
-/// Render the model picker popup overlay when active.
+/// Render the picker popup overlay when active: models, or providers.
 fn render_model_picker(frame: &mut ratatui::Frame, app: &App) {
     let Some(picker) = app.picker() else {
         return;
@@ -675,8 +675,12 @@ fn render_model_picker(frame: &mut ratatui::Frame, app: &App) {
         MODEL_PICKER_HEIGHT_PERCENT,
         frame.area(),
     );
+    let title = match picker.purpose {
+        PickerPurpose::Model => " Select model ",
+        PickerPurpose::Provider(_) => " Select provider ",
+    };
     let items: Vec<ListItem> = picker
-        .models
+        .rows
         .iter()
         .enumerate()
         .map(|(index, model)| {
@@ -694,7 +698,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(" Select model "),
+                    .title(title),
             )
             .highlight_style(
                 Style::default()
@@ -1174,6 +1178,41 @@ mod tests {
         app.focus_area = FocusArea::Input;
         terminal.draw(|frame| super::ui(frame, &mut app))?;
         assert_eq!(rule_color(&terminal), Some(Color::DarkGray));
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_provider_picker_hides_the_text_behind_it() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.config_path = crate::test_support::config_file_with("")?;
+        let filler: Vec<String> = (0..40).map(|_line| "x".repeat(70)).collect();
+        app.notice_lines(filler);
+        app.open_provider_picker();
+
+        let screen = draw(&mut app, 80, 30)?;
+
+        assert!(screen.contains("Select provider"));
+        assert!(screen.contains("│Add a provider…                               │"));
+        assert!(screen.contains("│Local Ollama (http://localhost:11434)         │"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_being_typed_is_drawn_as_dots() -> anyhow::Result<()> {
+        let mut app = test_app();
+        app.provider_form = Some(super::super::provider::ProviderForm::Key {
+            name: "deepseek".to_string(),
+            url: None,
+        });
+        app.input = "secret".to_string();
+        app.cursor = app.input.len();
+
+        let screen = draw(&mut app, 80, 30)?;
+
+        assert!(screen.contains("••••••"));
+        assert!(!screen.contains("secret"));
 
         Ok(())
     }

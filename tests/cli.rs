@@ -12,6 +12,8 @@
 use anyhow::Result;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -338,6 +340,142 @@ fn openai_server_lists_its_models() -> Result<()> {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("gemma  (served by"));
+    Ok(())
+}
+
+/// A new config folder for `XDG_CONFIG_HOME` whose `config.toml` holds
+/// `text`, and the path of that file.
+fn config_home(name: &str, text: &str) -> Result<(PathBuf, PathBuf)> {
+    let home = PathBuf::from(empty_workspace(name)?);
+    let file = home.join("openbatrangs").join("config.toml");
+    std::fs::create_dir_all(home.join("openbatrangs"))?;
+    std::fs::write(&file, text)?;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok((home, file))
+}
+
+/// The binary reading its config file from `home`.
+fn with_config(home: &PathBuf) -> Command {
+    let mut command = openbatrangs();
+    command
+        .env("XDG_CONFIG_HOME", home)
+        .env_remove("OPENBATRANGS_PROVIDER");
+
+    command
+}
+
+/// Run `openbatrangs provider add` with `arguments` and `key` on standard input.
+fn add_provider(home: &PathBuf, arguments: &[&str], key: &str) -> Result<Output> {
+    let mut child = with_config(home)
+        .args(["provider", "add"])
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(key.as_bytes())?;
+    }
+
+    Ok(child.wait_with_output()?)
+}
+
+#[test]
+fn providers_are_added_listed_and_removed() -> Result<()> {
+    let (home, file) = config_home(
+        "provider-commands",
+        "# my servers\nsearch_engine_url = \"http://search\"\n",
+    )?;
+
+    let deepseek = add_provider(&home, &["deepseek"], "sk-test\n")?;
+    let own = add_provider(
+        &home,
+        &["home-gpu", "--url", "http://192.168.1.20:8000/v1"],
+        "\n",
+    )?;
+    let listing = with_config(&home).args(["provider", "list"]).output()?;
+    let removed = with_config(&home)
+        .args(["provider", "remove", "home-gpu"])
+        .output()?;
+
+    let text = std::fs::read_to_string(&file)?;
+    let mode = std::fs::metadata(&file)?.permissions().mode() & 0o777;
+    assert!(deepseek.status.success(), "stderr: {}", stderr(&deepseek));
+    assert!(own.status.success(), "stderr: {}", stderr(&own));
+    assert!(stdout(&listing).contains("deepseek  https://api.deepseek.com/v1  key set"));
+    assert!(stdout(&listing).contains("home-gpu  http://192.168.1.20:8000/v1  no key"));
+    assert!(!stdout(&listing).contains("sk-test"));
+    assert!(removed.status.success());
+    assert!(text.starts_with("# my servers"));
+    assert!(text.contains("[deepseek]\napi_key = \"sk-test\""));
+    assert!(!text.contains("home-gpu"));
+    assert_eq!(mode, 0o600);
+    Ok(())
+}
+
+#[test]
+fn a_provider_of_your_own_needs_a_url() -> Result<()> {
+    let (home, _file) = config_home("provider-no-url", "")?;
+
+    let output = add_provider(&home, &["home-gpu"], "\n")?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("needs a URL"));
+    Ok(())
+}
+
+#[test]
+fn the_only_provider_is_used_without_flags() -> Result<()> {
+    let server = MockServer::start(openai_route)?;
+    let (home, _file) = config_home(
+        "provider-only",
+        &format!("[box]\nurl = \"{}/v1\"\n", server.url()),
+    )?;
+
+    let output = with_config(&home).arg("list-models").output()?;
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("gemma  (served by"));
+    Ok(())
+}
+
+#[test]
+fn a_task_with_several_providers_and_none_named_lists_them() -> Result<()> {
+    let (home, _file) = config_home(
+        "provider-several",
+        "[a]\nurl = \"http://a/v1\"\n[b]\nurl = \"http://b/v1\"\n",
+    )?;
+
+    let output = with_config(&home).args(["say", "hi"]).output()?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("a, b"));
+    assert!(stderr(&output).contains("--provider NAME"));
+    Ok(())
+}
+
+#[test]
+fn a_config_file_readable_by_others_gets_a_warning() -> Result<()> {
+    let (home, file) = config_home("provider-shared", "")?;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))?;
+
+    let output = with_config(&home).args(["provider", "list"]).output()?;
+
+    assert!(output.status.success());
+    assert!(stderr(&output).contains(&format!("chmod 600 {}", file.display())));
+    Ok(())
+}
+
+#[test]
+fn a_malformed_config_file_is_reported() -> Result<()> {
+    let (home, file) = config_home("provider-malformed", "[box\n")?;
+
+    let output = with_config(&home).arg("doctor").output()?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(&file.display().to_string()));
     Ok(())
 }
 

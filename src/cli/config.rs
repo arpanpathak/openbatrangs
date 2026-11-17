@@ -138,6 +138,12 @@ pub(crate) fn home_directory() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Whether a flag names the model server: `--openai-url`, `--ollama-url` or
+/// `--thor`. A named server takes precedence over every provider.
+pub(crate) fn names_server(cli: &Cli) -> bool {
+    cli.openai_url.is_some() || cli.ollama_url.is_some() || cli.thor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
