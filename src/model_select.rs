@@ -317,12 +317,15 @@ async fn pull_fallback(
 /// Context length in tokens, or `FALLBACK_CONTEXT_LENGTH` if unknown.
 pub(crate) async fn resolve_model_context(client: &OllamaClient, model: &str) -> Result<u64> {
     let show = client.show(model).await?;
+    let reported = context_length_from_show(&show);
 
-    Ok(context_length_from_show(&show))
+    Ok(reported
+        .or(client.context_window)
+        .unwrap_or(FALLBACK_CONTEXT_LENGTH))
 }
 
 /// Extract the model context length from a raw `/api/show` JSON body.
-fn context_length_from_show(show: &serde_json::Value) -> u64 {
+fn context_length_from_show(show: &serde_json::Value) -> Option<u64> {
     show.get("model_info")
         .and_then(|info| info.as_object())
         .and_then(|object| {
@@ -339,7 +342,6 @@ fn context_length_from_show(show: &serde_json::Value) -> u64 {
                 .and_then(|details| details.get("context_length"))
                 .and_then(|value| value.as_u64())
         })
-        .unwrap_or(FALLBACK_CONTEXT_LENGTH)
 }
 
 /// Compute the usable model memory budget from total system memory.
@@ -434,6 +436,23 @@ mod tests {
         OllamaClient::openai(&format!("{base_url}/v1"), None, true)
     }
 
+    #[tokio::test]
+    async fn the_providers_window_fills_in_only_when_the_server_reports_none() -> Result<()> {
+        let silent_url = spawn_mock_server(|_path| MockResponse::json("200 OK", "{}")).await;
+        let filling = OllamaClient::new(&silent_url)?.with_context_window(Some(1_000_000));
+        let silent = OllamaClient::new(&silent_url)?;
+        let reporting = served_models().await?.with_context_window(Some(1_000_000));
+
+        let filled = resolve_model_context(&filling, "m").await?;
+        let unset = resolve_model_context(&silent, "m").await?;
+        let reported = resolve_model_context(&reporting, "gemma").await?;
+
+        assert_eq!(filled, 1_000_000);
+        assert_eq!(unset, FALLBACK_CONTEXT_LENGTH);
+        assert_eq!(reported, 16_384, "the server's own window wins");
+        Ok(())
+    }
+
     #[test]
     fn extracts_context_from_model_info_key() {
         let show = json!({
@@ -443,26 +462,20 @@ mod tests {
             }
         });
 
-        assert_eq!(context_length_from_show(&show), 32_768);
+        assert_eq!(context_length_from_show(&show), Some(32_768));
     }
 
     #[test]
     fn extracts_context_from_details_fallback() {
         let show = json!({"details": {"context_length": 8192}});
 
-        assert_eq!(context_length_from_show(&show), 8_192);
+        assert_eq!(context_length_from_show(&show), Some(8_192));
     }
 
     #[test]
     fn falls_back_when_context_unknown() {
-        assert_eq!(
-            context_length_from_show(&json!({})),
-            FALLBACK_CONTEXT_LENGTH
-        );
-        assert_eq!(
-            context_length_from_show(&json!({"model_info": {}})),
-            FALLBACK_CONTEXT_LENGTH
-        );
+        assert_eq!(context_length_from_show(&json!({})), None);
+        assert_eq!(context_length_from_show(&json!({"model_info": {}})), None);
     }
 
     #[test]
@@ -472,7 +485,7 @@ mod tests {
             "details": {"context_length": 4096},
         });
 
-        assert_eq!(context_length_from_show(&show), 16_384);
+        assert_eq!(context_length_from_show(&show), Some(16_384));
     }
 
     #[test]

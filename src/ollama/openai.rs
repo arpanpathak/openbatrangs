@@ -245,13 +245,17 @@ pub(super) fn server_root(base_url: &str) -> &str {
 
 /// Shape one model's entry in a `/models` body like Ollama's `/api/show`.
 ///
-/// TensorRT Edge-LLM has no `/props`; it reports each model's context window
-/// in the list, as `max_model_len`.
+/// TensorRT Edge-LLM and vLLM report each model's context window in the
+/// list as `max_model_len`; Anthropic reports it as `max_input_tokens`.
 pub(super) fn show_from_models(list: &Value, name: &str) -> Option<Value> {
-    list.get("data")
+    let model = list
+        .get("data")
         .and_then(Value::as_array)
-        .and_then(|models| listed_model(models, name))
-        .and_then(|model| model.get("max_model_len"))
+        .and_then(|models| listed_model(models, name))?;
+
+    model
+        .get("max_model_len")
+        .or_else(|| model.get("max_input_tokens"))
         .and_then(Value::as_u64)
         .map(context_show)
 }
@@ -536,6 +540,16 @@ mod tests {
         assert_eq!(show_from_models(&list, "plain"), None);
         assert_eq!(show_from_models(&list, "other"), None);
         assert_eq!(show_from_models(&json!({}), "qwen"), None);
+    }
+
+    #[test]
+    fn anthropics_list_reports_the_window_as_max_input_tokens() {
+        let list = json!({"data": [{"id": "claude", "max_input_tokens": 1_000_000}]});
+
+        assert_eq!(
+            show_from_models(&list, "claude"),
+            Some(json!({"details": {"context_length": 1_000_000}}))
+        );
     }
 
     #[test]

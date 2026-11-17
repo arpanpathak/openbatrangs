@@ -86,9 +86,9 @@ impl App {
         let mut rows = Vec::new();
         let mut choices = Vec::new();
 
-        for (name, label, _url) in BUILT_IN_PROVIDERS {
-            rows.push(label.to_string());
-            choices.push(ProviderChoice::BuiltIn(name));
+        for provider in BUILT_IN_PROVIDERS {
+            rows.push(provider.label.to_string());
+            choices.push(ProviderChoice::BuiltIn(provider.name));
         }
 
         rows.push("Your own server".to_string());

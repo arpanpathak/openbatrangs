@@ -26,7 +26,7 @@
 use super::args::{Cli, Commands};
 use super::config::{home_directory, names_server};
 use crate::constants::cli::{
-    BUILT_IN_PROVIDERS, CONFIG_FILE_NAME, CONFIG_FOLDER_NAME, OPENAI_API_SUFFIX,
+    BUILT_IN_PROVIDERS, BuiltInProvider, CONFIG_FILE_NAME, CONFIG_FOLDER_NAME, OPENAI_API_SUFFIX,
     SEARCH_ENGINE_URL_KEY,
 };
 use crate::constants::ollama::ANTHROPIC_API_HOST;
@@ -60,6 +60,8 @@ pub(crate) struct Provider {
     pub(crate) think: Option<bool>,
     /// Sampling temperature, or `None` for the model card's.
     pub(crate) temperature: Option<f64>,
+    /// Context window in tokens when the server reports none.
+    pub(crate) context: Option<u64>,
 }
 
 /// A provider table as written in the file.
@@ -74,6 +76,8 @@ struct ProviderBlock {
     think: Option<bool>,
     /// A number, or `"auto"` for the model card's temperature.
     temperature: Option<Temperature>,
+    /// Context window in tokens when the server reports none.
+    context: Option<u64>,
 }
 
 /// A temperature setting: a number, or `None` for `"auto"`.
@@ -113,12 +117,16 @@ pub(crate) fn user_config_path() -> PathBuf {
     config_path(xdg_config_home, home_directory().as_deref())
 }
 
-/// The address openbatrangs knows for the built-in provider `name`.
-pub(crate) fn built_in_url(name: &str) -> Option<&'static str> {
+/// The built-in provider named `name`.
+fn built_in(name: &str) -> Option<&'static BuiltInProvider> {
     BUILT_IN_PROVIDERS
         .iter()
-        .find(|(known, _label, _url)| *known == name)
-        .map(|(_known, _label, url)| *url)
+        .find(|provider| provider.name == name)
+}
+
+/// The address openbatrangs knows for the built-in provider `name`.
+pub(crate) fn built_in_url(name: &str) -> Option<&'static str> {
+    built_in(name).map(|provider| provider.url)
 }
 
 /// A warning when the file at `path` can be read by other users, as it
@@ -258,11 +266,13 @@ impl ConfigFile {
 
 impl Provider {
     /// The provider named `name` from its table in the file at `path`. A
-    /// built-in name may leave out `url`; any other name needs it.
+    /// built-in name may leave out `url` and `context`; any other name needs
+    /// `url`.
     fn from_block(name: &str, block: ProviderBlock, path: &Path) -> Result<Self> {
+        let built_in = built_in(name);
         let url = block
             .url
-            .or_else(|| built_in_url(name).map(str::to_string))
+            .or_else(|| built_in.map(|provider| provider.url.to_string()))
             .ok_or_else(|| anyhow!("[{name}] in {} needs a `url`", path.display()))?;
 
         Ok(Self {
@@ -270,6 +280,9 @@ impl Provider {
             api_key: block.api_key,
             think: block.think,
             temperature: block.temperature.and_then(|temperature| temperature.0),
+            context: block
+                .context
+                .or(built_in.and_then(|provider| provider.context)),
         })
     }
 
@@ -277,16 +290,20 @@ impl Provider {
     /// gets an OpenAI-compatible client that sends `think`, with the key in
     /// Anthropic's headers when the URL is Anthropic's API; any other URL
     /// gets an Ollama client.
+    /// The client falls back to this provider's `context` when the server
+    /// reports no context window.
     pub(crate) fn client(&self, key: Option<String>, think: bool) -> Result<OllamaClient> {
         let url = self.url.trim_end_matches('/');
         let is_anthropic = reqwest::Url::parse(url)
             .is_ok_and(|parsed| parsed.host_str() == Some(ANTHROPIC_API_HOST));
 
-        match (url.ends_with(OPENAI_API_SUFFIX), is_anthropic) {
+        let client = match (url.ends_with(OPENAI_API_SUFFIX), is_anthropic) {
             (true, true) => OllamaClient::anthropic(url, key, think),
             (true, false) => OllamaClient::openai(url, key, think),
             (false, _) => OllamaClient::new(url),
-        }
+        }?;
+
+        Ok(client.with_context_window(self.context))
     }
 }
 
@@ -530,6 +547,23 @@ api_key = "colab-test"
         );
         assert_eq!(lines[4], "  home-gpu   http://192.168.1.20:8000/v1  no key");
         assert!(!lines.join("\n").contains("sk-"));
+        Ok(())
+    }
+
+    #[test]
+    fn deepseek_knows_its_window_and_a_block_can_set_one() -> Result<()> {
+        let file = config(
+            "[deepseek]\n[anthropic]\n[home-gpu]\nurl = \"http://box:8000/v1\"\ncontext = 131072",
+        )?;
+        let shorter = config("[deepseek]\ncontext = 65536")?;
+
+        assert_eq!(file.providers["deepseek"].context, Some(1_000_000));
+        assert_eq!(file.providers["anthropic"].context, None);
+        assert_eq!(file.providers["home-gpu"].context, Some(131_072));
+        assert_eq!(shorter.providers["deepseek"].context, Some(65_536));
+
+        let client = file.providers["deepseek"].client(None, true)?;
+        assert_eq!(client.context_window, Some(1_000_000));
         Ok(())
     }
 
