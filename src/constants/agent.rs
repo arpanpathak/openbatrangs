@@ -60,6 +60,16 @@ pub const MIN_TOOL_RESULT_CHARS: usize = 512;
 /// Prefix of the user messages that carry a tool's output in the JSON loop.
 pub const TOOL_RESULT_PREFIX: &str = "Tool result:";
 
+/// `tool_choice` the native loop sends first: served models such as Gemma
+/// on vLLM then call a tool instead of answering in plain text, and the
+/// `finish` tool is the exit.
+pub const TOOL_CHOICE_REQUIRED: &str = "required";
+
+/// `tool_choice` for the rest of a run once the server has answered
+/// `required` with HTTP 400, as DeepSeek in thinking mode and Anthropic's
+/// newest models do.
+pub const TOOL_CHOICE_AUTO: &str = "auto";
+
 /// Feedback injected when the model produced an empty turn in the native loop.
 pub const EMPTY_TURN_NUDGE: &str = "Your previous turn produced no answer or tool call. \
      Continue the task now: call the necessary tools to inspect or change files; \

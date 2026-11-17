@@ -2,7 +2,8 @@
 //!
 //! OpenAI-compatible servers — llama-server in router mode and TensorRT
 //! Edge-LLM — accept a `tools` array and reply with structured `tool_calls`.
-//! This loop sends the schemas with `tool_choice: "required"`, streams the
+//! This loop sends the schemas with `tool_choice: "required"` (or `"auto"`
+//! once a server answers `"required"` with HTTP 400), streams the
 //! reply, executes every call, and feeds the `tool` results back. Served
 //! models that answer with their JSON tool call as plain text instead of the
 //! structured channel are detected and executed anyway; anything else is the
@@ -34,7 +35,7 @@ use super::{
 use crate::constants::agent::{
     BROKEN_CALL_NOTE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
     MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS, NATIVE_SYSTEM_PROMPT,
-    RUNAWAY_NOTE,
+    RUNAWAY_NOTE, TOOL_CHOICE_AUTO, TOOL_CHOICE_REQUIRED,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use crate::sampling::Sampling;
@@ -484,6 +485,9 @@ struct Run<'a, R, C> {
     empty_retries: u8,
     /// Replies in a row cut off at the output limit.
     cut_retries: u8,
+    /// `tool_choice` sent with each request: [`TOOL_CHOICE_REQUIRED`] until
+    /// the server answers it with HTTP 400.
+    tool_choice: &'static str,
     /// Messages sent to the model, trimmed to fit the context window.
     messages: Vec<Message>,
     /// Full message history, never trimmed; written to the transcript.
@@ -559,13 +563,32 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         // whole budget on the answer instead of thinking first.
         let think = self.think && self.cut_retries == 0;
         let mut body = request_body(self.model, &self.messages, self.num_ctx, think);
+        body["tool_choice"] = json!(self.tool_choice);
         Sampling::for_model(self.model, self.config.temperature).write_to(&mut body);
 
-        let turn = stream_turn(self.client, body, self.reporter, self.config.show_thinking)
-            .await
-            .with_context(|| format!("model call failed at step {}", self.step))?;
+        let reply = stream_turn(self.client, body, self.reporter, self.config.show_thinking).await;
+        let turn = match reply {
+            Err(error)
+                if self.tool_choice == TOOL_CHOICE_REQUIRED && rejects_tool_choice(&error) =>
+            {
+                return Ok(self.choose_tools_freely());
+            }
+            reply => reply.with_context(|| format!("model call failed at step {}", self.step))?,
+        };
 
         Ok(state_after_turn(turn))
+    }
+
+    /// Send `tool_choice: "auto"` from now on and ask again, after the
+    /// server answered `"required"` with HTTP 400.
+    fn choose_tools_freely(&mut self) -> State {
+        self.tool_choice = TOOL_CHOICE_AUTO;
+        self.reporter.notice(
+            "\n⚠️ The server does not accept a required tool call; the model now chooses."
+                .to_string(),
+        );
+
+        State::Stream
     }
 
     /// Run a tool call the model wrote as text; otherwise the text is the
@@ -943,6 +966,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         step: 0,
         empty_retries: 0,
         cut_retries: 0,
+        tool_choice: TOOL_CHOICE_REQUIRED,
         full_conversation: messages.clone(),
         messages,
         files,
@@ -1169,9 +1193,7 @@ fn request_body(model: &str, messages: &[Message], num_ctx: u64, think: bool) ->
         "model": model,
         "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
         "tools": tools,
-        // "required" keeps served models from answering in plain text when a
-        // tool call is what the task needs; the `finish` tool is the exit.
-        "tool_choice": "required",
+        "tool_choice": TOOL_CHOICE_REQUIRED,
         "max_tokens": max_tokens,
         "stream": true,
         "chat_template_kwargs": { "enable_thinking": think },
@@ -1274,6 +1296,13 @@ fn prompt_budget(num_ctx: u64) -> usize {
     let schema_chars = tools_schema().to_string().len();
 
     max_prompt_chars(num_ctx).saturating_sub(schema_chars)
+}
+
+/// Whether `error` is the server answering `tool_choice` with HTTP 400.
+fn rejects_tool_choice(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+
+    message.contains("HTTP 400") && message.contains("tool_choice")
 }
 
 /// Make the messages fit in `budget` characters: drop the oldest turns after
@@ -2796,6 +2825,64 @@ mod tests {
         assert!(tool_results[2].contains("same result 3 times in a row"));
 
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// DeepSeek's answer to `tool_choice: "required"` in thinking mode.
+    fn tool_choice_rejected() -> Reply {
+        Reply::bad_request(&json!({"error": {
+            "message": "Thinking mode does not support this tool_choice",
+            "type": "invalid_request_error"
+        }}))
+    }
+
+    #[tokio::test]
+    async fn a_server_that_rejects_a_required_tool_call_is_asked_again_with_auto() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-tool-choice");
+        let config = test_config(&root, 3);
+        let replies = vec![
+            tool_choice_rejected(),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (requests, output) = requests_of_run(&config, "deepseek", "hi", replies).await?;
+        let choices: Vec<Value> = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_str::<Value>(request).map(|body| body["tool_choice"].clone())
+            })
+            .collect::<serde_json::Result<_>>()?;
+
+        assert_eq!(choices[0], json!("required"));
+        assert_eq!(choices[1], json!("auto"));
+        assert!(output.contains("does not accept a required tool call"));
+        assert!(output.contains("Done."));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_tool_choice_rejection_fails_the_run() -> Result<()> {
+        let replies = vec![tool_choice_rejected(), tool_choice_rejected()];
+
+        let (_output, result) = run_with_replies("say hi", 3, replies).await?;
+
+        assert!(format!("{result:?}").contains("model call failed at step 1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn another_bad_request_is_not_asked_again() -> Result<()> {
+        let replies = vec![
+            Reply::bad_request(&json!({"error": {"message": "context too long"}})),
+            Reply::openai_stream(&[text_delta("Done.")]),
+        ];
+
+        let (output, result) = run_with_replies("say hi", 3, replies).await?;
+
+        assert!(format!("{result:?}").contains("context too long"));
+        assert!(!output.contains("does not accept a required tool call"));
         Ok(())
     }
 
