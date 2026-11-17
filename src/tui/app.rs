@@ -19,8 +19,8 @@ use crate::cli::{
 use crate::constants::cli::DEFAULT_OLLAMA_URL;
 use crate::constants::models::BYTES_PER_GIGABYTE;
 use crate::constants::tui::{
-    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, MAX_TRANSCRIPT_BLOCKS, SPINNER, STREAM_GAP,
-    TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
+    CHARS_PER_TOKEN, CHAT_SCROLL_STEP, EDGE_SCROLL_RAMP_TICKS, MAX_EDGE_SCROLL_ROWS,
+    MAX_TRANSCRIPT_BLOCKS, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
 use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host};
@@ -382,6 +382,9 @@ pub(super) struct App {
     /// Direction to scroll while a drag holds the pointer on the top (-1) or
     /// bottom (1) row of the chat, and the cell it holds.
     pub(super) drag_edge: Option<(i32, Position)>,
+    /// Ticks the drag has held the pointer on that edge; the edge scroll
+    /// speeds up the longer it is held.
+    pub(super) drag_edge_ticks: u32,
     /// Program that puts copied text on the desktop clipboard, if any.
     pub(super) desktop_clipboard: Option<ClipboardProgram>,
     /// Text to put on the clipboard before the next frame is drawn.
@@ -476,6 +479,7 @@ impl App {
             press: None,
             selection: None,
             drag_edge: None,
+            drag_edge_ticks: 0,
             desktop_clipboard: None,
             clipboard: None,
             rate_window_chars: 0,
@@ -1363,20 +1367,30 @@ impl App {
         };
 
         let area = self.last_chat_area.unwrap_or_default();
-        self.drag_edge = edge_direction(area, cell).map(|direction| (direction, cell));
+        let held_direction = self.drag_edge.map(|(direction, _cell)| direction);
+        let direction = edge_direction(area, cell);
 
+        if direction != held_direction {
+            self.drag_edge_ticks = 0;
+        }
+
+        self.drag_edge = direction.map(|direction| (direction, cell));
         self.select_to(press.point, cell);
     }
 
-    /// Scroll one row while a drag holds the pointer on the top or bottom
-    /// row of the chat, and extend the selection to the row that scrolled in.
-    /// Called on every tick.
+    /// Scroll while a drag holds the pointer on the top or bottom row of the
+    /// chat, and extend the selection to the rows that scrolled in. Called
+    /// on every tick: one row per tick at first, faster the longer the
+    /// pointer stays on the edge.
     pub(super) fn scroll_at_drag_edge(&mut self) {
         let (Some((direction, cell)), Some(press)) = (self.drag_edge, self.press) else {
             return;
         };
 
-        self.scroll_chat(direction);
+        let rows = (1 + self.drag_edge_ticks / EDGE_SCROLL_RAMP_TICKS).min(MAX_EDGE_SCROLL_ROWS);
+        self.drag_edge_ticks += 1;
+
+        self.scroll_chat(direction * rows as i32);
         self.select_to(press.point, cell);
     }
 
@@ -1414,6 +1428,7 @@ impl App {
     /// of a press that did not move.
     fn release(&mut self) {
         self.drag_edge = None;
+        self.drag_edge_ticks = 0;
 
         let Some(press) = self.press.take() else {
             return;
@@ -3575,6 +3590,45 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 9, 10));
         app.scroll_at_drag_edge();
         assert_eq!(app.chat_scroll_offset, 2, "the release stops the scrolling");
+    }
+
+    #[test]
+    fn the_edge_scroll_speeds_up_while_the_drag_stays_on_the_edge() {
+        let mut app = test_app();
+        for index in 0..2_000 {
+            app.notice(format!("line {index}"));
+        }
+        app.last_chat_area = Some(Rect::new(0, 0, 40, 20));
+        app.scroll_chat(-100_000);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 25));
+
+        let mut steps = Vec::new();
+        for _tick in 0..9 {
+            let before = app.chat_scroll_offset;
+            app.scroll_at_drag_edge();
+            steps.push(app.chat_scroll_offset.abs_diff(before));
+        }
+        app.drag_edge_ticks = 1_000;
+        let before = app.chat_scroll_offset;
+        app.scroll_at_drag_edge();
+
+        assert_eq!(steps, [1, 1, 1, 1, 2, 2, 2, 2, 3]);
+        assert_eq!(
+            app.chat_scroll_offset.abs_diff(before),
+            MAX_EDGE_SCROLL_ROWS as usize
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 10));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 25));
+        let before = app.chat_scroll_offset;
+        app.scroll_at_drag_edge();
+
+        assert_eq!(
+            app.chat_scroll_offset.abs_diff(before),
+            1,
+            "leaving the edge starts slow again"
+        );
     }
 
     #[test]

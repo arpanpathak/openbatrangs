@@ -103,8 +103,17 @@ pub const STREAM_GAP: std::time::Duration = std::time::Duration::from_millis(150
 /// Minimum terminal height for showing the performance panel automatically.
 pub const PERF_MIN_TERMINAL_HEIGHT: u16 = 18;
 
-/// Number of lines scrolled per PageUp/PageDown in the chat area.
-pub const CHAT_SCROLL_STEP: usize = 5;
+/// Number of lines scrolled per PageUp/PageDown or wheel step in the chat
+/// area.
+pub const CHAT_SCROLL_STEP: usize = 12;
+
+/// Ticks a selection drag holds the pointer on the chat's edge before the
+/// edge scroll moves one more row per tick: 1 row per tick at first, 2
+/// after 4 ticks (320 ms), up to [`MAX_EDGE_SCROLL_ROWS`].
+pub const EDGE_SCROLL_RAMP_TICKS: u32 = 4;
+
+/// Most rows the edge scroll moves per tick, about 190 rows a second.
+pub const MAX_EDGE_SCROLL_ROWS: u32 = 15;
 
 /// Maximum number of suggestion rows rendered before scrolling.
 pub const MAX_SUGGESTION_ITEMS: usize = 6;
