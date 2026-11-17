@@ -25,13 +25,16 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// `text` without escape sequences or other control characters; a tab
-/// becomes four spaces.
+/// becomes four spaces and a line break a space, so the lines of a
+/// multi-line command stay apart on one row.
 ///
 /// A terminal acts on a control character instead of showing it: `ESC[4m`
 /// underlines every cell drawn after it, and a carriage return moves the
 /// cursor. Text drawn in the TUI must hold none of them.
 pub(crate) fn printable(text: &str) -> String {
-    printable_text(text).replace('\t', "    ").replace('\n', "")
+    printable_text(text)
+        .replace('\t', "    ")
+        .replace('\n', " ")
 }
 
 /// `line` with the text of every span made [`printable`].
@@ -296,7 +299,7 @@ mod tests {
 
         assert_eq!(spans_text(&cleaned.spans), "title50%100%2J    doneplain");
         assert_eq!(cleaned.spans[0].style, underlined);
-        assert_eq!(printable("a\nb"), "ab");
+        assert_eq!(printable("a\nb"), "a b");
     }
 
     #[test]
