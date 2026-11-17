@@ -47,6 +47,8 @@ pub struct OllamaClient {
     http: reqwest::Client,
     /// Which HTTP API the server speaks.
     api: Api,
+    /// Context window in tokens to use when the server reports none.
+    pub context_window: Option<u64>,
 }
 
 /// The HTTP API spoken by the model server.
@@ -92,6 +94,7 @@ impl OllamaClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
             api: Api::Ollama,
+            context_window: None,
         })
     }
 
@@ -134,7 +137,17 @@ impl OllamaClient {
                 key_headers,
                 think,
             },
+            context_window: None,
         })
+    }
+
+    /// This client, using `tokens` as the context window when the server
+    /// reports none.
+    pub fn with_context_window(self, tokens: Option<u64>) -> Self {
+        Self {
+            context_window: tokens,
+            ..self
+        }
     }
 
     /// Whether this client sends its key in Anthropic's headers.
@@ -513,6 +526,7 @@ mod tests {
             base_url: base_url.to_string(),
             http: http_client(reqwest::Client::builder(), read_timeout)?,
             api: Api::Ollama,
+            context_window: None,
         })
     }
 

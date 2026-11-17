@@ -30,11 +30,40 @@ pub const SEARCH_ENGINE_URL_KEY: &str = "search_engine_url";
 /// is an OpenAI-compatible server; any other URL is an Ollama server.
 pub const OPENAI_API_SUFFIX: &str = "/v1";
 
-/// Hosted providers whose address openbatrangs knows: the name of the block
-/// in the config file, the name shown in the TUI, and the API address.
-/// Anthropic is reached through its OpenAI-compatible endpoint.
-pub const BUILT_IN_PROVIDERS: &[(&str, &str, &str)] = &[
-    ("anthropic", "Anthropic", "https://api.anthropic.com/v1"),
-    ("deepseek", "DeepSeek", "https://api.deepseek.com/v1"),
-    ("openai", "OpenAI", "https://api.openai.com/v1"),
+/// A hosted provider whose address openbatrangs knows.
+pub struct BuiltInProvider {
+    /// Name of its block in the config file.
+    pub name: &'static str,
+    /// Name shown in the TUI.
+    pub label: &'static str,
+    /// API address.
+    pub url: &'static str,
+    /// Context window in tokens when the provider's model list reports
+    /// none, or `None` when it reports one.
+    pub context: Option<u64>,
+}
+
+/// The built-in providers. Anthropic is reached through its
+/// OpenAI-compatible endpoint, and its model list reports each window.
+/// DeepSeek's list reports none; its documentation gives 1M tokens for
+/// every model it serves.
+pub const BUILT_IN_PROVIDERS: &[BuiltInProvider] = &[
+    BuiltInProvider {
+        name: "anthropic",
+        label: "Anthropic",
+        url: "https://api.anthropic.com/v1",
+        context: None,
+    },
+    BuiltInProvider {
+        name: "deepseek",
+        label: "DeepSeek",
+        url: "https://api.deepseek.com/v1",
+        context: Some(1_000_000),
+    },
+    BuiltInProvider {
+        name: "openai",
+        label: "OpenAI",
+        url: "https://api.openai.com/v1",
+        context: None,
+    },
 ];

@@ -408,6 +408,7 @@ api_key = "..."
 | `api_key` | the key sent as a bearer token |
 | `think` | whether thinking models reason before they answer; on by default |
 | `temperature` | a number, or `"auto"` for each model card's temperature |
+| `context` | the context window in tokens, used when the server does not report one. `deepseek` defaults to 1,000,000; Anthropic, vLLM and Edge-LLM report their own |
 | `search_engine_url` | the SearXNG instance for web search, outside any table |
 
 When a provider is in use, the changes you make in `/settings` are saved to its
