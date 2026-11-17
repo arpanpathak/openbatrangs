@@ -687,6 +687,7 @@ fn render_model_picker(frame: &mut ratatui::Frame, app: &App) {
         })
         .collect();
 
+    frame.render_widget(Clear, area);
     frame.render_widget(
         List::new(items)
             .block(
@@ -1194,6 +1195,35 @@ mod tests {
         assert!(screen.contains("/mode"));
         assert!(screen.contains("Select model"));
         assert!(screen.contains("llama3.2:3b"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_model_picker_hides_the_text_behind_it() -> anyhow::Result<()> {
+        let mut app = test_app();
+        let text_behind = "X".repeat(200);
+        app.transcript.push_notice(vec![text_behind; 40]);
+        app.open_picker(vec!["gemma".to_string()]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30))?;
+
+        terminal.draw(|frame| super::ui(frame, &mut app))?;
+        let area = centered_rect(
+            MODEL_PICKER_WIDTH_PERCENT,
+            MODEL_PICKER_HEIGHT_PERCENT,
+            ratatui::layout::Rect::new(0, 0, 80, 30),
+        );
+        let buffer = terminal.backend().buffer();
+        let inside: String = (area.top()..area.bottom())
+            .flat_map(|row| (area.left()..area.right()).map(move |column| (column, row)))
+            .map(|(column, row)| buffer[(column, row)].symbol())
+            .collect();
+
+        assert!(inside.contains("gemma"));
+        assert!(
+            !inside.contains('X'),
+            "transcript text shows through the picker"
+        );
 
         Ok(())
     }
