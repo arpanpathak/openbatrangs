@@ -29,6 +29,7 @@ use crate::constants::cli::{
     BUILT_IN_PROVIDERS, CONFIG_FILE_NAME, CONFIG_FOLDER_NAME, OPENAI_API_SUFFIX,
     SEARCH_ENGINE_URL_KEY,
 };
+use crate::constants::ollama::ANTHROPIC_API_HOST;
 use crate::ollama::OllamaClient;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -273,14 +274,18 @@ impl Provider {
     }
 
     /// A client for this provider's server with `key`. A URL ending in `/v1`
-    /// gets an OpenAI-compatible client that sends `think`; any other URL
+    /// gets an OpenAI-compatible client that sends `think`, with the key in
+    /// Anthropic's headers when the URL is Anthropic's API; any other URL
     /// gets an Ollama client.
     pub(crate) fn client(&self, key: Option<String>, think: bool) -> Result<OllamaClient> {
         let url = self.url.trim_end_matches('/');
+        let is_anthropic = reqwest::Url::parse(url)
+            .is_ok_and(|parsed| parsed.host_str() == Some(ANTHROPIC_API_HOST));
 
-        match url.ends_with(OPENAI_API_SUFFIX) {
-            true => OllamaClient::openai(url, key, think),
-            false => OllamaClient::new(url),
+        match (url.ends_with(OPENAI_API_SUFFIX), is_anthropic) {
+            (true, true) => OllamaClient::anthropic(url, key, think),
+            (true, false) => OllamaClient::openai(url, key, think),
+            (false, _) => OllamaClient::new(url),
         }
     }
 }
@@ -540,6 +545,18 @@ api_key = "colab-test"
         assert_eq!(openai.base_url, "http://box:8000/v1");
         assert!(!ollama.is_openai());
         assert_eq!(ollama.base_url, "http://box:11434");
+        Ok(())
+    }
+
+    #[test]
+    fn only_anthropics_api_gets_anthropics_key_headers() -> Result<()> {
+        let file = config("[anthropic]\n[claude-proxy]\nurl = \"http://box:8000/v1\"")?;
+
+        let anthropic = file.providers["anthropic"].client(None, true)?;
+        let proxy = file.providers["claude-proxy"].client(None, true)?;
+
+        assert!(anthropic.sends_anthropic_headers());
+        assert!(!proxy.sends_anthropic_headers());
         Ok(())
     }
 }
