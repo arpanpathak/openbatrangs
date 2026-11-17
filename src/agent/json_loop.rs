@@ -20,7 +20,6 @@ use super::execute::{absolute_paths, run_tool_call};
 use super::file_log::FileLog;
 use super::quality::FinishGate;
 use super::repeats::RepeatGuard;
-use super::research::task_with_documentation;
 use super::stream::stream_model_response;
 use super::tool::{AgentResponse, Tool, ToolCall, parse_agent_response};
 use super::{
@@ -159,9 +158,8 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
         transcript,
         ..
     } = continuation.unwrap_or_default();
-    let task_with_docs = task_with_documentation(task, config, reporter).await;
     let opening = Opening {
-        task: &task_with_docs,
+        task,
         earlier: &earlier_turns_section(&earlier, num_ctx),
     };
 
@@ -196,7 +194,7 @@ pub(super) async fn run_json_agent<'a, R: Reporter, C: Confirmer>(
 
 /// What the first user turn of a run is made of.
 struct Opening<'a> {
-    /// The task, with any documentation found for it.
+    /// The task as the user wrote it.
     task: &'a str,
     /// The earlier turns of the session as a section of the first message;
     /// empty when there are none.

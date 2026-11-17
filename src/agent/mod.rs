@@ -42,7 +42,6 @@ mod native;
 mod quality;
 mod repeats;
 mod reporter;
-mod research;
 mod runaway;
 mod stream;
 mod summary;

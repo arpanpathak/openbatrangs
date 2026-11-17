@@ -24,7 +24,6 @@ use super::file_log::FileLog;
 use super::gemma_call::{has_raw_call_marker, parse_gemma_call};
 use super::quality::{FinishGate, command_succeeded};
 use super::repeats::RepeatGuard;
-use super::research::task_with_documentation;
 use super::runaway::ends_in_a_loop;
 use super::tool::{Tool, ToolCall, strip_code_fence};
 use super::{
@@ -914,13 +913,11 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         transcript,
     } = continuation.unwrap_or_default();
     let think = config.think;
-    let resuming = resume.is_some();
     let context_cap = config.max_ctx.or(client.default_context_cap());
     let num_ctx = effective_context(config.model_context, context_cap);
 
-    let opening_task = opening_task(task, config, resuming, reporter).await;
     let opening = Opening {
-        task: &opening_task,
+        task,
         earlier: &earlier_turns_section(&earlier, num_ctx),
         think,
     };
@@ -961,22 +958,6 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
     }
 
     result
-}
-
-/// The task for the first user turn. A resumed run already carries its
-/// documentation in the conversation; repeating the lookup would fetch the
-/// same pages for nothing.
-async fn opening_task<R: Reporter>(
-    task: &str,
-    config: &AgentConfig,
-    resuming: bool,
-    reporter: &mut R,
-) -> String {
-    if resuming {
-        return task.to_string();
-    }
-
-    task_with_documentation(task, config, reporter).await
 }
 
 /// What the first user turn of a run is made of.
@@ -1959,6 +1940,26 @@ mod tests {
         assert_eq!(card["top_k"], 64);
         assert_eq!(chosen["temperature"], 0.3);
         assert_eq!(chosen["top_k"], 64);
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_that_mentions_documentation_starts_without_a_search() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-no-search");
+        let config = test_config(&root, 2);
+        let task = "the latest docs in book.pdf are wrong, fix the documentation";
+        let answer = vec![Reply::openai_stream(&[text_delta("Done.")])];
+
+        let (requests, output) = requests_of_run(&config, "gemma-4-26b", task, answer).await?;
+        let request: Value = serde_json::from_str(&requests[0])?;
+        let first_message = request["messages"][1]["content"].to_string();
+
+        assert_eq!(requests.len(), 1, "only the model was asked");
+        assert!(!output.contains("web_search"), "{output}");
+        assert!(first_message.contains(task));
+        assert!(!first_message.contains("Search results"));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
