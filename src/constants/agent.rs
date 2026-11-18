@@ -88,6 +88,23 @@ pub const BROKEN_CALL_NOTE: &str = "Your previous reply wrote a tool call as tex
      not be read, so nothing ran. Call tools only through the tool-calling interface, with one \
      complete call per reply; write a long file in parts.";
 
+/// Feedback injected when the model's reply says what it will do next but
+/// calls no tool, so the plan is not mistaken for the final answer.
+pub const PROMISE_NOTE: &str = "Your previous reply said what you will do but called no tool, \
+     so nothing ran. Do it now with a tool call. If the task is already done, call finish \
+     with a summary.";
+
+/// Phrases, in lowercase, with which a reply announces work it has not done
+/// yet, such as "I will start by rewriting the file now."
+pub const PROMISE_PHRASES: [&str; 6] = [
+    "i will ",
+    "i'll ",
+    "let me ",
+    "i am going to ",
+    "i'm going to ",
+    "i am now going to ",
+];
+
 /// Feedback injected when the model's reply fell into repeating one short
 /// piece of text and was stopped.
 pub const RUNAWAY_NOTE: &str = "Your previous reply kept repeating the same text, so it was \

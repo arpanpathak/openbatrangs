@@ -35,7 +35,7 @@ use super::{
 use crate::constants::agent::{
     BROKEN_CALL_NOTE, CHARS_PER_TOKEN, CONTEXT_RESERVE_TOKENS, CUT_REPLY_NOTE, EMPTY_TURN_NUDGE,
     MAX_OUTPUT_TOKENS, MIN_OUTPUT_TOKENS, MIN_TOOL_RESULT_CHARS, NATIVE_SYSTEM_PROMPT,
-    RUNAWAY_NOTE, TOOL_CHOICE_AUTO, TOOL_CHOICE_REQUIRED,
+    PROMISE_NOTE, PROMISE_PHRASES, RUNAWAY_NOTE, TOOL_CHOICE_AUTO, TOOL_CHOICE_REQUIRED,
 };
 use crate::ollama::{Delta, OllamaClient, ToolCallDelta};
 use crate::sampling::Sampling;
@@ -50,6 +50,10 @@ const MAX_EMPTY_RETRIES: u8 = 2;
 /// Number of replies in a row cut off at the output limit that are answered
 /// with [`CUT_REPLY_NOTE`] before the run ends.
 const MAX_CUT_RETRIES: u8 = 2;
+
+/// Number of replies in a row that announce work without a tool call and are
+/// answered with [`PROMISE_NOTE`]; the next one counts as the answer.
+const MAX_PROMISE_RETRIES: u8 = 2;
 
 /// The text of the tool result that answers an `ask_user` call.
 const QUESTION_SHOWN: &str =
@@ -485,6 +489,8 @@ struct Run<'a, R, C> {
     empty_retries: u8,
     /// Replies in a row cut off at the output limit.
     cut_retries: u8,
+    /// Replies in a row that announced work without a tool call.
+    promise_retries: u8,
     /// `tool_choice` sent with each request: [`TOOL_CHOICE_REQUIRED`] until
     /// the server answers it with HTTP 400.
     tool_choice: &'static str,
@@ -700,11 +706,36 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
             calls: Vec::new(),
         });
 
+        if self.is_unkept_promise(answer) {
+            return self.ask_for_the_promised_call();
+        }
+
         let Some(feedback) = self.finish_feedback() else {
             return self.report_done(answer, true);
         };
 
         self.reject_finish(feedback)
+    }
+
+    /// Whether `answer` announces work the model has not started, in a run
+    /// that may change files, with retries left. A read-only run's plan is
+    /// its answer.
+    fn is_unkept_promise(&self, answer: &str) -> bool {
+        let has_retries = self.promise_retries < MAX_PROMISE_RETRIES;
+
+        !self.config.is_read_only && has_retries && announces_work(answer)
+    }
+
+    /// Ask the model to make the call its last reply only announced.
+    fn ask_for_the_promised_call(&mut self) -> State {
+        self.promise_retries += 1;
+        self.record(Message::User(PROMISE_NOTE.to_string()));
+        self.reporter.notice(
+            "\n⚠️  The model described its next step without doing it; asking it to act."
+                .to_string(),
+        );
+
+        State::Ask
     }
 
     /// Run every tool call of the turn, then finish, ask the user, or take
@@ -714,6 +745,7 @@ impl<R: Reporter, C: Confirmer> Run<'_, R, C> {
         let calls = identified_calls(turn.calls, self.step);
         self.empty_retries = 0;
         self.cut_retries = 0;
+        self.promise_retries = 0;
         self.record(Message::Assistant {
             content: turn.content,
             reasoning: turn.reasoning,
@@ -893,6 +925,13 @@ fn state_after_turn(turn: Turn) -> State {
     }
 }
 
+/// Whether `text` announces work to come, such as "I will rewrite the file".
+fn announces_work(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    PROMISE_PHRASES.iter().any(|phrase| lower.contains(phrase))
+}
+
 /// The state for a reply without tool calls: blank text is an empty turn,
 /// text with a tool-call marker is a broken call, and other text the answer.
 fn state_for_text(text: String) -> State {
@@ -966,6 +1005,7 @@ pub(super) async fn run_native_agent<'a, R: Reporter, C: Confirmer>(
         step: 0,
         empty_retries: 0,
         cut_retries: 0,
+        promise_retries: 0,
         tool_choice: TOOL_CHOICE_REQUIRED,
         full_conversation: messages.clone(),
         messages,
@@ -2696,6 +2736,55 @@ mod tests {
 
         result?;
         assert!(output.contains("✅ Use walkdir."));
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_only_announces_work_is_asked_to_act() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-promise");
+        let promise = text_delta("I will start by rewriting the chapter now.");
+        let write = tool_call_delta(
+            "c1",
+            "write_file",
+            &json!({"path": "chapter.md", "content": "# Chapter\n"}),
+        );
+        let finish = tool_call_delta("c2", "finish", &json!({"summary": "Wrote the chapter."}));
+        let replies = vec![
+            Reply::openai_stream(&[promise]),
+            Reply::openai_stream(&[write]),
+            Reply::openai_stream(&[finish]),
+        ];
+
+        let (output, result) = run_in(&root, "rewrite the chapter", 5, replies).await?;
+
+        result?;
+        assert!(output.contains("described its next step without doing it"));
+        assert!(output.contains("✅ Wrote the chapter."));
+        assert_eq!(
+            std::fs::read_to_string(root.join("chapter.md"))?,
+            "# Chapter\n"
+        );
+
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_third_announcement_in_a_row_is_the_answer() -> Result<()> {
+        let root = crate::test_support::unique_temp_dir("openbatrangs-native-promises");
+        let replies = vec![
+            Reply::openai_stream(&[text_delta("I'll begin now.")]),
+            Reply::openai_stream(&[text_delta("Let me start.")]),
+            Reply::openai_stream(&[text_delta("I will do it.")]),
+        ];
+
+        let (output, result) = run_in(&root, "rewrite the chapter", 5, replies).await?;
+
+        result?;
+        assert_eq!(output.matches("described its next step").count(), 2);
+        assert!(output.contains("✅ I will do it."));
 
         std::fs::remove_dir_all(root)?;
         Ok(())
