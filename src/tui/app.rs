@@ -23,7 +23,7 @@ use crate::constants::tui::{
     MAX_TRANSCRIPT_BLOCKS, SPINNER, STREAM_GAP, TOKEN_RATE_MIN_ELAPSED, VIM_TERMINALS,
 };
 use crate::ollama::{ChatMessage, OllamaClient, OllamaModel, Role};
-use crate::perf::{PerfMonitor, ServerStatsFeed, SystemStats, server_host};
+use crate::perf::{PerfMonitor, ServerPoller, ServerStatsFeed, SystemStats, server_host};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -352,6 +352,9 @@ pub(super) struct App {
     pub(super) perf: PerfMonitor,
     /// Most recently sampled system and GPU statistics.
     pub(super) system_stats: SystemStats,
+    /// The task that polls the model server for its stats, or `None` when
+    /// the server runs on this machine. Replacing it stops the old task.
+    pub(super) server_poller: Option<ServerPoller>,
     /// Stats published by a model server on another host, or `None` when the
     /// server runs on this machine.
     pub(super) server_feed: Option<ServerStatsFeed>,
@@ -467,6 +470,7 @@ impl App {
             mouse_capture: true,
             perf: PerfMonitor::new(tegrastats),
             system_stats: SystemStats::default(),
+            server_poller: None,
             server_feed: None,
             stream_chars: 0,
             stream_started_at: None,
@@ -1796,6 +1800,13 @@ impl App {
         });
 
         StatsTable::new(remote, &self.system_stats)
+    }
+
+    /// Poll the server `client` talks to for the panel's stats, in place of
+    /// the server polled before. A server on this machine is not polled.
+    pub(super) fn watch_server(&mut self, client: &OllamaClient) {
+        self.server_poller = ServerPoller::start_for_remote(client);
+        self.server_feed = self.server_poller.as_ref().map(ServerPoller::feed);
     }
 
     /// Tell the server stats poller whether the perf panel is on screen, so

@@ -212,6 +212,7 @@ impl App {
         self.model = None;
         self.model_info = None;
         self.server_url = client.base_url.clone();
+        self.watch_server(&client);
         self.refresh_model_info(&client).await;
         self.switched_client = Some(client);
     }
@@ -414,6 +415,31 @@ mod tests {
         assert_eq!(config.providers["anthropic"].url, server_url);
         assert_eq!(app.provider.as_deref(), Some("anthropic"));
         assert!(app.switched_client.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_server_on_another_host_polls_its_stats() -> anyhow::Result<()> {
+        // `.invalid` never resolves, so the switch fails to list models at once.
+        let mut app = app_with_config("[thor]\nurl = \"http://thor.invalid:8000/v1\"\n")?;
+
+        app.switch_provider("thor").await?;
+
+        assert!(app.server_feed.is_some());
+        assert!(app.server_poller.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_server_on_this_machine_stops_polling() -> anyhow::Result<()> {
+        let server_url = served_model_server().await;
+        let mut app = app_with_config(&format!("[home]\nurl = \"{server_url}\"\n"))?;
+        app.server_feed = Some(crate::perf::ServerStatsFeed::default());
+
+        app.switch_provider("home").await?;
+
+        assert!(app.server_feed.is_none());
+        assert!(app.server_poller.is_none());
         Ok(())
     }
 

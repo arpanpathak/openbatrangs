@@ -60,7 +60,7 @@ pub(super) enum ScrollMode {
 use crate::cli::Cli;
 use crate::constants::tui::{KEYBOARD_FLAGS, MAX_BACKGROUND_EVENTS_PER_FRAME, TICK_MILLIS};
 use crate::ollama::OllamaClient;
-use crate::perf::{ServerPoller, TegrastatsGuard};
+use crate::perf::TegrastatsGuard;
 use crate::update::UpdateCheck;
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
@@ -218,11 +218,9 @@ async fn run_app<W: Write>(
     let tegrastats_shared = Arc::new(Mutex::new(None));
     let _tegrastats_guard = TegrastatsGuard::start(tegrastats_shared.clone());
 
-    let server_poller = ServerPoller::start_for_remote(client);
-
     let mut app = app::App::new(cli, tegrastats_shared);
     app.server_url = client.base_url.clone();
-    app.server_feed = server_poller.as_ref().map(ServerPoller::feed);
+    app.watch_server(client);
     app.desktop_clipboard = selection::desktop_clipboard(
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
         std::env::var_os("DISPLAY").is_some(),
