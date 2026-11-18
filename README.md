@@ -324,6 +324,41 @@ cd /content/project
 openbatrangs --no-sandbox --openai-url http://localhost:8000/v1 --model nvidia/Gemma-4-31B-IT-NVFP4
 ```
 
+#### Gemma 4 31B on an A100 80 GB with one command
+
+On an A100 80 GB runtime, `colab/gemma31b.sh` does every step above. Open
+Colab's terminal from the button at the bottom left, and run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arpanpathak/openbatrangs/main/colab/gemma31b.sh | bash
+```
+
+The script installs openbatrangs and vLLM, starts vLLM with the draft model and
+Gemma 4's whole context of 262,144 tokens, and opens the terminal UI in `/content/project`.
+vLLM converts the 16-bit weights to FP8 as it loads them. In FP8, the weights
+take 31 GB instead of 62 GB, which leaves most of the GPU for the KV cache, the
+memory that holds the context. The A100 has no FP8 arithmetic, so vLLM keeps
+the weights in FP8 and computes in 16 bits. The first start downloads about 62 GB and takes 10 to
+20 minutes; `tail -f /content/vllm.log` in a second terminal shows its progress.
+To work in your own repository, pass its URL:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arpanpathak/openbatrangs/main/colab/gemma31b.sh | bash -s -- https://github.com/you/your-repo
+```
+
+When you quit the terminal UI, the server keeps running, so the same command
+opens the UI again at once. If the download stops with a 401 error, accept the
+model's license on Hugging Face, run `export HF_TOKEN=<your token>`, and run
+the command again. If vLLM stops because the KV cache does not fit the
+context, set a shorter one on a fresh runtime:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/arpanpathak/openbatrangs/main/colab/gemma31b.sh | MAX_MODEL_LEN=131072 bash
+```
+
+Files in `/content` disappear when the runtime ends, so commit and push your
+work, or download it, before you close the tab.
+
 ## Usage
 
 ```sh
